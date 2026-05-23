@@ -1,0 +1,307 @@
+version: 0.2
+
+# CodeBuild buildspec for the demo-s3-archiving project.
+#
+# The build:
+#   1. Compiles every Rust Lambda crate to a static ARM64 binary.
+#   2. Installs dependencies for every Python contender Lambda (if any).
+#   3. Runs `aws cloudformation package` on every template, replacing local
+#      `CodeUri` / `DefinitionUri` references by S3 URLs.
+#
+# Contender layout (see README for the contribution flow):
+#   contenders/
+#     rust/<dev_id>/        # one Cargo crate per Rust contender — crate name MUST be <dev_id>
+#     python/<dev_id>/      # one folder per Python contender, may contain requirements.txt
+#     <lang>/<dev_id>/      # add new language sub-directories here
+#
+# Internal Lambdas (Rust only): benching/fill-bucket and benching/control-lambda.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# ADDING A NEW LANGUAGE
+# ─────────────────────────────────────────────────────────────────────────────
+# Rust and Python contenders are already handled. For any other language
+# you MUST insert build steps in the `build` phase below. The pattern is:
+#
+#   1. Iterate over `contenders/<your-lang>/*` directories.
+#   2. Compile / package each contender in place. The end state must be that
+#      the `contenders/<your-lang>/<dev_id>/` directory contains ONLY the files
+#      the Lambda runtime expects to find (e.g. `bootstrap` for custom
+#      runtimes, a fat JAR for Java, …).
+#   3. `aws cloudformation package` (in `post_build`) will zip that directory
+#      verbatim and upload it to S3.
+#
+# A commented-out Go example is provided under the `# GO BUILD` marker below.
+# ─────────────────────────────────────────────────────────────────────────────
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.13
+    commands:
+      - echo Entered the install phase on `date`
+      - |
+        echo Installing Rust
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
+        export PATH="/root/.cargo/bin:$PATH"
+        pip3 install cargo-lambda
+    finally:
+      - |
+        echo Changing all file times to 2010-01-01 00:00:00 \(arbitrary\) to avoid inducing changes in ZIP packages
+        find . -not -path '*/.git/*' -exec touch -a -m -t"201001010000.00" {} \;
+      - echo Exiting the install phase on `date`
+  pre_build:
+    on-failure: ABORT
+    commands:
+      - echo Entered the pre_build phase on `date`
+      ######################################################################################
+      #                                 RUST PRE-BUILD                                     #
+      # This is caching/cleanup logic for Rust, which has a notoriously long build time... #
+      ######################################################################################
+      - |
+        RUST_INTERNAL_LAMBDA_PATH=./benching
+        RUST_CONTENDER_LAMBDA_PATH=./contenders/rust
+      - |
+        current_build_rust_version=$(cargo --version 2>/dev/null)
+        echo "Rust version: $current_build_rust_version"
+        if ! previous_build_rust_version=$(cat previous_build_rust_version 2>/dev/null) || [ "$previous_build_rust_version" != "$current_build_rust_version" ]; then
+          echo "Rust version changed $previous_build_rust_version -> $current_build_rust_version, cleaning everything"
+          cargo clean --locked
+          echo "$current_build_rust_version" > previous_build_rust_version
+        fi
+      - |
+        ##########################
+        #    Bash Hash Tables    #
+        ##########################
+        declare -A PACKAGES_TO_CLEAN
+        declare -A IMPACTED_PACKAGE_NAMES
+        ##########################
+        #        Functions       #
+        ##########################
+        # Function checking if any dependency of a crate will be cleaned
+        will_dep_be_cleaned () {
+          CRATE=$1
+          for dep in $(cargo tree --locked --prefix none --package $CRATE | sed -r 's/^(\S+)\s+v(\S+).*$/\1@\2/' | sort -u); do
+            dep_name=${dep%@*}
+            if [[ ${IMPACTED_PACKAGE_NAMES[$dep_name]} -eq 1 ]] || [[ ${PACKAGES_TO_CLEAN[$dep_name]} -eq 1 ]]; then
+              return 0
+            fi
+          done
+          return 1
+        }
+        # Function checking if a local package need cleaning
+        process_local_crate_cleaning () {
+          LOCAL_CRATE_NAME=$1
+          current_md5=$2
+          if ! previous_md5=$(cat rust_target_md5sum/$LOCAL_CRATE_NAME 2>/dev/null) || [ "$previous_md5" != "$current_md5" ] ; then
+            echo previous_md5=$previous_md5 current_md5=$current_md5 =\> Change detected for $LOCAL_CRATE_NAME, cleaning it and updating md5sum
+            PACKAGES_TO_CLEAN+=([$LOCAL_CRATE_NAME]=1)
+            echo $current_md5 > rust_target_md5sum/$LOCAL_CRATE_NAME
+          elif will_dep_be_cleaned $LOCAL_CRATE_NAME ; then
+            echo One of $LOCAL_CRATE_NAME dependencies will be cleaned, cleaning it
+            PACKAGES_TO_CLEAN+=([$LOCAL_CRATE_NAME]=1)
+          fi
+        }
+        # Function generating the current dependency tree
+        dependencies_tree () {
+          cargo tree --locked --prefix none --target all -f '{p} feats:{f}' | sed -r 's/^(\S+)\s+v(\S+).* feats:(\S*).*$/\1@\2#\3/' | sort -u
+        }
+        # Function generating the list of packages that depends on a package
+        invert_dependencies_tree () {
+          cargo tree --locked --prefix none --target all --invert $1 | sed -r 's/^(\S+)\s+v(\S+).*$/\1@\2/' | sort -u
+        }
+        # Function systematicly cleaning the files related to a package in the target directory
+        manual_clean_package () {
+          package_name=$1
+          echo "Manually cleaning $package_name"
+          find target/ -type d -regextype posix-egrep -regex ".+./\.fingerprint/${package_name}-[a-f0-9]{16}"
+          for fg_folder in $(find target/ -type d -regextype posix-egrep -regex ".+./\.fingerprint/${package_name}-[a-f0-9]{16}" -exec basename {} \;) ; do
+            fg=${fg_folder: -16}
+            # Clean build folders if they exist
+            find target/ -type d -regextype posix-egrep -regex ".+/build/${fg_folder}"
+            find target/ -type d -regextype posix-egrep -regex ".+/build/${fg_folder}" -exec rm -r {} +
+            # Clean deps files if they exist
+            dep_name=$(tr '-' '_' <<< "$package_name")
+            dep_name="${dep_name}-${fg}"
+            find target/ -type f -regextype posix-egrep -regex ".+/deps/(lib)?${dep_name}\..+"
+            find target/ -type f -regextype posix-egrep -regex ".+/deps/(lib)?${dep_name}\..+" -exec rm {} +
+          done
+          find target/ -type d -regextype posix-egrep -regex ".+./\.fingerprint/${package_name}-[a-f0-9]{16}" -exec rm -r {} +
+        }
+        ##########################
+        #     Cache cleaning     #
+        ##########################
+        if [ -f previous_dependencies_tree ] ; then
+          echo Cleaning cached target directory
+          declare -A CURRENT_PACKAGES
+          echo Building current dependencies tree...
+          for p in $(dependencies_tree) ; do
+            CURRENT_PACKAGES+=([$p]=1)
+          done
+          echo Finding all packages that are no longer needed or changed...
+          for p in $(cat previous_dependencies_tree) ; do
+            if ! [[ ${CURRENT_PACKAGES[$p]} -eq 1 ]]; then
+              package_id=${p%#*}
+              package_name=${p%@*}
+              if cargo pkgid $package_id 2>/dev/null >/dev/null ; then
+                echo "Cleaning $package_id and packages depending on it"
+                for ptc in $(invert_dependencies_tree $package_id); do
+                  ptc_name=${ptc%@*}
+                  manual_clean_package "$ptc_name"
+                  IMPACTED_PACKAGE_NAMES+=([$ptc_name]=1)
+                done
+              else
+                manual_clean_package "$package_name"
+                IMPACTED_PACKAGE_NAMES+=([$package_name]=1)
+              fi
+            fi
+          done
+        else
+          echo No cached target directory
+        fi
+        ##########################
+        #  Local Crates cleaning #
+        ##########################
+        if ! [ -d rust_target_md5sum ] ; then mkdir rust_target_md5sum ; fi
+        echo Selectively clean-up LAMBDA artifacts if code has changed
+        for LAMBDA_FOLDER in $RUST_INTERNAL_LAMBDA_PATH $RUST_CONTENDER_LAMBDA_PATH; do
+          for LAMBDA in $(ls $LAMBDA_FOLDER) ; do
+            echo Control MD5 for $LAMBDA_FOLDER/$LAMBDA
+            cd $LAMBDA_FOLDER/$LAMBDA
+            current_md5=$(find . | sort | zip -@ - | md5sum | cut -f1 -d" ")
+            cd $CODEBUILD_SRC_DIR
+            process_local_crate_cleaning "$LAMBDA" "$current_md5"
+          done
+        done
+        echo Cleaning ${#PACKAGES_TO_CLEAN[@]} packages...
+        for package in ${!PACKAGES_TO_CLEAN[@]}; do
+          echo Cleaning $package
+          cargo clean --locked --target aarch64-unknown-linux-gnu --release --package $package
+        done
+        ##########################
+        #    Dependencies Tree   #
+        ##########################
+        echo Saving current dependency tree as previous_dependencies_tree
+        dependencies_tree > previous_dependencies_tree
+      ####################
+      # PYTHON PRE-BUILD #
+      ####################
+      - |
+        PYTHON_CONTENDER_LAMBDA_PATH=./contenders/python
+    finally:
+      - echo Exiting the pre_build phase on `date`
+  build:
+    on-failure: ABORT
+    commands:
+      - echo Entered the build phase on `date`
+      ##############
+      # RUST BUILD #
+      ##############
+      # Builds every Rust Lambda crate. By project convention, the cargo package
+      # name of a contender MUST equal its directory name (the <dev_id>).
+      - |
+        echo Composing the release build command...
+        CMD="cargo lambda build --locked --release --arm64"
+        for LAMBDA in $(ls $RUST_INTERNAL_LAMBDA_PATH) ; do
+          echo Will build internal Lambda $LAMBDA
+          CMD="$CMD --package $LAMBDA"
+        done
+        if [ -d "$RUST_CONTENDER_LAMBDA_PATH" ]; then
+          for LAMBDA in $(ls $RUST_CONTENDER_LAMBDA_PATH) ; do
+            echo Will build Rust contender $LAMBDA
+            CMD="$CMD --package $LAMBDA"
+          done
+        fi
+        echo $CMD
+        eval $CMD
+      # Replaces every Lambda directory by a single `bootstrap` file (the compiled
+      # binary). CloudFormation's `aws cloudformation package` will then zip that
+      # directory and upload it to S3.
+      - |
+        echo Packaging lambdas...
+        for LAMBDA_FOLDER in $RUST_INTERNAL_LAMBDA_PATH $RUST_CONTENDER_LAMBDA_PATH; do
+          for LAMBDA in $(ls $LAMBDA_FOLDER) ; do
+            echo Prepping: $LAMBDA
+            # Remove all content (sources, Cargo.toml, etc.)
+            rm -rf $LAMBDA_FOLDER/$LAMBDA/*
+            # Move the compiled binary into the Lambda folder
+            mv ./target/lambda/$LAMBDA/bootstrap $LAMBDA_FOLDER/$LAMBDA/bootstrap
+          done
+        done
+      ############
+      # GO BUILD #
+      ############
+      # Uncomment and adapt this block when adding a Go contender.
+      # It assumes contenders live at `contenders/go/<dev_id>/` with a `main.go`
+      # (and optional `go.mod`/`go.sum`) at the root of each directory.
+      # After building, only the `bootstrap` binary is kept in the source dir
+      # so `aws cloudformation package` zips a minimal Lambda artifact.
+      #
+      # Requirements:
+      #   - the CodeBuild image must have a `go` toolchain available.
+      #     `aws/codebuild/amazonlinux-aarch64-standard:4.0` (used by this
+      #     project) ships Go — verify with `go version` in a build log.
+      #   - the contender's CFN block in templates/contenders.yml must use
+      #     `Runtime: provided.al2023` (custom runtime executes `bootstrap`).
+      #
+      # - |
+      #   GO_CONTENDER_LAMBDA_PATH=./contenders/go
+      #   if [ -d "$GO_CONTENDER_LAMBDA_PATH" ]; then
+      #     for LAMBDA in $(ls $GO_CONTENDER_LAMBDA_PATH); do
+      #       echo "Building Go contender $LAMBDA"
+      #       cd $GO_CONTENDER_LAMBDA_PATH/$LAMBDA
+      #       GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bootstrap .
+      #       cd $CODEBUILD_SRC_DIR
+      #       # Strip sources so only the binary ships in the Lambda ZIP
+      #       find $GO_CONTENDER_LAMBDA_PATH/$LAMBDA -mindepth 1 -not -name bootstrap -delete
+      #     done
+      #   fi
+
+      ################
+      # PYTHON BUILD #
+      ################
+      - |
+        if [ -d "$PYTHON_CONTENDER_LAMBDA_PATH" ]; then
+          echo Installing dependencies for the Python lambdas
+          for LAMBDA in $(ls $PYTHON_CONTENDER_LAMBDA_PATH) ; do
+            if [ -f "$PYTHON_CONTENDER_LAMBDA_PATH/$LAMBDA/requirements.txt" ]; then
+              echo Installing dependencies for Python lambda: $LAMBDA
+              pip install -r $PYTHON_CONTENDER_LAMBDA_PATH/$LAMBDA/requirements.txt -t $PYTHON_CONTENDER_LAMBDA_PATH/$LAMBDA
+              rm $PYTHON_CONTENDER_LAMBDA_PATH/$LAMBDA/requirements.txt
+            fi
+          done
+        fi
+    finally:
+      - |
+        echo Changing all file times to 2010-01-01 00:00:00 \(arbitrary\) to avoid inducing changes in ZIP packages
+        find . -not -path '*/.git/*' -exec touch -a -m -t"201001010000.00" {} \;
+      - echo Exiting the build phase on `date`
+  post_build:
+    commands:
+      - echo Entered the post_build phase on `date`
+      - |
+        echo Packaging the sub-templates file references...
+        # `aws cloudformation package` rewrites local file references inside the template
+        # (CodeUri, DefinitionUri, etc.) to S3 URLs after uploading the referenced assets.
+        # Note: `ls ./templates/*.yml` returns paths already prefixed with `./templates/`,
+        # so we operate on the full path directly.
+        for SUBTEMPLATE in ./templates/*.yml ; do
+          echo Packaging sub-template $SUBTEMPLATE
+          mv $SUBTEMPLATE $SUBTEMPLATE.bak
+          aws cloudformation package --template-file $SUBTEMPLATE.bak --s3-bucket $ARTIFACT_BUCKET --s3-prefix templates --output-template-file $SUBTEMPLATE
+        done
+      - |
+        echo Packaging the root-template file references...
+        mv root-template.yml root-template.yml.bak
+        aws cloudformation package --template-file root-template.yml.bak --s3-bucket $ARTIFACT_BUCKET --s3-prefix templates --output-template-file root-template.yml
+    finally:
+      - echo Exiting the post_build phase on `date`
+artifacts:
+  base-directory: .
+  files:
+    - root-template.yml
+cache:
+  paths:
+    - target/**/* # Rust workspace target directory
+    - rust_target_md5sum/**/* # Where we store md5sum for code
+    - previous_dependencies_tree # The last seen dependencies tree
+    - previous_build_rust_version # The last seen Rust toolchain version

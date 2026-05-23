@@ -1,0 +1,174 @@
+AWSTemplateFormatVersion: 2010-09-09
+# Two transforms:
+# - LanguageExtensions enables Fn::ForEach (looping over resources) and Fn::ToJsonString
+# - Serverless (SAM) enables shorthand like AWS::Serverless::Function
+Transform:
+  - AWS::LanguageExtensions
+  - AWS::Serverless-2016-10-31
+Description: Contender Lambda functions competing in the demo-s3-archiving benchmark
+
+Parameters:
+  ProjectName:
+    Type: String
+  BucketName:
+    Type: String
+    Description: The name of the bucket containing the test objects for benching archive creation
+  FilesPrefix:
+    Type: String
+    Default: files
+    Description: Key prefix under which the test objects live in the bucket
+
+# SAM Globals sets default properties for ALL AWS::Serverless::Function resources in this template.
+Globals:
+  Function:
+    Environment:
+      Variables:
+        BUCKET_NAME: !Ref BucketName
+        FILES_PREFIX: !Ref FilesPrefix
+
+Resources:
+  LambdaContenderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-lambda-contender
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: s3-access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: GetObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::${BucketName}
+                  - !Sub arn:${AWS::Partition}:s3:::${BucketName}/${FilesPrefix}/*
+              - Sid: UploadArchive
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                  - s3:ListBucketMultipartUploads
+                Resource: !Sub arn:${AWS::Partition}:s3:::${BucketName}/archives/*
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+      Path: /
+  # =============================================================================
+  # CONTENDERS — REGISTER YOUR LAMBDA HERE
+  # =============================================================================
+  # To add a contender, append two resources to this section, following the
+  # naming and structural conventions described below.
+  #
+  # Naming convention (STRICT — the benching Step Function relies on it):
+  #
+  #   - FunctionName MUST be: !Sub ${ProjectName}-<lang>-<dev_id>
+  #       e.g. ${ProjectName}-rust-jeremie-rodon
+  #
+  #   - <lang>-<dev_id> SHOULD match the source directory:
+  #       contenders/<lang>/<dev_id>/
+  #
+  #   - CloudFormation logical IDs (the keys below) SHOULD be PascalCase'd:
+  #       <Lang><DevId>Function
+  #       <Lang><DevId>FunctionLogGroup
+  #
+  #   - For Rust contenders, the Cargo package name in
+  #     contenders/<lang>/<dev_id>/Cargo.toml MUST equal <dev_id>
+  #     (the CI buildspec uses it to locate `target/lambda/<dev_id>/bootstrap`).
+  #
+  # The Step Function bench input takes a list of contender ARNs. The state
+  # machine derives the per-contender archive name by stripping the
+  # `${ProjectName}-` prefix from the function name, so it ends up
+  # writing/reading `archives/<lang>-<dev_id>.zip` in the bucket.
+  #
+  # All contenders share the same IAM role (LambdaContenderRole above), so
+  # adding one only requires defining the Function + its LogGroup.
+  # =============================================================================
+
+  # ----------------------------- BEGIN CONTENDERS -------------------------------
+  #
+  # ╔══════════════════════════════════════════════════════════════════════════╗
+  # ║                  >>> INSERT YOUR CONTENDER HERE <<<                      ║
+  # ║                                                                          ║
+  # ║  Copy the RustJeremieRodon block below as a template and adjust:         ║
+  # ║    - logical IDs (PascalCase: <Lang><DevId>Function / ...LogGroup)       ║
+  # ║    - FunctionName  (must be ${ProjectName}-<lang>-<dev_id>)              ║
+  # ║    - CodeUri       (../contenders/<lang>/<dev_id>)                       ║
+  # ║    - Runtime / Handler (see cheat sheet below)                           ║
+  # ║                                                                          ║
+  # ║  Common runtime + handler values:                                        ║
+  # ║    Rust   (custom):  Runtime: provided.al2023,  Handler: rust.handler    ║
+  # ║                      (Handler is ignored — bootstrap is executed)        ║
+  # ║    Go     (custom):  Runtime: provided.al2023,  Handler: bootstrap       ║
+  # ║                      (Handler is ignored — bootstrap is executed)        ║
+  # ║    Python 3.x:       Runtime: python3.x,        Handler: index.handler   ║
+  # ║    Node.js 22.x:     Runtime: nodejs22.x,       Handler: index.handler   ║
+  # ║    Java 21:          Runtime: java21,           Handler: pkg.Cls::method ║
+  # ║                                                                          ║
+  # ║  Non-Rust compiled languages also require a build step in                ║
+  # ║  ci-config/buildspec.yml — see the README "Buildspec adjustments"        ║
+  # ║  section.                                                                ║
+  # ╚══════════════════════════════════════════════════════════════════════════╝
+  #
+  # The reference Rust contender below is both a working example AND the
+  # copy-paste template for new contenders. Keep it as the last block in
+  # this section so newcomers always see a valid registered Lambda.
+
+  # Rust / jeremie-rodon  (reference implementation)
+  RustJeremieRodonFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-rust-jeremie-rodon
+      CodeUri: ../contenders/rust/jeremie-rodon
+      # provided.al2023 is the custom runtime for compiled binaries (Rust, Go, C++).
+      # The Lambda service executes the `bootstrap` binary directly.
+      Runtime: provided.al2023
+      MemorySize: 512
+      Timeout: 600
+      # For custom runtimes, Handler is technically ignored (bootstrap is always executed).
+      # This value is just my convention.
+      Handler: rust.handler
+      Architectures:
+        # ARM64 (Graviton2): ~20% cheaper and often faster than x86_64 for Rust Lambda workloads
+        - arm64
+      Environment:
+        Variables:
+          # RUST_LOG configures the `tracing` crate's log filter:
+          # debug for app code, info for noisy AWS SDK internals
+          RUST_LOG: info # debug,hyper=info,h2=info,tracing=info,aws_config=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,rustls=info
+      Role: !GetAtt LambdaContenderRole.Arn
+  RustJeremieRodonFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${RustJeremieRodonFunction}
+      RetentionInDays: 90
+
+  # ------------------------------ END CONTENDERS --------------------------------
+
+# Outputs — the list of contender ARNs is consumed by the benching Step Function
+# (root-template wires this up). Append a `!GetAtt` for every contender you
+# register above, between the BEGIN/END markers.
+Outputs:
+  ContenderArns:
+    Description: Event for the benching State Machine that can be passed as-is
+    Value:
+      Fn::ToJsonString:
+        contenders:
+          # ----- BEGIN CONTENDER ARN LIST -----
+          # >>> INSERT YOUR CONTENDER ARN HERE <<<
+          # Append one line per contender, mirroring the resource block you added above:
+          #   - !GetAtt <Lang><DevId>Function.Arn
+          - !GetAtt RustJeremieRodonFunction.Arn
+          # ----- END CONTENDER ARN LIST -----

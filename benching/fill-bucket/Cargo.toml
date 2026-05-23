@@ -1,0 +1,26 @@
+[package]
+name = "fill-bucket"
+version = "0.1.0"
+rust-version = "1.85.0"
+edition = "2024"
+authors = ["Jérémie RODON <jeremie.rodon@gmail.com>"]
+license = "GPL-3.0-only"
+
+[dependencies]
+awssdk-instrumentation = { workspace = true }
+
+aws-sdk-s3 = { workspace = true }
+aws_lambda_events = { workspace = true }
+
+tokio = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+rand = { workspace = true }
+rand_distr = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+reqwest = { workspace = true }

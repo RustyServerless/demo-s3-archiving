@@ -1,0 +1,24 @@
+[workspace]
+members = ["benching/*", "contenders/rust/*"]
+resolver = "2"
+
+
+[workspace.dependencies]
+awssdk-instrumentation = { version = "0.2", default-features = false, features = ["tracing-backend", "env-lambda", "extract-s3"] }
+aws-sdk-s3 = "1"
+aws_lambda_events = { version = "1", default-features = false, features = ["cloudformation"] }
+
+tokio = { version = "1", features = ["macros", "signal", "rt-multi-thread", "sync"] }
+
+tracing = { version = "0.1"}
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+rand = "0.9"
+rand_distr = "0.5"
+zip = { version = "5.1", default-features = false }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

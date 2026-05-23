@@ -1,0 +1,176 @@
+{
+  "Comment": "Benchmark the contender Lambdas: for each ARN run the lambda (timed), validate the produced archive with the control Lambda, then delete the archive. Outputs ordered success / failure lists.",
+  "QueryLanguage": "JSONata",
+  "StartAt": "BenchOverContenders",
+  "States": {
+    "BenchOverContenders": {
+      "Type": "Map",
+      "Items": "{% $states.input.contenders %}",
+      "ItemSelector": {
+        "arn": "{% $states.context.Map.Item.Value %}"
+      },
+      "MaxConcurrency": 10,
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "DeriveArchiveKey",
+        "States": {
+          "DeriveArchiveKey": {
+            "Type": "Pass",
+            "Comment": "Derive the contender's function id from its ARN: '<lang>-<dev_id>', e.g. 'rust-jeremie-rodon'. The Function ARN basename is '${ProjectName}-<function_id>'.",
+            "Assign": {
+              "arn": "{% $states.input.arn %}",
+              "archive_key": "{% 'archives/' & $substringAfter($split($states.input.arn, ':')[6], '${ProjectName}-') & '.zip' %}"
+            },
+            "Next": "GetContenderConfig"
+          },
+          "GetContenderConfig": {
+            "Type": "Task",
+            "Comment": "Fetch the contender's runtime, architecture, memory and ephemeral storage. Required for GB-second ranking. A failure here aborts the whole run on purpose — config fetch should not fail.",
+            "Resource": "arn:aws:states:::aws-sdk:lambda:getFunctionConfiguration",
+            "Arguments": {
+              "FunctionName": "{% $arn %}"
+            },
+            "Assign": {
+              "runtime": "{% $states.result.Runtime %}",
+              "architecture": "{% $states.result.Architectures[0] %}",
+              "memory_mb": "{% $states.result.MemorySize %}",
+              "ephemeral_storage_mb": "{% $states.result.EphemeralStorage.Size %}"
+            },
+            "Next": "StartTimer"
+          },
+          "StartTimer": {
+            "Type": "Pass",
+            "Assign": {
+              "started_ms": "{% $millis() %}"
+            },
+            "Next": "InvokeContender"
+          },
+          "InvokeContender": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Arguments": {
+              "FunctionName": "{% $arn %}",
+              "Payload": {
+                "archive_key": "{% $archive_key %}"
+              }
+            },
+            "Retry": [],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.Timeout",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException",
+                  "Lambda.ServiceException"
+                ],
+                "Next": "RecordContenderFailure",
+                "Output": {
+                  "reason": "{% 'timeout: ' & $states.errorOutput.Error & ' ' & $states.errorOutput.Cause %}"
+                }
+              },
+              {
+                "ErrorEquals": ["States.ALL"],
+                "Next": "RecordContenderFailure",
+                "Output": {
+                  "reason": "{% 'crash: ' & $states.errorOutput.Error & ' ' & $states.errorOutput.Cause %}"
+                }
+              }
+            ],
+            "Next": "StopTimer"
+          },
+          "RecordContenderFailure": {
+            "Type": "Pass",
+            "Comment": "Contender either crashed or timed out — no archive to delete (or it may be a partial multipart, but the bucket lifecycle aborts those after 1 day).",
+            "Output": {
+              "kind": "failure",
+              "arn": "{% $arn %}",
+              "reason": "{% $states.input.reason %}"
+            },
+            "Next": "EndSuccess"
+          },
+          "StopTimer": {
+            "Type": "Pass",
+            "Assign": {
+              "duration_ms": "{% $millis() - $started_ms %}"
+            },
+            "Next": "InvokeControl"
+          },
+          "InvokeControl": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Arguments": {
+              "FunctionName": "${ControlFunctionArn}",
+              "Payload": {
+                "archive_key": "{% $archive_key %}",
+                "expected_object_count": "${TestFileCount}"
+              }
+            },
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "Next": "EmitInvalid",
+                "Output": {
+                  "reason": "{% 'invalid: ' & ($exists($states.errorOutput.Cause) ? ($parse($states.errorOutput.Cause).errorMessage ? $parse($states.errorOutput.Cause).errorMessage : $states.errorOutput.Cause) : $states.errorOutput.Error) %}"
+                }
+              }
+            ],
+            "Next": "EmitSuccess"
+          },
+          "EmitSuccess": {
+            "Type": "Pass",
+            "Output": {
+              "kind": "success",
+              "arn": "{% $arn %}",
+              "runtime": "{% $runtime %}",
+              "architecture": "{% $architecture %}",
+              "memory_mb": "{% $memory_mb %}",
+              "ephemeral_storage_mb": "{% $ephemeral_storage_mb %}",
+              "duration_ms": "{% $duration_ms %}",
+              "gb_second": "{% ($duration_ms / 1000) * ($memory_mb / 1024) %}"
+            },
+            "Next": "DeleteArchive"
+          },
+          "EmitInvalid": {
+            "Type": "Pass",
+            "Output": {
+              "kind": "failure",
+              "arn": "{% $arn %}",
+              "reason": "{% $states.input.reason %}"
+            },
+            "Next": "DeleteArchive"
+          },
+          "DeleteArchive": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:s3:deleteObject",
+            "Arguments": {
+              "Bucket": "${BucketName}",
+              "Key": "{% $archive_key %}"
+            },
+            "Output": "{% $states.input %}",
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "Next": "EndSuccess"
+              }
+            ],
+            "Next": "EndSuccess"
+          },
+          "EndSuccess": {
+            "Type": "Succeed"
+          }
+        }
+      },
+      "Next": "PartitionResults"
+    },
+    "PartitionResults": {
+      "Type": "Pass",
+      "Output": {
+        "success": "{% ($res := $sort([$states.input[kind='success']], function($a, $b) { $a.gb_second > $b.gb_second }) ~> $map(function($v) { { 'arn': $v.arn, 'runtime': $v.runtime, 'architecture': $v.architecture, 'memory_mb': $v.memory_mb, 'ephemeral_storage_mb': $v.ephemeral_storage_mb, 'duration_ms': $v.duration_ms, 'gb_second': $v.gb_second } }); $boolean($res) ? $res : []) %}",
+        "failure": "{% ($res := [$states.input[kind='failure']] ~> $map(function($v) { { 'arn': $v.arn, 'reason': $v.reason } }); $boolean($res) ? $res : []) %}"
+      },
+      "End": true
+    }
+  }
+}
