@@ -32,15 +32,15 @@ use tracing::{debug, error, info, instrument};
 
 // ---------- Tunables ----------
 
-/// Maximum memory that pending downloads can consume (100MB)
-const MAX_DOWNLOADS_MEMORY: usize = 100 * 1024 * 1024;
+/// Maximum memory that pending downloads can consume (20MB)
+const MAX_DOWNLOADS_MEMORY: usize = 20 * 1024 * 1024;
 
 /// Maximum concurrent part uploads
-const MAX_CONCURRENT_UPLOADS: usize = 10;
+const MAX_CONCURRENT_UPLOADS: usize = 3;
 /// Size of each multipart upload chunk (10MB)
 const CHUNK_SIZE_BYTES: usize = 10 * 1024 * 1024;
 /// Slab Ring Buffer size in chuncks
-const BUFFER_CHUNKS_COUNT: usize = 3;
+const BUFFER_CHUNKS_COUNT: usize = 2;
 
 /// Info switch every 50
 const TRACING_INFO_FREQUENCY: usize = 50;
