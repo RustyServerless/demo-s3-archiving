@@ -27,7 +27,7 @@ Resources:
   # S3 Bucket #
   #############
   Bucket:
-    Type: AWS::S3::Bucket
+    Type: AWS::S3::Bucke
     Properties:
       BucketName: !Sub ${ProjectName}-${AWS::AccountId}-${AWS::Region}
       OwnershipControls:
