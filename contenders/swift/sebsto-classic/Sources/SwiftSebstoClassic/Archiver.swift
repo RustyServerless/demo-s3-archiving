@@ -9,9 +9,20 @@ import Foundation
 #endif
 
 // One downloaded file's bytes plus the byte-budget release amount.
+//
+// Carries a ByteBuffer (not Data) to keep the bytes in NIO's native
+// representation all the way through the pipeline. The downloader iterates
+// `response.body` which already yields ByteBuffer; converting to Data was
+// causing two allocations + a Sequence iteration per ~64 KB NIO frame
+// (~250k iterations across the run). ByteBuffer.writeBuffer is a memcpy
+// into a pre-sized backing store — one operation per frame, no iteration.
+//
+// CRC32 is also computed in the downloader, in parallel across N tasks,
+// rather than in the single-threaded zipper.
 struct DownloadedFile: Sendable {
     let name: String
-    let bytes: Data
+    let buffer: ByteBuffer
+    let crc32: UInt32
     let releaseBytes: Int
 }
 
@@ -127,8 +138,11 @@ private func runDownloadStage(
             // worth of files are concurrently in-flight.
             await byteBudget.acquire(file.size)
             group.addTask {
-                let data = try await downloadFile(s3: s3, bucket: bucket, key: file.key, expectedSize: file.size, logger: logger)
-                out.send(DownloadedFile(name: file.name, bytes: data, releaseBytes: file.size))
+                let (buffer, crc) = try await downloadFile(
+                    s3: s3, bucket: bucket, key: file.key,
+                    expectedSize: file.size, logger: logger
+                )
+                out.send(DownloadedFile(name: file.name, buffer: buffer, crc32: crc, releaseBytes: file.size))
             }
         }
         try await group.waitForAll()
@@ -136,31 +150,40 @@ private func runDownloadStage(
     }
 }
 
-// Streams chunks from getObject() into a pre-sized Data — mirrors the Rust
-// author's "no body.collect()" trick to avoid AWS SDK 3× memory amplification.
+// Streams chunks from getObject() into a pre-sized ByteBuffer. Computes
+// CRC32 inline as bytes flow in — parallelizes the CRC work across N
+// download tasks instead of bottlenecking it in the single zipper.
+//
+// Uses ByteBuffer (not Data) to keep the bytes in NIO's native form: the
+// hot per-frame path becomes `out.writeBuffer(&frame)` (one memcpy, no
+// Sequence iteration), versus the previous `Data.append(contentsOf:)` which
+// allocated and copied byte-by-byte.
 private func downloadFile(
     s3: S3,
     bucket: String,
     key: String,
     expectedSize: Int,
     logger: Logger
-) async throws -> Data {
+) async throws -> (ByteBuffer, UInt32) {
     let response = try await s3.getObject(
         S3.GetObjectRequest(bucket: bucket, key: key),
         logger: logger
     )
-    var data = Data()
-    data.reserveCapacity(expectedSize)
-    for try await buffer in response.body {
-        var b = buffer
-        if let bytes = b.readBytes(length: b.readableBytes) {
-            data.append(contentsOf: bytes)
+    var out = ByteBufferAllocator().buffer(capacity: expectedSize)
+    var crc = CRC32()
+    for try await frameBuffer in response.body {
+        var frame = frameBuffer
+        // CRC over the frame's readable bytes without copying.
+        frame.readableBytesView.withContiguousStorageIfAvailable { ptr in
+            crc.update(ptr)
         }
+        // Memcpy into the per-file accumulator. One op per frame.
+        out.writeBuffer(&frame)
     }
-    if data.count != expectedSize {
-        throw ArchivingError.downloadShortRead(key: key, expected: expectedSize, got: data.count)
+    if out.readableBytes != expectedSize {
+        throw ArchivingError.downloadShortRead(key: key, expected: expectedSize, got: out.readableBytes)
     }
-    return data
+    return (out, crc.value)
 }
 
 // ----- Stage B: zipper -----
@@ -178,28 +201,23 @@ private func runZipStage(
     var processed = 0
 
     for await file in fileChannel.stream {
+        let bodySize = UInt64(file.buffer.readableBytes)
         let lfh = ZipHeaders.localFileHeader(name: file.name)
         let lfhOffset = offset
-        await producer.append(lfh)
-        offset += UInt64(lfh.count)
+        let dd = ZipHeaders.dataDescriptor(crc32: file.crc32, size: bodySize)
 
-        var crc = CRC32()
-        file.bytes.withUnsafeBytes { rawBuf in
-            let typed = rawBuf.bindMemory(to: UInt8.self)
-            crc.update(typed)
-        }
-        await producer.append(file.bytes)
-        offset += UInt64(file.bytes.count)
+        // One actor hop for the LFH + body + descriptor instead of three.
+        // The body goes through as a ByteBuffer so the producer can memcpy
+        // the readable bytes directly into its chunk store with no copy
+        // through Data / Sequence iteration.
+        await producer.appendCompound(lfh: lfh, body: file.buffer, dataDescriptor: dd)
+        offset += UInt64(lfh.count) + bodySize + UInt64(dd.count)
         await byteBudget.release(file.releaseBytes)
-
-        let dd = ZipHeaders.dataDescriptor(crc32: crc.value, size: UInt64(file.bytes.count))
-        await producer.append(dd)
-        offset += UInt64(dd.count)
 
         entries.append(ZipEntry(
             name: file.name,
-            crc32: crc.value,
-            size: UInt64(file.bytes.count),
+            crc32: file.crc32,
+            size: bodySize,
             localHeaderOffset: lfhOffset
         ))
         processed += 1

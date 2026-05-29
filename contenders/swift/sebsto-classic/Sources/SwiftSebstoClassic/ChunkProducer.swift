@@ -1,3 +1,5 @@
+import NIOCore
+
 #if canImport(FoundationEssentials)
 import FoundationEssentials
 #else
@@ -44,16 +46,83 @@ actor ChunkProducer {
     // Append raw bytes to the producer. Suspends if the in-flight ceiling is
     // hit, providing the backpressure that protects Lambda memory.
     func append(_ bytes: Data) async {
-        var remaining = bytes[...]
-        while !remaining.isEmpty {
-            let room = chunkSize - buffer.count
-            let take = Swift.min(remaining.count, room)
-            buffer.append(contentsOf: remaining.prefix(take))
-            remaining = remaining.dropFirst(take)
+        let total = bytes.count
+        let room = chunkSize - buffer.count
+        // Hot path: the whole input fits in the current chunk. One memcpy
+        // via pointer + Data.append(_:count:); no Sequence iteration.
+        if total <= room {
+            bytes.withUnsafeBytes { raw in
+                if let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) {
+                    buffer.append(base, count: total)
+                }
+            }
+            if buffer.count == chunkSize {
+                await emitFullChunk()
+            }
+            return
+        }
+        // Spill path: input crosses one or more chunk boundaries.
+        var cursor = 0
+        while cursor < total {
+            let stillRoom = chunkSize - buffer.count
+            let take = Swift.min(total - cursor, stillRoom)
+            bytes.withUnsafeBytes { raw in
+                if let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) {
+                    buffer.append(base + cursor, count: take)
+                }
+            }
+            cursor += take
             if buffer.count == chunkSize {
                 await emitFullChunk()
             }
         }
+    }
+
+    // ByteBuffer-aware append: memcpy a NIO ByteBuffer's readable bytes
+    // into the chunk store without going through Data / Sequence iteration.
+    // Used for file payloads on the hot path (5 MB per call × 3000 files).
+    func append(_ byteBuf: ByteBuffer) async {
+        let total = byteBuf.readableBytes
+        guard total > 0 else { return }
+        let room = chunkSize - buffer.count
+
+        // Hot path: file fits in current chunk.
+        if total <= room {
+            byteBuf.withUnsafeReadableBytes { raw in
+                if let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) {
+                    buffer.append(base, count: total)
+                }
+            }
+            if buffer.count == chunkSize {
+                await emitFullChunk()
+            }
+            return
+        }
+        // Spill path.
+        var cursor = 0
+        while cursor < total {
+            let stillRoom = chunkSize - buffer.count
+            let take = Swift.min(total - cursor, stillRoom)
+            byteBuf.withUnsafeReadableBytes { raw in
+                if let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) {
+                    buffer.append(base + cursor, count: take)
+                }
+            }
+            cursor += take
+            if buffer.count == chunkSize {
+                await emitFullChunk()
+            }
+        }
+    }
+
+    // Coalesced LFH + body + data descriptor: one actor hop instead of
+    // three for every file. The body comes in as ByteBuffer (zero-copy from
+    // the downloader's accumulator), the headers as small Data (encoded by
+    // ZipHeaders).
+    func appendCompound(lfh: Data, body: ByteBuffer, dataDescriptor: Data) async {
+        await append(lfh)
+        await append(body)
+        await append(dataDescriptor)
     }
 
     // Mark the producer as done. Emits any remaining partial chunk and closes
