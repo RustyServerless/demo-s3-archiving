@@ -105,6 +105,8 @@ Resources:
   # ║                      (Handler is ignored — bootstrap is executed)        ║
   # ║    Go     (custom):  Runtime: provided.al2023,  Handler: bootstrap       ║
   # ║                      (Handler is ignored — bootstrap is executed)        ║
+  # ║    Swift  (custom):  Runtime: provided.al2023,  Handler: swift.handler   ║
+  # ║                      (Handler is ignored — bootstrap is executed)        ║
   # ║    Python 3.x:       Runtime: python3.x,        Handler: index.handler   ║
   # ║    Node.js 22.x:     Runtime: nodejs22.x,       Handler: index.handler   ║
   # ║    Java 21:          Runtime: java21,           Handler: pkg.Cls::method ║
@@ -117,6 +119,25 @@ Resources:
   # The reference Rust contender below is both a working example AND the
   # copy-paste template for new contenders. Keep it as the last block in
   # this section so newcomers always see a valid registered Lambda.
+
+  # Swift / sebsto-classic  (3-stage download/zip/upload pipeline, Soto + swift-aws-lambda-runtime)
+  SwiftSebstoClassicFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-swift-sebsto-classic
+      CodeUri: ../contenders/swift/sebsto-classic
+      Runtime: provided.al2023
+      MemorySize: 512
+      Timeout: 600
+      Handler: swift.handler
+      Architectures:
+        - arm64
+      Role: !GetAtt LambdaContenderRole.Arn
+  SwiftSebstoClassicFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${SwiftSebstoClassicFunction}
+      RetentionInDays: 90
 
   # Rust / jeremie-rodon  (reference implementation)
   RustJeremieRodonFunction:
@@ -162,5 +183,6 @@ Outputs:
           # >>> INSERT YOUR CONTENDER ARN HERE <<<
           # Append one line per contender, mirroring the resource block you added above:
           #   - !GetAtt <Lang><DevId>Function.Arn
+          - !GetAtt SwiftSebstoClassicFunction.Arn
           - !GetAtt RustJeremieRodonFunction.Arn
           # ----- END CONTENDER ARN LIST -----

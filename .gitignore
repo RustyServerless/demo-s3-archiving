@@ -18,3 +18,7 @@ target/
 
 # Direnv
 /.direnv
+
+# Swift
+.build/
+contenders/swift/*/scripts/out/

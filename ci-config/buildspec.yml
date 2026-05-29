@@ -45,6 +45,44 @@ phases:
         rustup show
         export PATH="/root/.cargo/bin:$PATH"
         pip3 install cargo-lambda
+      - |
+        ##############################################################
+        # Swift 6.3.2 toolchain.                                     #
+        # Adapted from the official Amazon Linux 2023 Dockerfile:    #
+        # https://github.com/swiftlang/swift-docker/blob/main/6.3/   #
+        #         amazonlinux/2023/Dockerfile                        #
+        # CodeBuild already runs on AL2023 aarch64 = same OS/arch    #
+        # as the Lambda runtime, so a native release build is what   #
+        # we need; we'll bundle the Swift runtime libs alongside the #
+        # binary in the build phase so Lambda doesn't need them.     #
+        ##############################################################
+        if ! command -v swift >/dev/null 2>&1; then
+          echo Installing Swift toolchain
+          dnf -y install \
+            binutils gcc git unzip glibc-static gzip libbsd \
+            libcurl-devel libedit libicu libstdc++-static libuuid \
+            libxml2-devel openssl-devel tar tzdata
+          dnf -y swap gnupg2-minimal gnupg2-full
+          SWIFT_VERSION=swift-6.3.2-RELEASE
+          SWIFT_BRANCH=swift-6.3.2-release
+          SWIFT_PLATFORM=amazonlinux2023
+          SWIFT_ARCH_SUFFIX=-aarch64
+          SWIFT_BIN_URL="https://download.swift.org/${SWIFT_BRANCH}/${SWIFT_PLATFORM}${SWIFT_ARCH_SUFFIX}/${SWIFT_VERSION}/${SWIFT_VERSION}-${SWIFT_PLATFORM}${SWIFT_ARCH_SUFFIX}.tar.gz"
+          SWIFT_SIG_URL="${SWIFT_BIN_URL}.sig"
+          # GPG fingerprint of the official Swift 6.x release signing key
+          # (https://swift.org/keys/all-keys.asc). Public; not a secret.
+          SWIFT_GPG_FINGERPRINT=52BB7E3DE28A71BE22EC05FFEF80A866B47A981F
+          export GNUPGHOME="$(mktemp -d)"
+          curl -fsSL "$SWIFT_BIN_URL" -o swift.tar.gz
+          curl -fsSL "$SWIFT_SIG_URL" -o swift.tar.gz.sig
+          gpg --batch --quiet --keyserver keyserver.ubuntu.com --recv-keys "$SWIFT_GPG_FINGERPRINT"
+          gpg --batch --verify swift.tar.gz.sig swift.tar.gz
+          tar -xzf swift.tar.gz --directory / --strip-components=1
+          chmod -R o+r /usr/lib/swift
+          rm -rf "$GNUPGHOME" swift.tar.gz swift.tar.gz.sig
+          unset GNUPGHOME
+        fi
+        swift --version
     finally:
       - |
         echo Changing all file times to 2010-01-01 00:00:00 \(arbitrary\) to avoid inducing changes in ZIP packages
@@ -256,6 +294,38 @@ phases:
       #       find $GO_CONTENDER_LAMBDA_PATH/$LAMBDA -mindepth 1 -not -name bootstrap -delete
       #     done
       #   fi
+
+      ###############
+      # SWIFT BUILD #
+      ###############
+      # Builds every Swift contender Lambda natively on this CodeBuild
+      # AL2023 aarch64 host. The Lambda runtime is also AL2023 aarch64,
+      # so we build with `--static-swift-stdlib` and rely on the AL2023
+      # base layer providing libFoundation*/libdispatch/etc. at runtime.
+      #
+      # Convention (mirrors Rust/Go): contenders live at
+      # `contenders/swift/<dev_id>/` as standalone SwiftPM packages whose
+      # executable product is named `bootstrap`.
+      - |
+        SWIFT_CONTENDER_LAMBDA_PATH=./contenders/swift
+        if [ -d "$SWIFT_CONTENDER_LAMBDA_PATH" ]; then
+          for LAMBDA in $(ls $SWIFT_CONTENDER_LAMBDA_PATH); do
+            echo "Building Swift contender $LAMBDA"
+            cd $SWIFT_CONTENDER_LAMBDA_PATH/$LAMBDA
+            swift build -c release --static-swift-stdlib -Xswiftc -Osize
+            BIN=$(swift build -c release --static-swift-stdlib --show-bin-path)/bootstrap
+            if [ ! -f "$BIN" ]; then
+              echo "ERROR: Swift build did not produce $BIN" >&2
+              exit 1
+            fi
+            strip "$BIN" || true
+            cd $CODEBUILD_SRC_DIR
+            cp "$SWIFT_CONTENDER_LAMBDA_PATH/$LAMBDA/$BIN" /tmp/bootstrap-$LAMBDA
+            find $SWIFT_CONTENDER_LAMBDA_PATH/$LAMBDA -mindepth 1 -delete
+            mv /tmp/bootstrap-$LAMBDA $SWIFT_CONTENDER_LAMBDA_PATH/$LAMBDA/bootstrap
+            ls -la $SWIFT_CONTENDER_LAMBDA_PATH/$LAMBDA/bootstrap
+          done
+        fi
 
       ################
       # PYTHON BUILD #
