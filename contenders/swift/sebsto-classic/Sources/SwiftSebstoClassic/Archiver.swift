@@ -9,12 +9,9 @@ import Foundation
 #endif
 
 // One downloaded file's bytes plus the byte-budget release amount.
-// CRC32 is now computed in the downloader (parallel, scaling with N download
-// tasks), not in the zipper (single-threaded bottleneck).
 struct DownloadedFile: Sendable {
     let name: String
     let bytes: Data
-    let crc32: UInt32
     let releaseBytes: Int
 }
 
@@ -131,14 +128,7 @@ private func runDownloadStage(
             await byteBudget.acquire(file.size)
             group.addTask {
                 let data = try await downloadFile(s3: s3, bucket: bucket, key: file.key, expectedSize: file.size, logger: logger)
-                // Compute CRC32 here (in parallel with all other downloads)
-                // rather than in the single-threaded zipper. With N download
-                // tasks this trades one bottleneck for N-way parallelism.
-                var crc = CRC32()
-                data.withUnsafeBytes { rawBuf in
-                    crc.update(rawBuf.bindMemory(to: UInt8.self))
-                }
-                out.send(DownloadedFile(name: file.name, bytes: data, crc32: crc.value, releaseBytes: file.size))
+                out.send(DownloadedFile(name: file.name, bytes: data, releaseBytes: file.size))
             }
         }
         try await group.waitForAll()
@@ -190,18 +180,25 @@ private func runZipStage(
     for await file in fileChannel.stream {
         let lfh = ZipHeaders.localFileHeader(name: file.name)
         let lfhOffset = offset
-        let dd = ZipHeaders.dataDescriptor(crc32: file.crc32, size: UInt64(file.bytes.count))
+        await producer.append(lfh)
+        offset += UInt64(lfh.count)
 
-        // Single actor hop per file instead of three: pass LFH + body + data
-        // descriptor as one batched call. Saves ~2 actor crossings per file
-        // = ~6000 fewer suspension points across 3000 files.
-        await producer.appendMany([lfh, file.bytes, dd])
-        offset += UInt64(lfh.count) + UInt64(file.bytes.count) + UInt64(dd.count)
+        var crc = CRC32()
+        file.bytes.withUnsafeBytes { rawBuf in
+            let typed = rawBuf.bindMemory(to: UInt8.self)
+            crc.update(typed)
+        }
+        await producer.append(file.bytes)
+        offset += UInt64(file.bytes.count)
         await byteBudget.release(file.releaseBytes)
+
+        let dd = ZipHeaders.dataDescriptor(crc32: crc.value, size: UInt64(file.bytes.count))
+        await producer.append(dd)
+        offset += UInt64(dd.count)
 
         entries.append(ZipEntry(
             name: file.name,
-            crc32: file.crc32,
+            crc32: crc.value,
             size: UInt64(file.bytes.count),
             localHeaderOffset: lfhOffset
         ))

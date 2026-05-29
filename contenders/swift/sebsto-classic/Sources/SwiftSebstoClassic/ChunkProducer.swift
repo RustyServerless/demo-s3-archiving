@@ -44,50 +44,15 @@ actor ChunkProducer {
     // Append raw bytes to the producer. Suspends if the in-flight ceiling is
     // hit, providing the backpressure that protects Lambda memory.
     func append(_ bytes: Data) async {
-        let total = bytes.count
-        let room = chunkSize - buffer.count
-
-        // Hot path: the whole input fits in the current chunk (covers every
-        // header / data descriptor / sub-chunk file). One memcpy via
-        // withUnsafeBytes + Data.append(_:count:), no slicing.
-        if total <= room {
-            bytes.withUnsafeBytes { raw in
-                if let base = raw.baseAddress {
-                    buffer.append(base.assumingMemoryBound(to: UInt8.self), count: total)
-                }
-            }
+        var remaining = bytes[...]
+        while !remaining.isEmpty {
+            let room = chunkSize - buffer.count
+            let take = Swift.min(remaining.count, room)
+            buffer.append(contentsOf: remaining.prefix(take))
+            remaining = remaining.dropFirst(take)
             if buffer.count == chunkSize {
                 await emitFullChunk()
             }
-            return
-        }
-
-        // Spill path: input crosses one or more chunk boundaries. memcpy each
-        // crossing slice via the same unsafe pointer pattern. We re-enter
-        // withUnsafeBytes per slice rather than across the await, since the
-        // pointer borrow can't span actor suspensions.
-        var cursor = 0
-        while cursor < total {
-            let stillRoom = chunkSize - buffer.count
-            let take = Swift.min(total - cursor, stillRoom)
-            bytes.withUnsafeBytes { raw in
-                if let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) {
-                    buffer.append(base + cursor, count: take)
-                }
-            }
-            cursor += take
-            if buffer.count == chunkSize {
-                await emitFullChunk()
-            }
-        }
-    }
-
-    // Coalesced append: same semantics as N consecutive `append` calls but
-    // one actor hop instead of N. Used by the zipper to push LFH + body +
-    // data descriptor in one go.
-    func appendMany(_ blobs: [Data]) async {
-        for blob in blobs {
-            await append(blob)
         }
     }
 
