@@ -72,15 +72,24 @@ phases:
           # GPG fingerprint of the official Swift 6.x release signing key
           # (https://swift.org/keys/all-keys.asc). Public; not a secret.
           SWIFT_GPG_FINGERPRINT=52BB7E3DE28A71BE22EC05FFEF80A866B47A981F
-          export GNUPGHOME="$(mktemp -d)"
-          curl -fsSL "$SWIFT_BIN_URL" -o swift.tar.gz
-          curl -fsSL "$SWIFT_SIG_URL" -o swift.tar.gz.sig
-          gpg --batch --quiet --keyserver keyserver.ubuntu.com --recv-keys "$SWIFT_GPG_FINGERPRINT"
-          gpg --batch --verify swift.tar.gz.sig swift.tar.gz
-          tar -xzf swift.tar.gz --directory / --strip-components=1
+          # Cache the Swift toolchain tarball under $CODEBUILD_SRC_DIR so the
+          # CodeBuild S3 cache can persist it across runs (~85 MB, saves ~30 s
+          # of download per build). Re-download only when the version differs.
+          mkdir -p ./.swift-cache
+          if [ ! -f "./.swift-cache/${SWIFT_VERSION}.tar.gz" ]; then
+            echo "Downloading $SWIFT_VERSION (cache miss)"
+            export GNUPGHOME="$(mktemp -d)"
+            curl -fsSL "$SWIFT_BIN_URL" -o ./.swift-cache/${SWIFT_VERSION}.tar.gz
+            curl -fsSL "$SWIFT_SIG_URL" -o ./.swift-cache/${SWIFT_VERSION}.tar.gz.sig
+            gpg --batch --quiet --keyserver keyserver.ubuntu.com --recv-keys "$SWIFT_GPG_FINGERPRINT"
+            gpg --batch --verify ./.swift-cache/${SWIFT_VERSION}.tar.gz.sig ./.swift-cache/${SWIFT_VERSION}.tar.gz
+            rm -rf "$GNUPGHOME" ./.swift-cache/${SWIFT_VERSION}.tar.gz.sig
+            unset GNUPGHOME
+          else
+            echo "Using cached $SWIFT_VERSION tarball"
+          fi
+          tar -xzf ./.swift-cache/${SWIFT_VERSION}.tar.gz --directory / --strip-components=1
           chmod -R o+r /usr/lib/swift
-          rm -rf "$GNUPGHOME" swift.tar.gz swift.tar.gz.sig
-          unset GNUPGHOME
         fi
         swift --version
     finally:
@@ -309,7 +318,11 @@ phases:
       - |
         SWIFT_CONTENDER_LAMBDA_PATH=./contenders/swift
         if [ -d "$SWIFT_CONTENDER_LAMBDA_PATH" ]; then
-          for LAMBDA in $(ls $SWIFT_CONTENDER_LAMBDA_PATH); do
+          # Iterate directories only; sibling files (e.g. DESIGN.md) must
+          # be skipped — they are not SwiftPM packages.
+          for LAMBDA_DIR in "$SWIFT_CONTENDER_LAMBDA_PATH"/*/; do
+            [ -d "$LAMBDA_DIR" ] || continue
+            LAMBDA=$(basename "$LAMBDA_DIR")
             echo "Building Swift contender $LAMBDA"
             cd $SWIFT_CONTENDER_LAMBDA_PATH/$LAMBDA
             swift build -c release --static-swift-stdlib -Xswiftc -Osize
@@ -379,3 +392,9 @@ cache:
     - rust_target_md5sum/**/* # Where we store md5sum for code
     - previous_dependencies_tree # The last seen dependencies tree
     - previous_build_rust_version # The last seen Rust toolchain version
+    # Per-contender SwiftPM caches: package checkouts + compile artifacts.
+    # Keyed under the contender directory so each Swift contender keeps
+    # its own .build state. Saves ~10 min on warm rebuilds.
+    - contenders/swift/*/.build/**/*
+    # Swift toolchain tarball cache (~85 MB, saves ~30 s download).
+    - .swift-cache/**/*
