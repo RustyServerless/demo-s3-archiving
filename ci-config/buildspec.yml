@@ -319,8 +319,11 @@ phases:
               exit 1
             fi
             strip "$BIN" || true
+            # `swift build --show-bin-path` returns an absolute path while
+            # we are still inside $SWIFT_CONTENDER_LAMBDA_PATH/$LAMBDA, so
+            # use $BIN directly — do not prepend the relative dir.
+            cp "$BIN" /tmp/bootstrap-$LAMBDA
             cd $CODEBUILD_SRC_DIR
-            cp "$SWIFT_CONTENDER_LAMBDA_PATH/$LAMBDA/$BIN" /tmp/bootstrap-$LAMBDA
             find $SWIFT_CONTENDER_LAMBDA_PATH/$LAMBDA -mindepth 1 -delete
             mv /tmp/bootstrap-$LAMBDA $SWIFT_CONTENDER_LAMBDA_PATH/$LAMBDA/bootstrap
             ls -la $SWIFT_CONTENDER_LAMBDA_PATH/$LAMBDA/bootstrap
