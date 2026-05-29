@@ -1,5 +1,54 @@
 # Plan — Add a Swift contender to `demo-s3-archiving`
 
+> ## Postscript: experiment outcome (2026-05, supersedes the recommendation below)
+>
+> The two-PR plan was executed. The predicted-layout `swift-sebsto` contender
+> was deployed and benchmarked, and it **lost** to the simpler `swift-sebsto-classic`
+> port:
+>
+> | Contender | Best run | vs Rust (~213 s) |
+> |---|---|---|
+> | `rust-jeremie-rodon` | 213 s | 1.00× |
+> | `swift-sebsto-classic` (3-stage) | 372 s (run 1), 367 s (run 7) | ~1.74× |
+> | `swift-sebsto` (predicted-layout) | 532 s (run 3) | ~2.50× |
+>
+> **Why predicted-layout did not win.** Removing the central serial zipper moved
+> the bottleneck onto `PartActor`, which is hit by *every* NIO frame rather than
+> once per file. That is roughly 250k actor hops × ~1 µs ≈ 250 ms of pure hop
+> overhead, plus the matching continuation allocations. The classic pipeline's
+> single zipper actor is hit only ~3000 times (once per file) and totals 4.4 s
+> over the whole run, so the structural "win" of predicted-layout was a loss in
+> practice.
+>
+> **Why we are not pursuing `sebsto v2` (the lock-light NIOLockedValueBox redesign
+> documented in `DESIGN-LOCK-LIGHT.md`).** The run-5 instrumentation on classic
+> revealed the actual bottleneck: per-task S3 GET throughput is ~12 MB/s vs
+> Rust's ~35 MB/s. The downloader stage sums to 1256 s of work; the zipper
+> stage sums to 4.4 s. The entire architecture-level optimisation thread above
+> — predicted-layout, lock-light, Span, etc. — was attacking the wrong target.
+> The gap is in the per-request SDK path (Soto + AsyncHTTPClient on Lambda),
+> not in the Swift concurrency model.
+>
+> **Pivot.** Work has therefore moved to:
+>
+> 1. Stay with the simpler 3-stage classic architecture (`swift-sebsto-classic`)
+>    rather than continue the predicted-layout track.
+> 2. Test whether **AWS SDK for Swift** (aws-crt-swift) closes the per-request
+>    throughput gap that Soto/AsyncHTTPClient leaves open, in
+>    `swift-sebsto-classic-awssdk`.
+>
+> The `sebsto` directory and AWS stacks (`demo-s3-archiv-sebsto-*`) and the
+> `contender/swift-sebsto` branch were deleted as part of this cleanup.
+>
+> See `contenders/swift/RESULTS.md` for the run-by-run history and profiling
+> tables.
+>
+> ---
+>
+> The original two-contender plan is kept below for context. Treat the
+> `swift-sebsto` (predicted-layout) sections as a record of what was tried, not
+> as a current recommendation.
+
 ## Context
 
 This forked repository is a Lambda-archiving benchmark: a Step Function invokes

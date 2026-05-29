@@ -1,5 +1,53 @@
 # Design — re-evaluating NIOLock and Apple Span for the Swift contenders
 
+> ## Postscript: experiment outcome (2026-05, supersedes the proposal below)
+>
+> **Status update: this redesign was never implemented.** The lock-light
+> rewrite was planned for both `swift-sebsto-classic` and `swift-sebsto v2`.
+> It was abandoned before any code landed because the run-5 profiling pass
+> changed the diagnosis.
+>
+> What we measured on `swift-sebsto-classic` run 5:
+>
+> | Stage | Sum across run | Note |
+> |---|---|---|
+> | downloadFile | **1256.8 s** | ~12 MB/s per task vs Rust's ~35 MB/s |
+> | zipperAppend | **4.4 s** | ~0.1% of runtime |
+> | uploadPart | 337.5 s | not bottleneck |
+>
+> The actor hop the lock-light design was going to remove costs 4.4 s out of
+> ~372 s. Even reducing that to zero would not move the run-price ranking. The
+> real gap to Rust is in the downloader path: per-request Soto/AsyncHTTPClient
+> overhead for S3 GET, not Swift concurrency primitives.
+>
+> The companion experiment, `swift-sebsto` v1 (predicted-layout), shipped and
+> measured 532 s — slower than `swift-sebsto-classic`. The post-mortem
+> diagnosis: predicted-layout removed the central serial zipper but moved the
+> bottleneck onto `PartActor`, which is hit by every NIO frame (~250k actor
+> hops × ~1 µs) instead of once per file (~3000 hops in classic). The
+> "structural win" was a loss in practice. `swift-sebsto v2` (this doc's
+> lock-light redesign of `PartActor` into `[NIOLockedValueBox<PartSlot>]`) was
+> never implemented because the bottleneck wasn't there either.
+>
+> **Pivot.** Work has moved to:
+>
+> 1. Keep the simpler 3-stage classic architecture (`swift-sebsto-classic`).
+> 2. Test **AWS SDK for Swift** (aws-crt-swift) in `swift-sebsto-classic-awssdk`
+>    to see whether a different HTTP client closes the per-request gap that
+>    Soto leaves open.
+>
+> The `sebsto` directory, the `demo-s3-archiv-sebsto-*` AWS stacks, and the
+> `contender/swift-sebsto` branch were deleted as part of this cleanup.
+>
+> See `contenders/swift/RESULTS.md` for the run-by-run history and profiling
+> tables.
+>
+> ---
+>
+> The original lock-light proposal follows for context. The reasoning about
+> NIOLock vs actor cost is still correct in isolation; it just wasn't the
+> lever that moved the benchmark.
+
 Status: proposal, awaiting the 2c8102a (ByteBuffer-on-classic) benchmark
 Scope: `swift-sebsto-classic` (3-stage pipeline) and `swift-sebsto` (predicted-layout)
 
