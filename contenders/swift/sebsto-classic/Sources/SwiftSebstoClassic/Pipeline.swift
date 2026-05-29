@@ -8,9 +8,14 @@ import FoundationEssentials
 import Foundation
 #endif
 
-// Tunables — mirror the Rust reference's constants so we can A/B compare.
+// Tunables. Run-5 profiling showed downloader-bound runtime: 1256 s of
+// summed download work over the run vs 4 s of zipper work. Per-task GET
+// throughput was only ~12 MB/s, vs Rust's ~35 MB/s on the same Lambda.
+// Hypothesis: 8-connection AsyncHTTPClient pool was the limit with ~10
+// concurrent download tasks. Raised the pool to 32 in main.swift and
+// expanded the byte budget here to drive ~16 concurrent downloads.
 enum Tunables {
-    static let maxDownloadsMemory: Int = 20 * 1024 * 1024  // 20 MiB
+    static let maxDownloadsMemory: Int = 40 * 1024 * 1024   // 40 MiB ≈ 16× 2-3 MB headroom
     static let maxConcurrentUploads: Int = 3
     static let chunkSize: Int = 10 * 1024 * 1024            // 10 MiB
     static let bufferChunksCount: Int = 4                   // ChunkProducer in-flight ceiling

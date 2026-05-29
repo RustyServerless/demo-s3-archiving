@@ -10,9 +10,19 @@ import FoundationEssentials
 import Foundation
 #endif
 
-// One shared HTTPClient + AWSClient + S3 client, instantiated once at cold
-// start so subsequent warm invocations skip the connection setup.
-let httpClient = HTTPClient.shared
+// One HTTPClient + AWSClient + S3 client, instantiated once at cold start
+// so subsequent warm invocations skip the connection setup.
+//
+// Run-5 profiling showed downloader-bound runtime at ~12 MB/s per task with
+// the default `HTTPClient.shared` (8 connections per host). With 10+
+// concurrent S3 GETs, requests serialize behind the pool. Raise the soft
+// limit and tighten timeouts so a misbehaving connection doesn't stall the
+// whole pipeline.
+var httpConfig = HTTPClient.Configuration()
+httpConfig.connectionPool.concurrentHTTP1ConnectionsPerHostSoftLimit = 32
+httpConfig.timeout.read = .seconds(120)
+httpConfig.timeout.connect = .seconds(10)
+let httpClient = HTTPClient(eventLoopGroupProvider: .singleton, configuration: httpConfig)
 let awsClient = AWSClient(httpClient: httpClient)
 
 let region: Region = {
