@@ -61,16 +61,19 @@ func runArchiveJob(s3: S3, job: JobInfo, logger: Logger) async throws {
     )
     logger.info("archive: multipart upload started (id=\(upload.uploadId))")
 
+    let stats = Stats()
     do {
         let parts = try await runPipeline(
             s3: s3,
             bucket: job.bucket_name,
             files: files,
             upload: upload,
+            stats: stats,
             logger: logger
         )
         try await completeMultipartUpload(s3: s3, upload: upload, parts: parts, logger: logger)
         logger.info("archive: completed (\(parts.count) parts)")
+        await stats.report(logger: logger)
     } catch {
         logger.error("archive: failed, aborting multipart upload: \(error)")
         await abortMultipartUpload(s3: s3, upload: upload, logger: logger)
@@ -85,6 +88,7 @@ private func runPipeline(
     bucket: String,
     files: [FileInfo],
     upload: MultipartUpload,
+    stats: Stats,
     logger: Logger
 ) async throws -> [S3.CompletedPart] {
     let producer = ChunkProducer(
@@ -100,6 +104,7 @@ private func runPipeline(
         files: files,
         byteBudget: byteBudget,
         out: fileChannel,
+        stats: stats,
         logger: logger
     )
     async let zipDone: Void = runZipStage(
@@ -107,12 +112,14 @@ private func runPipeline(
         in: fileChannel,
         producer: producer,
         byteBudget: byteBudget,
+        stats: stats,
         logger: logger
     )
     async let uploadResult: [S3.CompletedPart] = runUploadStage(
         s3: s3,
         producer: producer,
         upload: upload,
+        stats: stats,
         logger: logger
     )
 
@@ -129,6 +136,7 @@ private func runDownloadStage(
     files: [FileInfo],
     byteBudget: ByteSemaphore,
     out: FileChannel,
+    stats: Stats,
     logger: Logger
 ) async throws {
     try await withThrowingTaskGroup(of: Void.self) { group in
@@ -138,10 +146,12 @@ private func runDownloadStage(
             // worth of files are concurrently in-flight.
             await byteBudget.acquire(file.size)
             group.addTask {
+                let t0 = monoNs()
                 let (buffer, crc) = try await downloadFile(
                     s3: s3, bucket: bucket, key: file.key,
                     expectedSize: file.size, logger: logger
                 )
+                await stats.record(.downloadFile, ns: monoNs() - t0)
                 out.send(DownloadedFile(name: file.name, buffer: buffer, crc32: crc, releaseBytes: file.size))
             }
         }
@@ -193,6 +203,7 @@ private func runZipStage(
     in fileChannel: FileChannel,
     producer: ChunkProducer,
     byteBudget: ByteSemaphore,
+    stats: Stats,
     logger: Logger
 ) async throws {
     var entries: [ZipEntry] = []
@@ -200,17 +211,25 @@ private func runZipStage(
     var offset: UInt64 = 0
     var processed = 0
 
+    // Time the zipper *waits* on the next downloaded file: a high p50 here
+    // means the downloader is the bottleneck (zipper is starved). A low p50
+    // means files are queued up and the zipper can't keep up.
+    var queueWaitStart = monoNs()
     for await file in fileChannel.stream {
+        await stats.record(.zipperQueueWait, ns: monoNs() - queueWaitStart)
+
         let bodySize = UInt64(file.buffer.readableBytes)
         let lfh = ZipHeaders.localFileHeader(name: file.name)
         let lfhOffset = offset
         let dd = ZipHeaders.dataDescriptor(crc32: file.crc32, size: bodySize)
 
-        // One actor hop for the LFH + body + descriptor instead of three.
-        // The body goes through as a ByteBuffer so the producer can memcpy
-        // the readable bytes directly into its chunk store with no copy
-        // through Data / Sequence iteration.
+        // Time inside the chunk producer: a high p50 here means the
+        // uploader (downstream) is the bottleneck and back-pressure is
+        // pushing back through the producer.
+        let appendStart = monoNs()
         await producer.appendCompound(lfh: lfh, body: file.buffer, dataDescriptor: dd)
+        await stats.record(.zipperAppend, ns: monoNs() - appendStart)
+
         offset += UInt64(lfh.count) + bodySize + UInt64(dd.count)
         await byteBudget.release(file.releaseBytes)
 
@@ -224,6 +243,7 @@ private func runZipStage(
         if processed % 200 == 0 {
             logger.info("zip: \(processed)/\(files.count) entries")
         }
+        queueWaitStart = monoNs()
     }
 
     // Central directory + ZIP64 EOCD + locator + EOCD.
@@ -258,12 +278,19 @@ private func runUploadStage(
     s3: S3,
     producer: ChunkProducer,
     upload: MultipartUpload,
+    stats: Stats,
     logger: Logger
 ) async throws -> [S3.CompletedPart] {
     var completed: [S3.CompletedPart] = []
     try await withThrowingTaskGroup(of: S3.CompletedPart.self) { group in
         var inFlight = 0
+        // Time the uploader waits for the next sealed chunk: high p50 here
+        // = chunks aren't ready (zipper-bound). Low p50 = upload pool is
+        // saturated and chunks queue up.
+        var queueWaitStart = monoNs()
         for await chunk in producer.stream {
+            await stats.record(.uploaderQueueWait, ns: monoNs() - queueWaitStart)
+
             if inFlight >= Tunables.maxConcurrentUploads {
                 if let p = try await group.next() {
                     completed.append(p)
@@ -271,6 +298,7 @@ private func runUploadStage(
                 }
             }
             group.addTask {
+                let t0 = monoNs()
                 let cp = try await uploadPart(
                     s3: s3,
                     upload: upload,
@@ -278,10 +306,12 @@ private func runUploadStage(
                     data: chunk.data,
                     logger: logger
                 )
+                await stats.record(.uploadPart, ns: monoNs() - t0)
                 await producer.releaseSlot()
                 return cp
             }
             inFlight += 1
+            queueWaitStart = monoNs()
         }
         while let p = try await group.next() {
             completed.append(p)

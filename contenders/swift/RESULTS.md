@@ -20,7 +20,7 @@ jitter, not code change.
 | 2   | 213.3 s  | $0.001428       | classic + tuning attempt 1    |
 | 3   | 209.7 s  | $0.001398       | classic + tuning attempt 2    |
 | 4   | 213.0 s  | $0.001420       | sebsto v1 deploy              |
-| 5   | (TBD)    | (TBD)           | classic ByteBuffer hot path   |
+| 5   | 212.9 s  | $0.001419       | classic ByteBuffer hot path   |
 
 ## `swift-sebsto-classic` (3-stage pipeline: download → zipper actor → upload)
 
@@ -30,13 +30,15 @@ jitter, not code change.
 | 2   | `00fe9e7` | Tunables only: 8 MiB chunks × 6 uploads, 30 MiB byte budget.                                  | 373.2 s  | 504 MB   | $0.002488 (1.75× Rust)   |
 | 3   | `1c2a4ed` | Run 2 + CRC32 in downloader (parallel) + `appendMany` (1 actor hop / file) + pointer memcpy in `ChunkProducer`. | 376.2 s | 511 MB   | $0.002508 (1.79× Rust) ← worse |
 | —   | `3c38ea4`/`39126b6` | Reverted runs 2 & 3.                                                              |          |          |                          |
-| 4   | `2c8102a` | ByteBuffer end-to-end on hot path: downloader yields `(ByteBuffer, UInt32)`; chunk producer copies via `withUnsafeReadableBytes` + `Data.append(_:count:)`; `appendCompound(lfh:body:dataDescriptor:)` for one actor hop per file. | (TBD)    | (TBD)    | (TBD)                    |
+| 4   | `2c8102a` | ByteBuffer end-to-end on hot path: downloader yields `(ByteBuffer, UInt32)`; chunk producer copies via `withUnsafeReadableBytes` + `Data.append(_:count:)`; `appendCompound(lfh:body:dataDescriptor:)` for one actor hop per file. | 385.2 s  | (n/a)    | $0.002568 (1.81× Rust) ← worse |
 
 ### `sebsto-classic` lessons
 
 - **Upload concurrency is not the bottleneck.** Going 3 → 6 uploads with smaller chunks did nothing.
 - **Moving CRC32 to the downloader alone doesn't help** — only helps when paired with reduced per-frame allocation cost.
-- **The classic single-zipper architecture caps at ~370 s** with `Data`-based hot path. Hypothesis for run 4: the per-NIO-frame `Data.append(contentsOf: [UInt8])` (alloc + Sequence iteration) over ~250k frames is the real cost; `ByteBuffer.writeBuffer` should remove ~60% of that.
+- **`Data.append(contentsOf: [UInt8])` was *not* the bottleneck either.** Run 4 swapped the per-frame copy for `ByteBuffer.writeBuffer` + `withUnsafeReadableBytes` + `Data.append(_:count:)`. Result: 385 s (slightly *worse* than 372 s baseline). The hot-path inner loop is not where the time is going.
+- **Three failed micro-optimization attacks suggest the bottleneck is structural**, somewhere in the Soto/AsyncHTTPClient stack or in the actor + AsyncStream dispatch we haven't measured yet.
+- **The classic single-zipper architecture caps at ~370–385 s** in this stack regardless of what we do inside the hot loop.
 - **Apple `Span` / `RawSpan` can't replace actor patterns here.** They are `~Escapable`, can't cross actor boundaries or `await` suspensions.
 
 ## `swift-sebsto` (predicted-layout: PartActor random-access writer)
@@ -62,5 +64,12 @@ jitter, not code change.
 
 ## Pending experiments
 
-- **Run 5** (commit `2c8102a`) on classic: full pipeline benchmark with `ByteBuffer` hot path. Expected: 280–340 s (closing ~30–50% of the gap to Rust).
-- **`sebsto` v2** (deferred): replace `PartActor` with `[Mutex<ByteBuffer>]` array indexed by part number + per-task local file accumulators (hop budget: ~12k Mutex acquires instead of ~250k actor hops). Predicted: 220–260 s.
+- **Profile the actual hot path.** Three runs of micro-optimizations on classic have all landed in 372–385 s. Before more design work, instrument the code with timing markers on each stage (download time per file, zipper time per file, upload time per part) to see where the 372 s actually goes. Without this, every "obvious" optimization keeps missing.
+- **`sebsto` v2** (deferred): replace `PartActor` with `[NIOLockedValueBox<PartSlot>]` array indexed by part number + per-task local file accumulators. Per the `DESIGN-LOCK-LIGHT.md` design doc; predicted 220–260 s but unverified.
+
+## Hypothesis log (where time *might* be going)
+
+- **AsyncStream consumer-side polling cost** between the downloader → zipper and the zipper → uploader. Each `for await x in stream` is a per-element await that may be more expensive than direct producer-consumer.
+- **Soto request body materialization**. `AWSHTTPBody(bytes: data)` may copy. Worth checking whether passing a `ByteBuffer` body avoids it.
+- **AsyncHTTPClient's HTTP/1.1 keep-alive scheduling** when many concurrent uploads share a connection pool — the requests serialize behind connection availability even if our app code is parallel.
+- **Lambda CPU-time accounting**: at 512 MB the Lambda has ~0.29 vCPU. If our pipeline is even slightly less CPU-efficient than Rust's, the time difference compounds.
