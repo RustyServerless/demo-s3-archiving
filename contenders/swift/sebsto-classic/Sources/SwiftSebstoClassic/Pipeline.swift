@@ -8,11 +8,15 @@ import FoundationEssentials
 import Foundation
 #endif
 
-// Tunables — mirror the Rust reference's constants so we can A/B compare.
+// Tunables. Initial values mirrored the Rust reference; first benchmark run
+// showed the Swift port at 372 s vs Rust's 215 s with peak 452 MB / 512 MB,
+// indicating the upload side was under-provisioned (~40 MB/s sustained vs
+// Rust's ~70 MB/s). Bumped concurrency to better saturate the symmetric
+// 600 Mbps Lambda link while staying under the 512 MB memory ceiling.
 enum Tunables {
-    static let maxDownloadsMemory: Int = 20 * 1024 * 1024  // 20 MiB
-    static let maxConcurrentUploads: Int = 3
-    static let chunkSize: Int = 10 * 1024 * 1024            // 10 MiB
+    static let maxDownloadsMemory: Int = 30 * 1024 * 1024  // 30 MiB
+    static let maxConcurrentUploads: Int = 6
+    static let chunkSize: Int = 8 * 1024 * 1024             // 8 MiB
     static let bufferChunksCount: Int = 4                   // ChunkProducer in-flight ceiling
 }
 
