@@ -12,10 +12,14 @@ import Foundation
 // summed download work over the run vs 4 s of zipper work. Per-task GET
 // throughput was only ~12 MB/s, vs Rust's ~35 MB/s on the same Lambda.
 // Hypothesis: 8-connection AsyncHTTPClient pool was the limit with ~10
-// concurrent download tasks. Raised the pool to 32 in main.swift and
-// expanded the byte budget here to drive ~16 concurrent downloads.
+// concurrent download tasks. The pool ceiling is raised to 32 in main.swift.
+//
+// Run-7 attempted to also raise maxDownloadsMemory 20 → 40 MiB to fan out
+// to ~16 concurrent downloads, but that hit the 512 MB Lambda ceiling
+// (Max Memory Used: 511 MB, OOM-driven stall after ~600 entries). Keep
+// the byte budget at 20 MiB and let the pool change alone do the work.
 enum Tunables {
-    static let maxDownloadsMemory: Int = 40 * 1024 * 1024   // 40 MiB ≈ 16× 2-3 MB headroom
+    static let maxDownloadsMemory: Int = 20 * 1024 * 1024   // 20 MiB
     static let maxConcurrentUploads: Int = 3
     static let chunkSize: Int = 10 * 1024 * 1024            // 10 MiB
     static let bufferChunksCount: Int = 4                   // ChunkProducer in-flight ceiling
