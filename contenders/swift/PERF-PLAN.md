@@ -242,6 +242,29 @@ not configurable through public API.
   - **Open question**: would `getObject` with `.collect(upTo: 8MB)`
     body collection be faster than streaming? Would short-circuit the
     AsyncSequence iteration and let NIO read at full speed.
+  - **Probe outcome (Run 11)**: collect cuts `downloadFile` summed by
+    -5% (1228 → 1168 s) but moves wall-clock by <1%. **The
+    per-task download time is not what gates the run.** The byte
+    budget (20 MiB ÷ 5 MB ≈ 4 concurrent) is. Bigger surprise: collect
+    saves **70 MB peakRSS** vs streaming. Keep collect as the default,
+    not for speed but for RSS — it makes raising the byte budget
+    feasible.
+
+### Updated Phase C ordering (post-probe)
+
+The probe redirects the plan: the gap is byte-budget-bound, not
+streaming-overhead-bound. New ordering:
+
+1. **C1 (still first) — ByteBuffer end-to-end on upload** (H2). Free
+   ~15 GiB/run of upload-side copies. Big RSS saving expected.
+2. **C2 — Adopt collect path as default**. ~70 MB peak RSS reclaimed.
+3. **C3 — Raise byte budget** (`maxDownloadsMemory` 20 → 32 MiB or higher).
+   Direct attack on H1. Only safe after C1+C2 free headroom (Run 6
+   showed 40 MiB OOMs at 511 MB before any of these wins).
+4. **C4 — single-hop appendCompound** (cosmetic; ~0% win).
+5. **C5+ — investigate F1/F2 if still relevant.**
+
+Each is one PR, one A/B against Run 10 baseline.
 
 ### New post-A3 findings (added to PERF-PLAN scope)
 

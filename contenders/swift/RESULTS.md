@@ -121,6 +121,65 @@ Three things the new instrumentation surfaced that no prior run could see:
 These are now PERF-PLAN.md candidates for Phase B/C, in addition to the
 H1–H7 set.
 
+## Run 11 — Phase B probe: streaming vs collect A/B
+
+Phase B probe (`PROBE_COLLECT` env var) compares the default streaming
+`for try await frame in response.body` path against
+`response.body.collect(upTo:)` which buffers the whole body before
+returning. Tests F3 hypothesis (AsyncSequence overhead vs network/TLS).
+
+Stack: `demo-s3-archiv-perf-{ci,root}`. Build: `bafb743`. STATS=1.
+
+| Run | PROBE_COLLECT | Swift wall (s) | Rust (s) |
+|---|---|---|---|
+| 11.A1 | unset (streaming) | 375.0 | 210.5 |
+| 11.B1 | 1 (collect)       | 374.2 | 212.3 |
+
+**Wall-clock essentially identical.** F3 partially refuted: AsyncSequence
+overhead is not the dominant cost.
+
+### Per-stage diff (cold-1 from Run 10 vs B1)
+
+| Metric | Streaming (10.cold-1) | Collect (11.B1) | Δ |
+|---|---|---|---|
+| Wall-clock | 377.4 s | 374.2 s | -0.8% (noise) |
+| downloadFile sum | 1228.9 s | **1168.7 s** | **-60 s (-5%)** |
+| downloadFile p50 | 402 ms | 386 ms | -16 ms |
+| downloadInFrame sum | 135.9 s | 249.7 s | +114 s (different work — whole-body CRC) |
+| downloadBetweenFrames sum | 766.9 s | n/a in collect path | — |
+| zipperQueueWait sum | 369.1 s | 362.7 s | -2% |
+| uploadPart sum | 339.1 s | 369.7 s | +30 s |
+| downloadInFlight mean | 2.56 | 2.79 | +0.23 |
+| **peakRSS** | **437 MB** | **366.8 MB** | **-70 MB** |
+| **heapInUse** | **86.4 MB** | **69.6 MB** | **-17 MB** |
+
+Findings:
+
+1. **The wall-clock bottleneck is NOT per-task download time.** Cutting
+   60 s of summed download work moved the wall-clock by <1%. Mean
+   in-flight only rose 2.56 → 2.79; the byte budget (20 MiB / ~5 MB
+   files ≈ 4 concurrent) is the real concurrency cap.
+
+2. **Collect saves ~70 MB peak RSS** (and 17 MB heap). Streaming-path
+   ByteBuffer arena churn is a contributor to F1 (warm-run RSS leak).
+   This is the more interesting finding from this probe.
+
+3. The minor uploadPart slowdown (+30 s) is intra-run noise from
+   sharing the upload pool with new collect-path memory pressure
+   patterns; not statistically significant from one A/B.
+
+### Implications for Phase C
+
+The download stage is byte-budget-bound, not network-bound or
+sequence-overhead-bound. To move the wall-clock we must:
+- Free RSS (so we can raise the byte budget without OOM).
+- Raise the budget.
+- (Optionally) keep collect — it's cheap RSS.
+
+C1 (ByteBuffer end-to-end on upload) remains the highest-ROI change:
+it kills ~15 GiB/run of avoidable copies and should free ByteBufferAllocator
+arena pressure further.
+
 ## Run-by-run history
 
 ### Rust reference (`rust-jeremie-rodon`)
