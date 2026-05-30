@@ -5,6 +5,7 @@ import NIOConcurrencyHelpers
 import Darwin.C
 #elseif canImport(Glibc)
 import Glibc
+import CCRC32  // ccrc32_mallinfo_uordblks shim — Linux-only, hence the conditional import
 #elseif canImport(Musl)
 import Musl
 #endif
@@ -169,8 +170,16 @@ final class Stats: @unchecked Sendable {
         }
 
         // Peak RSS. ru_maxrss is KB on Linux, bytes on Darwin.
+        // On glibc, RUSAGE_SELF is imported as a `__rusage_who` enum but
+        // getrusage takes `__rusage_who_t` (Int32) — cast through rawValue.
+        // On Darwin RUSAGE_SELF is already an Int32 (a #define).
         var ru = rusage()
-        if getrusage(RUSAGE_SELF, &ru) == 0 {
+        #if canImport(Glibc) || canImport(Musl)
+        let who = __rusage_who_t(RUSAGE_SELF.rawValue)
+        #else
+        let who = RUSAGE_SELF
+        #endif
+        if getrusage(who, &ru) == 0 {
             #if os(Linux)
             let peakMB = Double(ru.ru_maxrss) / 1024.0
             #else
