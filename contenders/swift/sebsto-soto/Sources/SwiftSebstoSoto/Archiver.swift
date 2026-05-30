@@ -168,19 +168,28 @@ private func runDownloadStage(
     }
 }
 
-// Reads the whole object body into one ByteBuffer via Soto's
-// `response.body.collect(upTo:)`, then runs CRC32 once over the full
-// readable view.
+// Streams the body into a pre-sized ByteBuffer, then runs CRC32 once
+// over the full readable view at end-of-file.
 //
-// Phase B probe (Run 11) compared collect vs streaming
-// `for try await frame in response.body`. Wall-clock was identical
-// (374.2 vs 375.0 s) but collect saved **70 MB peakRSS** and ~17 MB
-// heapInUse — the streaming path was churning ByteBuffer arenas. We
-// adopted collect as the default in C2 because the RSS headroom
-// unlocks raising `maxDownloadsMemory` (C3) without OOM.
+// History:
+//   - Run 10/11: streaming with per-frame CRC (multiple short ccrc32
+//     calls per file) — the ARMv8 __crc32{b,h,w,d} intrinsics are
+//     fastest on long contiguous runs.
+//   - Run 13 (C2): switched to `response.body.collect(upTo:)` — single
+//     code path, single CRC pass, but +13 MB peakRSS vs C1 because
+//     `collect` grows its accumulator by doubling and the freed
+//     intermediate buffers don't return to the OS (NIO/glibc arena
+//     retention).
+//   - Run 14 (C2.5, this code): pre-allocate the destination
+//     ByteBuffer at exactly `expectedSize` (no doubling-growth, no
+//     intermediate frees), stream into it, CRC once at end. Keeps C2's
+//     code-simplification wins (single path, whole-file CRC) while
+//     eliminating C2's allocation churn.
 //
-// `expectedSize ≤ 8 MiB` by the test bucket spec (N(5 MB, 1 MB) clamped
-// to [2 MB, 8 MB]); the +1024 headroom is paranoia.
+// Memory model is now deterministic: each in-flight download owns
+// exactly one expectedSize-byte ByteBuffer. With maxDownloadsMemory =
+// 20 MiB ÷ ~5 MB ≈ 4 concurrent downloads, that's ~20 MiB of body
+// storage at any moment, predictable for raising the byte budget in C3.
 private func downloadFile(
     s3: S3,
     bucket: String,
@@ -193,23 +202,27 @@ private func downloadFile(
         S3.GetObjectRequest(bucket: bucket, key: key),
         logger: logger
     )
-    let collected = try await response.body.collect(upTo: expectedSize + 1024)
+    var out = ByteBufferAllocator().buffer(capacity: expectedSize)
+    for try await frameBuffer in response.body {
+        var frame = frameBuffer
+        out.writeBuffer(&frame)
+    }
+    if out.readableBytes != expectedSize {
+        throw ArchivingError.downloadShortRead(key: key, expected: expectedSize, got: out.readableBytes)
+    }
     var crc = CRC32()
     if Stats.enabled {
         let t0 = monoNs()
-        collected.readableBytesView.withContiguousStorageIfAvailable { ptr in
+        out.readableBytesView.withContiguousStorageIfAvailable { ptr in
             crc.update(ptr)
         }
         stats.record(.downloadInFrame, ns: monoNs() - t0)
     } else {
-        collected.readableBytesView.withContiguousStorageIfAvailable { ptr in
+        out.readableBytesView.withContiguousStorageIfAvailable { ptr in
             crc.update(ptr)
         }
     }
-    if collected.readableBytes != expectedSize {
-        throw ArchivingError.downloadShortRead(key: key, expected: expectedSize, got: collected.readableBytes)
-    }
-    return (collected, crc.value)
+    return (out, crc.value)
 }
 
 // ----- Stage B: zipper -----
