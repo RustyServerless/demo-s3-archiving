@@ -168,33 +168,19 @@ private func runDownloadStage(
     }
 }
 
-// PROBE_COLLECT switches the body-read strategy. When set ("1"/"true"/"yes"),
-// downloadFile uses Soto's `response.body.collect(upTo:)` which buffers the
-// whole object into a single ByteBuffer in one go (no per-frame
-// AsyncSequence iteration). When unset, the original streaming path runs.
+// Reads the whole object body into one ByteBuffer via Soto's
+// `response.body.collect(upTo:)`, then runs CRC32 once over the full
+// readable view.
 //
-// Phase B probe — see PERF-PLAN.md F3. The Phase A baseline showed
-// downloadBetweenFrames=767s vs downloadInFrame=136s; that 5.6× imbalance
-// could be either AsyncSequence overhead or the underlying network/TLS
-// readiness. Streaming yields lockstep through watermarks (1,1) in
-// AsyncHTTPClient, so collecting may let NIO read at full pipe speed.
+// Phase B probe (Run 11) compared collect vs streaming
+// `for try await frame in response.body`. Wall-clock was identical
+// (374.2 vs 375.0 s) but collect saved **70 MB peakRSS** and ~17 MB
+// heapInUse — the streaming path was churning ByteBuffer arenas. We
+// adopted collect as the default in C2 because the RSS headroom
+// unlocks raising `maxDownloadsMemory` (C3) without OOM.
 //
-// One-shot: read once at cold start (it's a runtime experiment, not a
-// build-time switch).
-let probeCollect: Bool = {
-    guard let v = ProcessInfo.processInfo.environment["PROBE_COLLECT"]?.lowercased() else { return false }
-    return v == "1" || v == "true" || v == "yes"
-}()
-
-// Streams chunks from getObject() into a pre-sized ByteBuffer. Computes
-// CRC32 inline as bytes flow in — parallelizes the CRC work across N
-// download tasks instead of bottlenecking it in the single zipper.
-//
-// Two body-read strategies, switched by PROBE_COLLECT:
-//   - default (streaming): `for try await frame in response.body` —
-//     locked to AsyncHTTPClient watermarks (1, 1).
-//   - probe (collect): `try await response.body.collect(upTo: 8 MiB)` —
-//     single ByteBuffer, no AsyncSequence iteration.
+// `expectedSize ≤ 8 MiB` by the test bucket spec (N(5 MB, 1 MB) clamped
+// to [2 MB, 8 MB]); the +1024 headroom is paranoia.
 private func downloadFile(
     s3: S3,
     bucket: String,
@@ -207,69 +193,23 @@ private func downloadFile(
         S3.GetObjectRequest(bucket: bucket, key: key),
         logger: logger
     )
+    let collected = try await response.body.collect(upTo: expectedSize + 1024)
     var crc = CRC32()
-
-    if probeCollect {
-        // Single-shot collect. expectedSize ≤ 8 MiB by the test bucket spec
-        // (N(5MB,1MB) clamped to [2MB,8MB]); add a small headroom in case.
-        let collected = try await response.body.collect(upTo: expectedSize + 1024)
-        if Stats.enabled {
-            // For the collect path, downloadInFrame is the CRC+nothing-else
-            // work, downloadBetweenFrames is the wait inside collect.
-            let inFrameStart = monoNs()
-            collected.readableBytesView.withContiguousStorageIfAvailable { ptr in
-                crc.update(ptr)
-            }
-            stats.record(.downloadInFrame, ns: monoNs() - inFrameStart)
-            // Approximate "between" as collect-call total minus our work;
-            // we don't have it directly because collect blocks atomically.
-            // Record the collect cost itself in downloadBetweenFrames so
-            // the total still adds to ~downloadFile.
-            // (Filled by the caller via the downloadFile timer.)
-        } else {
-            collected.readableBytesView.withContiguousStorageIfAvailable { ptr in
-                crc.update(ptr)
-            }
-        }
-        if collected.readableBytes != expectedSize {
-            throw ArchivingError.downloadShortRead(key: key, expected: expectedSize, got: collected.readableBytes)
-        }
-        return (collected, crc.value)
-    }
-
-    // Default path: streaming, with per-frame split timing when STATS=1.
-    var out = ByteBufferAllocator().buffer(capacity: expectedSize)
     if Stats.enabled {
-        var betweenSum: UInt64 = 0
-        var inFrameSum: UInt64 = 0
-        var lastReturnedAt = monoNs()
-        for try await frameBuffer in response.body {
-            let arrivedAt = monoNs()
-            betweenSum &+= arrivedAt &- lastReturnedAt
-            var frame = frameBuffer
-            frame.readableBytesView.withContiguousStorageIfAvailable { ptr in
-                crc.update(ptr)
-            }
-            out.writeBuffer(&frame)
-            let doneAt = monoNs()
-            inFrameSum &+= doneAt &- arrivedAt
-            lastReturnedAt = doneAt
+        let t0 = monoNs()
+        collected.readableBytesView.withContiguousStorageIfAvailable { ptr in
+            crc.update(ptr)
         }
-        stats.record(.downloadBetweenFrames, ns: betweenSum)
-        stats.record(.downloadInFrame, ns: inFrameSum)
+        stats.record(.downloadInFrame, ns: monoNs() - t0)
     } else {
-        for try await frameBuffer in response.body {
-            var frame = frameBuffer
-            frame.readableBytesView.withContiguousStorageIfAvailable { ptr in
-                crc.update(ptr)
-            }
-            out.writeBuffer(&frame)
+        collected.readableBytesView.withContiguousStorageIfAvailable { ptr in
+            crc.update(ptr)
         }
     }
-    if out.readableBytes != expectedSize {
-        throw ArchivingError.downloadShortRead(key: key, expected: expectedSize, got: out.readableBytes)
+    if collected.readableBytes != expectedSize {
+        throw ArchivingError.downloadShortRead(key: key, expected: expectedSize, got: collected.readableBytes)
     }
-    return (out, crc.value)
+    return (collected, crc.value)
 }
 
 // ----- Stage B: zipper -----

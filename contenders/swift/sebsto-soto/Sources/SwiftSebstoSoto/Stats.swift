@@ -51,9 +51,8 @@ final class Stats: @unchecked Sendable {
     static let enabled: Bool = statsEnabled
 
     enum Stage: String, CaseIterable {
-        case downloadFile           // Time inside `getObject` body iteration (download + CRC).
-        case downloadBetweenFrames  // Time waiting on AsyncSequence next() (cumulative per file).
-        case downloadInFrame        // Time inside one frame: CRC + memcpy (cumulative per file).
+        case downloadFile           // Time inside `getObject` body collect + CRC.
+        case downloadInFrame        // Time of the CRC pass over the collected body.
         case zipperQueueWait        // Time the zipper waits for the next downloaded file.
         case zipperAppend           // Time inside `producer.appendCompound`.
         case uploadPart             // Time inside `S3.uploadPart`.
