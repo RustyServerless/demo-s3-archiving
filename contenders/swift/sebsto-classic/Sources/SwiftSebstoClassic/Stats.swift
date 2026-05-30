@@ -14,9 +14,20 @@ import FoundationEssentials
 import Foundation
 #endif
 
+// Read once at cold start. Truthy values: "1", "true", "yes" (case-insensitive).
+// When false, Stats.record/report are no-ops — no actor state mutation, no log
+// lines. The monoNs() reads at call sites still happen but cost ~30 ns each.
+let statsEnabled: Bool = {
+    guard let v = ProcessInfo.processInfo.environment["STATS"]?.lowercased() else { return false }
+    return v == "1" || v == "true" || v == "yes"
+}()
+
 // One-shot profiling instrument. Each public method records a duration in
 // nanoseconds for one event of one stage. At the end of a run, `report(...)`
 // emits aggregate stats (count + sum + p50 + p95 + p99) per stage.
+//
+// Gated on `statsEnabled` (env var STATS). When disabled, record/report
+// return immediately so there's no overhead and no log noise.
 //
 // Implemented as an actor purely for thread-safety: it's called only from
 // non-hot paths (around per-file boundaries, around per-part uploads), so
@@ -39,10 +50,12 @@ actor Stats {
     private var samples: [Stage: [UInt64]] = [:]
 
     func record(_ stage: Stage, ns: UInt64) {
+        guard statsEnabled else { return }
         samples[stage, default: []].append(ns)
     }
 
     func report(logger: Logger) {
+        guard statsEnabled else { return }
         for stage in Stage.allCases {
             guard let s = samples[stage], !s.isEmpty else { continue }
             let sorted = s.sorted()
