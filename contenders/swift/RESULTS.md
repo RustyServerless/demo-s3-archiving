@@ -180,6 +180,62 @@ C1 (ByteBuffer end-to-end on upload) remains the highest-ROI change:
 it kills ~15 GiB/run of avoidable copies and should free ByteBufferAllocator
 arena pressure further.
 
+## Run 12 — Phase C1: ByteBuffer end-to-end on upload
+
+Stack: same. Build: `e48c5e5`. STATS=1, PROBE_COLLECT unset (streaming
+path) — isolates C1 from C2.
+
+Change: ChunkProducer's internal buffer Data → ByteBuffer; uploadPart
+uses AWSHTTPBody(buffer:). Eliminates ~15 GiB/run of avoidable copies
+(soto-core AWSHTTPBody.swift:44).
+
+| Run | Type | Swift (s) | Rust (s) | run_price_usd | Ratio |
+|---|---|---|---|---|---|
+| 12.cold-1 | cold | 365.6 | 211.2 | $0.002437 | 1.73× |
+| 12.cold-2 | cold | 371.6 | 210.9 | $0.002477 | 1.76× |
+
+vs Run 10 baseline (median 374.7 s, range 374.3–377.4): **-3 to -9 s**,
+~1–3% wall-clock improvement.
+
+### Per-stage diff (Run 10 cold-1 → 12.cold-2)
+
+| Metric | 10.cold-1 | 12.cold-2 | Δ |
+|---|---|---|---|
+| Wall-clock | 377.4 s | 371.6 s | **-5.8 s (-1.5%)** |
+| **uploadPart sum** | **339.1 s** | **326.3 s** | **-12.8 s (-3.8%)** ← direct C1 effect |
+| **zipperAppend sum** | **5.1 s** | **3.0 s** | **-2.1 s (-42%)** |
+| downloadFile sum | 1228.9 s | 1208.1 s | -20.8 s |
+| downloadBetweenFrames | 766.9 s | 726.5 s | -40 s |
+| downloadInFrame | 135.9 s | 150.0 s | +14 s |
+| zipperQueueWait | 369.1 s | 366.0 s | -3 s |
+| uploaderQueueWait | 374.6 s | 369.0 s | -6 s |
+| downloadInFlight mean | 2.56 | 1.70 | **-0.86 (regression)** |
+| **peakRSS** | **437.1 MB** | **418.7 MB** | **-18 MB** |
+| heapInUse | 86.4 MB | 103.0 MB | +17 MB |
+| Max Memory Used | n/a | 445 MB | (CloudWatch report) |
+
+### Findings
+
+- **C1 directly delivered a 12.8 s save on `uploadPart` and 2.1 s on
+  `zipperAppend`.** Both are the predicted effects of removing the
+  Data→ByteBuffer copy on the upload hot path.
+- Wall-clock only moved -1.5% because the run is byte-budget-bound:
+  saving upload time doesn't shrink the wall-clock unless stage A can
+  run more concurrent downloads. **`downloadInFlight` mean actually
+  went *down*** (2.56 → 1.70) — different timing of acquire/release
+  through the byte budget.
+- **18 MB peakRSS reclaimed.** Combined with ~70 MB from C2 (Run 11),
+  we'd have ~88 MB headroom — enough to raise `maxDownloadsMemory`
+  from 20 → 28 MiB without OOM (Run 6 OOM'd at 511 MB / 40 MiB
+  budget; CW Max Memory Used here = 445 MB).
+- heapInUse climbed (86 → 103 MB) — more ByteBuffer-arena state held
+  by the producer, but offset by the absence of upload-path copies.
+
+### Decision
+
+Keep C1. Continue to C2 (collect as default) and C3 (raise byte
+budget) — together they should unblock the wall-clock.
+
 ## Run-by-run history
 
 ### Rust reference (`rust-jeremie-rodon`)
