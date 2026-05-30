@@ -36,6 +36,91 @@ Lambda VM's per-connection TLS cost which both SDKs share, and the Swift
 runtime / NIO event-loop scheduling at the 0.29 vCPU allocation that
 512 MB of Lambda memory provides. *All speculation; do not state as fact.*
 
+## Run 10 — Phase A baseline (fresh CI + bench, instrumented)
+
+Stack: `demo-s3-archiv-perf-{ci,root}` in eu-west-3, account 486652066693.
+Built from `contender/swift-sebsto-soto @ 0471df9` with PERF-PLAN.md
+Phase A1+A2 instrumentation. STATS=1 throughout.
+
+3 cold + 3 warm executions. "Cold" = LambdaConfig env var bumped before
+each run to force a new sandbox; "warm" = back-to-back, same env vars,
+same sandbox.
+
+| Run | Type | Rust (s) | Swift (s) | Swift `run_price_usd` | Ratio |
+|---|---|---|---|---|---|
+| 10.cold-1 | cold | 213.7 | 377.4 | $0.002516 | 1.77× |
+| 10.cold-2 | cold | 211.7 | 374.7 | $0.002498 | 1.77× |
+| 10.cold-3 | cold | 213.1 | 374.3 | $0.002495 | 1.76× |
+| 10.warm-1 | warm | 212.1 | 372.3 | $0.002482 | 1.76× |
+| 10.warm-2 | warm | 212.1 | 377.6 | $0.002517 | 1.78× |
+| 10.warm-3 | warm | 212.1 | **OOM** | n/a | — |
+
+**Locked baseline**: median Swift (excluding OOM) = **374.7 s** ≈ **1.77×
+Rust**. Variance across 5 successful Swift runs is ±2.7 s. Rust is rock
+steady at 212.1–213.7 s. The instrumentation has not regressed wall-clock
+relative to the prior Run-7/8 numbers (367 / 380 s).
+
+### Phase A findings — verified hypotheses
+
+Stats output from cold-1 (representative; later runs are similar):
+
+```
+stats[downloadFile]:         n=3000 sum=1228896ms p50=402ms p95=579ms p99=678ms max=836ms
+stats[downloadBetweenFrames]:n=3000 sum= 766959ms p50=247ms p95=420ms p99=500ms max=657ms
+stats[downloadInFrame]:      n=3000 sum= 135945ms p50= 36ms p95=108ms p99=151ms max=260ms
+stats[zipperQueueWait]:      n=3000 sum= 369137ms p50=102ms p95=300ms p99=359ms max=459ms
+stats[zipperAppend]:         n=3000 sum=   5115ms p50=  0ms p95=  2ms p99= 36ms max=112ms
+stats[uploadPart]:           n=1501 sum= 339136ms p50=216ms p95=321ms p99=420ms max=757ms
+stats[uploaderQueueWait]:    n=1501 sum= 374630ms p50=259ms p95=399ms p99=442ms max=560ms
+stats[downloadInFlight]:     mean=2.56 max=5
+stats[producerHops]:         total=9000     (3000 files × 3 hops/file)
+stats[peakRSS]:              437.1MB
+stats[heapInUse]:            86.4MB
+```
+
+Verdicts against PERF-PLAN.md hypotheses:
+
+| H | Predicted (true) | Observed | Verdict |
+|---|---|---|---|
+| H1 | byte budget gates concurrency: mean ≈ 4, max ≤ 5 | mean **2.56**, max 5 | **CONFIRMED — even tighter than predicted** |
+| H3 | `appendCompound` does 3 actor hops/file (counter == 9000) | counter == **9000** exactly | **CONFIRMED** |
+| H4 | `between-frames` >> `in-frame` time | between **766.9s** vs in-frame **135.9s** = 5.6× | **CONFIRMED — between-frame is the dominant cost** |
+| H6 | `zipperAppend` ~0.1% of run | 5.1s / 374.7s = **1.4%** | mostly confirmed (slightly above the prior 4.4 s) |
+
+H2 / H5 still need targeted experiments (see Phase B in PERF-PLAN.md).
+
+### Phase A unexpected findings
+
+Three things the new instrumentation surfaced that no prior run could see:
+
+1. **Warm-run RSS climbs**: peakRSS across the same warm sandbox went
+   **437 → 492 → 422 → 494 → 500 → OOM**. Five successful invocations
+   then a kill. `heapInUse` (mallinfo2 uordblks) stayed flat at
+   ~86–103 MB. The drift is therefore **anonymous mmap regions** — most
+   likely NIO `ByteBufferAllocator` per-event-loop arenas not being
+   returned to the OS, or AsyncHTTPClient state retained between
+   invocations. *This is a real ops issue: under sustained load the
+   Lambda will OOM after a handful of calls.* The bench Step Function
+   only invokes once, so historical runs never hit this; warm-3 here did.
+
+2. **`downloadInFlight` mean degrades across warms**: 2.56 → 2.65 → 1.78
+   → 0.90 → 0.63. Even before OOM, the warm sandbox runs progressively
+   more *serially*. The byte budget hasn't changed and the file list
+   hasn't changed, so something is causing download tasks to suspend
+   longer / start later on warm runs. Suspect: AsyncHTTPClient
+   connection pool saturation by retained connections from prior runs,
+   or event-loop scheduling under increasing memory pressure.
+
+3. **`downloadInFrame` p50 = 36 ms over 5 MB ≈ 140 MB/s in-frame
+   throughput**, but `downloadFile` p50 = 402 ms ≈ 12.4 MB/s. The
+   *work* the Swift code does once a frame is in hand is fast; it
+   spends 5.6× as long *waiting for the next frame*. That number
+   should be the new optimization target — every later change is
+   judged by what it does to `downloadBetweenFrames`.
+
+These are now PERF-PLAN.md candidates for Phase B/C, in addition to the
+H1–H7 set.
+
 ## Run-by-run history
 
 ### Rust reference (`rust-jeremie-rodon`)

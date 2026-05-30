@@ -168,14 +168,33 @@ private func runDownloadStage(
     }
 }
 
+// PROBE_COLLECT switches the body-read strategy. When set ("1"/"true"/"yes"),
+// downloadFile uses Soto's `response.body.collect(upTo:)` which buffers the
+// whole object into a single ByteBuffer in one go (no per-frame
+// AsyncSequence iteration). When unset, the original streaming path runs.
+//
+// Phase B probe — see PERF-PLAN.md F3. The Phase A baseline showed
+// downloadBetweenFrames=767s vs downloadInFrame=136s; that 5.6× imbalance
+// could be either AsyncSequence overhead or the underlying network/TLS
+// readiness. Streaming yields lockstep through watermarks (1,1) in
+// AsyncHTTPClient, so collecting may let NIO read at full pipe speed.
+//
+// One-shot: read once at cold start (it's a runtime experiment, not a
+// build-time switch).
+let probeCollect: Bool = {
+    guard let v = ProcessInfo.processInfo.environment["PROBE_COLLECT"]?.lowercased() else { return false }
+    return v == "1" || v == "true" || v == "yes"
+}()
+
 // Streams chunks from getObject() into a pre-sized ByteBuffer. Computes
 // CRC32 inline as bytes flow in — parallelizes the CRC work across N
 // download tasks instead of bottlenecking it in the single zipper.
 //
-// Uses ByteBuffer (not Data) to keep the bytes in NIO's native form: the
-// hot per-frame path becomes `out.writeBuffer(&frame)` (one memcpy, no
-// Sequence iteration), versus the previous `Data.append(contentsOf:)` which
-// allocated and copied byte-by-byte.
+// Two body-read strategies, switched by PROBE_COLLECT:
+//   - default (streaming): `for try await frame in response.body` —
+//     locked to AsyncHTTPClient watermarks (1, 1).
+//   - probe (collect): `try await response.body.collect(upTo: 8 MiB)` —
+//     single ByteBuffer, no AsyncSequence iteration.
 private func downloadFile(
     s3: S3,
     bucket: String,
@@ -188,13 +207,39 @@ private func downloadFile(
         S3.GetObjectRequest(bucket: bucket, key: key),
         logger: logger
     )
-    var out = ByteBufferAllocator().buffer(capacity: expectedSize)
     var crc = CRC32()
+
+    if probeCollect {
+        // Single-shot collect. expectedSize ≤ 8 MiB by the test bucket spec
+        // (N(5MB,1MB) clamped to [2MB,8MB]); add a small headroom in case.
+        let collected = try await response.body.collect(upTo: expectedSize + 1024)
+        if Stats.enabled {
+            // For the collect path, downloadInFrame is the CRC+nothing-else
+            // work, downloadBetweenFrames is the wait inside collect.
+            let inFrameStart = monoNs()
+            collected.readableBytesView.withContiguousStorageIfAvailable { ptr in
+                crc.update(ptr)
+            }
+            stats.record(.downloadInFrame, ns: monoNs() - inFrameStart)
+            // Approximate "between" as collect-call total minus our work;
+            // we don't have it directly because collect blocks atomically.
+            // Record the collect cost itself in downloadBetweenFrames so
+            // the total still adds to ~downloadFile.
+            // (Filled by the caller via the downloadFile timer.)
+        } else {
+            collected.readableBytesView.withContiguousStorageIfAvailable { ptr in
+                crc.update(ptr)
+            }
+        }
+        if collected.readableBytes != expectedSize {
+            throw ArchivingError.downloadShortRead(key: key, expected: expectedSize, got: collected.readableBytes)
+        }
+        return (collected, crc.value)
+    }
+
+    // Default path: streaming, with per-frame split timing when STATS=1.
+    var out = ByteBufferAllocator().buffer(capacity: expectedSize)
     if Stats.enabled {
-        // Split per-frame time into (a) waiting on response.body's next()
-        // (= AsyncSequence + AsyncHTTPClient + decryption + network) and
-        // (b) the work we do once a frame arrived (CRC + memcpy). Tests
-        // H4 from PERF-PLAN.md — is the bottleneck "next()" or "in-frame".
         var betweenSum: UInt64 = 0
         var inFrameSum: UInt64 = 0
         var lastReturnedAt = monoNs()

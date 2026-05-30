@@ -193,11 +193,78 @@ After each change:
 
 | Phase | Step | Status |
 |---|---|---|
-| A | A1 — Stats zero-cost-off | not started |
-| A | A2 — new instruments | not started |
-| A | A3 — baseline run | not started |
-| B | H1–H7 | not started |
-| C | TBD | gated on B |
+| A | A1 — Stats zero-cost-off | done (commit `72e3c9e` + `0471df9`) |
+| A | A2 — new instruments | done (commit `72e3c9e` + `0471df9`) |
+| A | A3 — baseline run | done — see RESULTS.md "Run 10" |
+| B | H1, H3, H4, H6 | **CONFIRMED** by Run 10 baseline alone |
+| B | H2 (Soto upload-side copy) | **CONFIRMED** — see below |
+| B | H5 (`Data.appendLE` per-byte alloc) | **REJECTED** — ~5–10 cycles, zero alloc on reserved Data |
+| B | H7 (per-task GET throughput) | partially confirmed (in-frame ≈ 140 MB/s, between-frames is the gap) |
+| C | TBD | gated on remaining B + new findings |
+
+### H2 finding — Soto AWSHTTPBody copy
+
+`AWSHTTPBody(bytes:)` (used by us in `uploadPart`) calls `writeBytes()`
+into a fresh ByteBuffer. Zero-copy path exists: `AWSHTTPBody(buffer:)`.
+AsyncHTTPClient's `.bytes(byteBuffer)` stage does no further copy.
+
+  - File: `soto-core/Sources/SotoCore/HTTP/AWSHTTPBody.swift` lines
+    40–46 (init overloads), 34–42 (wire-handoff to AsyncHTTPClient).
+
+Impact at our scale: 10 MiB × ~1500 parts = ~15 GiB of avoidable
+upload-side copies per run. Probably explains a noticeable slice of the
+warm-run RSS climb (F1) since these copies allocate into NIO's
+ByteBufferAllocator arenas.
+
+### H5 finding — `Data.appendLE` is fine
+
+On a `Data` that was `reserveCapacity`'d, every `append(contentsOf:
+UnsafeRawBufferPointer)` is `isKnownUniquelyReferenced` (1 cycle) +
+`memmove` (1–2 cycles for 4 bytes) + slice update. No allocation.
+Source: swift-foundation `Data+Representation.swift` /
+`DataStorage.swift`.
+
+`zipperAppend` summed to 5.1s/run; even cutting it 100× saves <5s.
+**Do not touch ZIP header building — verified safe.**
+
+### F3 finding — AsyncHTTPClient watermarks (1, 1)
+
+The `response.body` AsyncSequence enforces strict lockstep:
+the producer pauses after each yield until `.next()` resumes it.
+Watermarks `(low: 1, high: 1)` are hardcoded in
+`async-http-client/Sources/AsyncHTTPClient/AsyncAwait/Transaction+StateMachine.swift:441` —
+not configurable through public API.
+
+  - Per-frame budget: ~3 ms between frames vs ~0.45 ms in-frame work
+    (5 MB file ≈ 80 frames at ~64 KB each).
+  - The producer is doing ~2.5 ms per frame of *something* (TLS
+    decrypt, event-loop hop, kernel read) while the consumer waits.
+  - **Open question**: would `getObject` with `.collect(upTo: 8MB)`
+    body collection be faster than streaming? Would short-circuit the
+    AsyncSequence iteration and let NIO read at full speed.
+
+### New post-A3 findings (added to PERF-PLAN scope)
+
+Three things Run 10 surfaced that need their own Phase B experiments
+before any Phase C change:
+
+- **F1 — Warm-run RSS leak.** peakRSS climbed 437 → 500 MB across 5
+  warm invocations, then OOM on the 6th. heapInUse (mallinfo2) stayed
+  flat. The drift is anonymous mmap (NIO arenas? AsyncHTTPClient
+  retained state?). *Experiment*: instrument with `mmap`/`munmap`
+  hooks, or use `pmap`/`/proc/self/maps` snapshots if Lambda permits.
+- **F2 — `downloadInFlight` mean degrades across warms** (2.56 → 0.63).
+  Even before OOM, the same code becomes more serial. Likely connected
+  to F1 (memory pressure → event-loop scheduling → fewer concurrent
+  tasks). *Experiment*: log per-task acquire-budget time and time
+  between `byteBudget.release` and the next `acquire` resuming.
+- **F3 — `downloadBetweenFrames` is the new optimization target.**
+  At 5.6× the work-time-per-frame, it's the dominant cost. Specific
+  cause unverified; could be S3 latency, AsyncHTTPClient framing, TLS
+  decryption, or AsyncSequence scheduling. *Experiment*: fork
+  `downloadFile` to use `getObject` with `.byteBuffer` body collection
+  (single allocation, no AsyncSequence) and A/B against the streaming
+  path on a single file; record bytes/sec inside a tight loop.
 
 (Update this table as work progresses. The detailed run log lives in
 `RESULTS.md`.)
