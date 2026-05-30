@@ -293,6 +293,66 @@ the way Run 11 suggested.
 C3 is the next move — but go conservative: try byte budget 20 → 24 MiB
 first.
 
+## Run 14 — Phase C2.5: pre-sized ByteBuffer + single-pass CRC
+
+Stack: same. Build: `7772f42`. STATS=1.
+
+Hybrid of Run 11 (collect's single CRC pass + simpler code) and Run 10
+(pre-sized ByteBuffer with deterministic per-file allocation). Replaces
+`response.body.collect(upTo:)` with: pre-allocate ByteBuffer at exactly
+`expectedSize`, stream `for try await frame in response.body` into it,
+single CRC pass at end.
+
+| Run | Type | Swift (s) | Rust (s) | run_price_usd | Ratio |
+|---|---|---|---|---|---|
+| 14.cold-1 | cold | **363.7** | 209.2 | $0.002425 | **1.74×** |
+| 14.cold-2 | cold | **363.9** | 212.8 | $0.002426 | **1.71×** |
+
+**Best Swift wall-clock to date.** Both runs within 0.2 s — very tight.
+
+### Per-stage diff (C2 cold-2 → C2.5 cold-1)
+
+| Metric | C2 cold-2 | C2.5 cold-1 | Δ |
+|---|---|---|---|
+| **Wall-clock** | 368.7 s | **363.7 s** | **-5.0 s** |
+| **peakRSS** | 431.4 MB | **388.4 MB** | **-43 MB** |
+| **Max Memory Used (CW)** | 460 MB | **417 MB** | **-43 MB** |
+| downloadFile sum | 1171.9 s | 1136.6 s | -35 s |
+| downloadInFrame | 254.2 s | 245.2 s | -9 s |
+| zipperQueueWait | 355.2 s | 348.8 s | -6 s |
+| zipperAppend | 9.9 s | 11.9 s | +2 s |
+| uploadPart | 334.2 s | 342.1 s | +8 s |
+| uploaderQueueWait | 365.8 s | 360.9 s | -5 s |
+| downloadInFlight mean | 2.69 | 1.96 | -0.7 |
+| heapInUse | 86.4 MB | 102.8 MB | +16 MB |
+
+### Findings
+
+- **Pre-sizing the ByteBuffer fixed C2's RSS regression and then some.**
+  Max Memory Used dropped from 460 → 417 MB, the lowest yet. Confirms
+  the C2 hypothesis: `response.body.collect(upTo:)` was growing its
+  internal accumulator by doubling, leaking intermediate buffers into
+  NIO/glibc arenas.
+- Wall-clock improved 5 s vs C2, even though the per-stage breakdown
+  shows downloadFile -35 s of summed work — the rest of the saving was
+  absorbed by lower mean concurrency (1.96 vs 2.69). Same byte-budget-
+  bound pattern as C1.
+- **95 MB headroom** to the 512 MB ceiling. C3 can be more
+  aggressive than the conservative "+4 MiB" plan: bumping
+  `maxDownloadsMemory` from 20 → 32 MiB adds at most ~12 MiB of body
+  storage per concurrent download — well within the 95 MB cushion.
+
+### Decision
+
+Keep C2.5. Current best: **363.7 s, 1.71× Rust, $0.002425**.
+
+Total Phase C wins so far vs Run 10 baseline (374.7 s):
+- Wall-clock: -11.0 s (-3%)
+- Max Memory Used: -43 MB (vs Run 10 437 MB peakRSS, now 417 MB)
+
+C3 is next. With ~95 MB headroom we can try `maxDownloadsMemory` 20 →
+32 MiB without expecting OOM.
+
 ## Run-by-run history
 
 ### Rust reference (`rust-jeremie-rodon`)
