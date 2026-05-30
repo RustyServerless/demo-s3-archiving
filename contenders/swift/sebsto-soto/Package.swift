@@ -2,10 +2,10 @@
 import PackageDescription
 
 let package = Package(
-    name: "sebsto-classic",
+    name: "sebsto-soto",
     platforms: [.macOS(.v15)],
     products: [
-        .executable(name: "bootstrap", targets: ["SwiftSebstoClassic"])
+        .executable(name: "bootstrap", targets: ["SwiftSebstoSoto"])
     ],
     dependencies: [
         .package(url: "https://github.com/awslabs/swift-aws-lambda-runtime.git", from: "2.0.0"),
@@ -16,7 +16,7 @@ let package = Package(
     ],
     targets: [
         .executableTarget(
-            name: "SwiftSebstoClassic",
+            name: "SwiftSebstoSoto",
             dependencies: [
                 .product(name: "AWSLambdaRuntime", package: "swift-aws-lambda-runtime"),
                 .product(name: "SotoS3", package: "soto"),

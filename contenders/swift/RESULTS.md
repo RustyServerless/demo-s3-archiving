@@ -11,7 +11,7 @@ ranking metric).
 | Contender | Best run | Mem peak | `run_price_usd` | Ratio vs Rust |
 |---|---|---|---|---|
 | `rust-jeremie-rodon` (reference) | 213.0 s | ~350 MB | $0.001420 | 1.00× |
-| `swift-sebsto-classic` (Soto)    | 366.9 s (Run 7) / 379.8 s (Run 8) | 470–511 MB | $0.002446 (Run 7) / $0.002532 (Run 8) | 1.72×–1.78× |
+| `swift-sebsto-soto` (Soto)    | 366.9 s (Run 7) / 379.8 s (Run 8) | 470–511 MB | $0.002446 (Run 7) / $0.002532 (Run 8) | 1.72×–1.78× |
 | `swift-sebsto-classic-awssdk` (AWS SDK) | timed out at 600 s | 363 MB | n/a (failed) | — |
 
 Soto is the **shippable Swift variant**. The AWS SDK port is kept on a
@@ -21,7 +21,7 @@ sibling branch (`contender/swift-sebsto-classic-awssdk`) for reference.
 
 After nine end-to-end benchmark runs across two architectures (3-stage
 classic, predicted-layout) and two SDKs (Soto, AWS SDK for Swift), the
-shippable Swift contender is **`swift-sebsto-classic` on Soto**. It runs at
+shippable Swift contender is **`swift-sebsto-soto` on Soto**. It runs at
 ~1.72×–1.78× the Rust reference's wall-clock time, which puts it second in
 `run_price_usd` ranking — behind Rust, ahead of any other language we have
 shipped.
@@ -240,7 +240,7 @@ SM=$(aws cloudformation describe-stacks --stack-name demo-s3-archiving-root \
 
 # 2) (Optional) Enable per-stage profiling on the Soto contender
 aws lambda update-function-configuration \
-  --function-name demo-s3-archiving-swift-sebsto-classic \
+  --function-name demo-s3-archiving-swift-sebsto-soto \
   --environment 'Variables={STATS=1}'
 
 # 3) Trigger the benchmark
@@ -249,12 +249,12 @@ aws stepfunctions start-execution \
   --input "$CONTENDERS"
 
 # 4) Watch in the Step Functions console; read ranked output from the final
-#    state. CloudWatch Logs for /aws/lambda/demo-s3-archiving-swift-sebsto-classic
+#    state. CloudWatch Logs for /aws/lambda/demo-s3-archiving-swift-sebsto-soto
 #    will contain the per-stage Stats lines if STATS=1 was set.
 
 # 5) When done, disable Stats again
 aws lambda update-function-configuration \
-  --function-name demo-s3-archiving-swift-sebsto-classic \
+  --function-name demo-s3-archiving-swift-sebsto-soto \
   --environment 'Variables={}'
 ```
 

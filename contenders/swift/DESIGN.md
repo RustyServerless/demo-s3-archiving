@@ -1,7 +1,7 @@
-# Swift contender — `sebsto-classic` (Soto)
+# Swift contender — `sebsto-soto` (Soto)
 
 Architectural reference for the shippable Swift contender in this repo:
-`contenders/swift/sebsto-classic/`. This is the variant that lands ZIPs end-to-end
+`contenders/swift/sebsto-soto/`. This is the variant that lands ZIPs end-to-end
 and posts measurable `run_price_usd` numbers (~380 s / 1.72× the Rust reference).
 
 This document describes **what the code does today**. For the run-by-run
@@ -13,7 +13,7 @@ architecture on top of the AWS SDK for Swift instead of Soto; it timed out at
 at the end of this doc.
 
 A third variant, `swift-sebsto` (predicted-layout, parallel writer using a
-`PartActor`), was built and benchmarked at 532 s — slower than `sebsto-classic`
+`PartActor`), was built and benchmarked at 532 s — slower than `sebsto-soto`
 — and removed from the repo. The full post-mortem is in `RESULTS.md`; see the
 project's git history (`contender/swift-sebsto` branch, deleted) for the code.
 
@@ -209,7 +209,7 @@ A/B comparison). ZIP64 is mandatory: the archive total exceeds 4 GiB.
 Filenames are pure ASCII (SHA-256 hex, 64 chars), so no UTF-8 GP-flag tweaks
 are required. There are no directory entries and no extra fields beyond the
 mandatory ZIP64 one. All implementation lives in
-`Sources/SwiftSebstoClassic/Zip/Headers.swift`.
+`Sources/SwiftSebstoSoto/Zip/Headers.swift`.
 
 ## Optional profiling instrumentation — `STATS=1`
 
@@ -225,7 +225,7 @@ To enable for one run:
 
 ```bash
 aws lambda update-function-configuration \
-  --function-name demo-s3-archiving-swift-sebsto-classic \
+  --function-name demo-s3-archiving-swift-sebsto-soto \
   --environment 'Variables={STATS=1}'
 ```
 
@@ -240,10 +240,10 @@ in `RESULTS.md` and is the way to investigate further regressions.
 The clock used is `clock_gettime(CLOCK_MONOTONIC)` via a platform-conditional
 libc import (`Darwin.C`, `Glibc`, `Musl`) — see `monoNs()` in `Stats.swift`.
 
-## File map (sebsto-classic)
+## File map (sebsto-soto)
 
 ```
-contenders/swift/sebsto-classic/
+contenders/swift/sebsto-soto/
 ├── Package.swift                        SwiftPM manifest, Swift 6.0
 ├── Package.resolved
 ├── scripts/test-codebuild-locally.sh    Manual reproduce-the-CI-build helper
@@ -251,7 +251,7 @@ contenders/swift/sebsto-classic/
     ├── CCRC32/
     │   ├── ccrc32.c                     ARMv8 __crc32 intrinsics + sw fallback
     │   └── include/ccrc32.h
-    └── SwiftSebstoClassic/
+    └── SwiftSebstoSoto/
         ├── main.swift                   Cold-start: HTTPClient, AWSClient, S3,
         │                                LambdaRuntime entry point.
         ├── Pipeline.swift               Tunables, FileInfo/JobInfo, listFiles,
@@ -325,7 +325,7 @@ Notes:
 Two `AWS::Serverless::Function` blocks plus matching `AWS::Logs::LogGroup`
 entries are registered:
 
-- `SwiftSebstoClassicFunction` — `CodeUri: ../contenders/swift/sebsto-classic`
+- `SwiftSebstoSotoFunction` — `CodeUri: ../contenders/swift/sebsto-soto`
 - `SwiftSebstoClassicAWSSDKFunction` — sibling experiment, see below
 
 Both use `Runtime: provided.al2023`, `MemorySize: 512`, `Timeout: 600`,
