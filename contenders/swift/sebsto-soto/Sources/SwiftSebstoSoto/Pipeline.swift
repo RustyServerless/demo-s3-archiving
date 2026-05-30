@@ -118,14 +118,18 @@ func uploadPart(
     s3: S3,
     upload: MultipartUpload,
     partNumber: Int,
-    data: Data,
+    data: ByteBuffer,
     logger: Logger
 ) async throws -> S3.CompletedPart {
+    // AWSHTTPBody(buffer:) is zero-copy — Soto wraps the ByteBuffer
+    // directly and AsyncHTTPClient streams it without re-copying.
+    // See PERF-PLAN.md H2 finding (verified by reading
+    // soto-core/Sources/SotoCore/HTTP/AWSHTTPBody.swift:40).
     let response = try await s3.uploadPart(
         S3.UploadPartRequest(
-            body: AWSHTTPBody(bytes: data),
+            body: AWSHTTPBody(buffer: data),
             bucket: upload.bucket,
-            contentLength: Int64(data.count),
+            contentLength: Int64(data.readableBytes),
             key: upload.key,
             partNumber: partNumber,
             uploadId: upload.uploadId
