@@ -236,6 +236,63 @@ vs Run 10 baseline (median 374.7 s, range 374.3–377.4): **-3 to -9 s**,
 Keep C1. Continue to C2 (collect as default) and C3 (raise byte
 budget) — together they should unblock the wall-clock.
 
+## Run 13 — Phase C2: collect as default download path
+
+Stack: same. Build: `1c8d718`. STATS=1.
+
+Change: removed PROBE_COLLECT env var + the streaming AsyncSequence
+branch. downloadFile always uses `response.body.collect(upTo:)`.
+
+| Run | Type | Swift (s) | Rust (s) | run_price_usd |
+|---|---|---|---|---|
+| 13.cold-1 | cold | 365.2 | 212.8 | $0.002435 |
+| 13.cold-2 | cold | 368.7 | 212.3 | $0.002458 |
+
+Wall-clock parity vs C1 (365.6 / 371.6). As expected — C2 is a code-
+simplification + RSS play, not a speed change.
+
+### Per-stage diff (C1 cold-2 → C2 cold-2)
+
+| Metric | C1 cold-2 | C2 cold-2 | Δ |
+|---|---|---|---|
+| Wall-clock | 371.6 s | 368.7 s | -2.9 s |
+| downloadFile sum | 1208.1 s | 1171.9 s | -36 s |
+| downloadInFrame sum | 150.0 s | 254.2 s | +104 s (full-buffer CRC) |
+| zipperAppend | 3.0 s | 9.9 s | +7 s |
+| uploadPart | 326.3 s | 334.2 s | +8 s |
+| downloadInFlight mean | 1.70 | 2.69 | **+1.0** |
+| **peakRSS** | **418.7 MB** | **431.4 MB** | **+13 MB regression** |
+| heapInUse | 103 MB | 86.4 MB | -17 MB |
+| Max Memory Used (CW) | 445 MB | **460 MB** | +15 MB |
+
+### Findings
+
+- **C2 RSS prediction did not hold on top of C1.** Run 11 (probe vs
+  streaming-Data baseline) showed -70 MB peakRSS. Run 13 (collect vs
+  streaming-ByteBuffer baseline = C1) shows +13 MB. The streaming +
+  ByteBuffer combination from C1 already captured most of the
+  ByteBuffer-arena savings; switching from streaming to collect
+  *adds* one large per-file allocation back.
+- `heapInUse` did drop -17 MB — collect's single allocation is
+  cleanly freed; streaming's per-frame ByteBuffers leave more
+  fragmentation.
+- `downloadInFlight` is back near baseline (2.69 vs Run 10's 2.56).
+- **CW Max Memory Used = 460 MB**, leaving ~52 MB headroom against
+  the 512 MB ceiling. C3 (raise byte budget) must be conservative:
+  Run 6 OOM'd at 511 MB with budget=40 MiB. Safe ceiling for C3
+  is somewhere around 24–28 MiB.
+
+### Decision
+
+**Keep C2** — code is simpler (no AsyncSequence iteration, no per-frame
+timing), RSS regression is small (+13 MB), and `heapInUse` actually
+improved. The "make collect default" change is justified on
+maintainability + heap fragmentation, even though peakRSS didn't move
+the way Run 11 suggested.
+
+C3 is the next move — but go conservative: try byte budget 20 → 24 MiB
+first.
+
 ## Run-by-run history
 
 ### Rust reference (`rust-jeremie-rodon`)
