@@ -61,7 +61,13 @@ func runArchiveJob(s3: S3, job: JobInfo, logger: Logger) async throws {
     )
     logger.info("archive: multipart upload started (id=\(upload.uploadId))")
 
-    let stats = Stats()
+    // Pre-reserve the per-stage sample arrays so a STATS=1 run doesn't
+    // include array reallocation in its measurements. estimatedParts is a
+    // ceiling — the real archive lands a bit under (chunkSize=10 MiB,
+    // ~17 GiB total → ~1700 parts).
+    let totalBytes = files.reduce(0) { $0 + $1.size }
+    let estimatedParts = max(1, totalBytes / Tunables.chunkSize + 8)
+    let stats = Stats(estimatedFiles: files.count, estimatedParts: estimatedParts)
     do {
         let parts = try await runPipeline(
             s3: s3,
@@ -73,7 +79,7 @@ func runArchiveJob(s3: S3, job: JobInfo, logger: Logger) async throws {
         )
         try await completeMultipartUpload(s3: s3, upload: upload, parts: parts, logger: logger)
         logger.info("archive: completed (\(parts.count) parts)")
-        await stats.report(logger: logger)
+        stats.report(logger: logger)
     } catch {
         logger.error("archive: failed, aborting multipart upload: \(error)")
         await abortMultipartUpload(s3: s3, upload: upload, logger: logger)
@@ -146,12 +152,14 @@ private func runDownloadStage(
             // worth of files are concurrently in-flight.
             await byteBudget.acquire(file.size)
             group.addTask {
-                let t0 = monoNs()
+                stats.incrementInFlight()
+                let t0: UInt64 = Stats.enabled ? monoNs() : 0
                 let (buffer, crc) = try await downloadFile(
                     s3: s3, bucket: bucket, key: file.key,
-                    expectedSize: file.size, logger: logger
+                    expectedSize: file.size, stats: stats, logger: logger
                 )
-                await stats.record(.downloadFile, ns: monoNs() - t0)
+                if Stats.enabled { stats.record(.downloadFile, ns: monoNs() - t0) }
+                stats.decrementInFlight()
                 out.send(DownloadedFile(name: file.name, buffer: buffer, crc32: crc, releaseBytes: file.size))
             }
         }
@@ -173,6 +181,7 @@ private func downloadFile(
     bucket: String,
     key: String,
     expectedSize: Int,
+    stats: Stats,
     logger: Logger
 ) async throws -> (ByteBuffer, UInt32) {
     let response = try await s3.getObject(
@@ -181,14 +190,36 @@ private func downloadFile(
     )
     var out = ByteBufferAllocator().buffer(capacity: expectedSize)
     var crc = CRC32()
-    for try await frameBuffer in response.body {
-        var frame = frameBuffer
-        // CRC over the frame's readable bytes without copying.
-        frame.readableBytesView.withContiguousStorageIfAvailable { ptr in
-            crc.update(ptr)
+    if Stats.enabled {
+        // Split per-frame time into (a) waiting on response.body's next()
+        // (= AsyncSequence + AsyncHTTPClient + decryption + network) and
+        // (b) the work we do once a frame arrived (CRC + memcpy). Tests
+        // H4 from PERF-PLAN.md — is the bottleneck "next()" or "in-frame".
+        var betweenSum: UInt64 = 0
+        var inFrameSum: UInt64 = 0
+        var lastReturnedAt = monoNs()
+        for try await frameBuffer in response.body {
+            let arrivedAt = monoNs()
+            betweenSum &+= arrivedAt &- lastReturnedAt
+            var frame = frameBuffer
+            frame.readableBytesView.withContiguousStorageIfAvailable { ptr in
+                crc.update(ptr)
+            }
+            out.writeBuffer(&frame)
+            let doneAt = monoNs()
+            inFrameSum &+= doneAt &- arrivedAt
+            lastReturnedAt = doneAt
         }
-        // Memcpy into the per-file accumulator. One op per frame.
-        out.writeBuffer(&frame)
+        stats.record(.downloadBetweenFrames, ns: betweenSum)
+        stats.record(.downloadInFrame, ns: inFrameSum)
+    } else {
+        for try await frameBuffer in response.body {
+            var frame = frameBuffer
+            frame.readableBytesView.withContiguousStorageIfAvailable { ptr in
+                crc.update(ptr)
+            }
+            out.writeBuffer(&frame)
+        }
     }
     if out.readableBytes != expectedSize {
         throw ArchivingError.downloadShortRead(key: key, expected: expectedSize, got: out.readableBytes)
@@ -211,24 +242,28 @@ private func runZipStage(
     var offset: UInt64 = 0
     var processed = 0
 
-    // Time the zipper *waits* on the next downloaded file: a high p50 here
-    // means the downloader is the bottleneck (zipper is starved). A low p50
-    // means files are queued up and the zipper can't keep up.
-    var queueWaitStart = monoNs()
+    // Time the zipper *waits* on the next downloaded file (zipperQueueWait):
+    // high p50 = downloader bottleneck. Time inside the chunk producer
+    // (zipperAppend): high p50 = uploader bottleneck pushing back through
+    // the producer.
+    var queueWaitStart: UInt64 = Stats.enabled ? monoNs() : 0
     for await file in fileChannel.stream {
-        await stats.record(.zipperQueueWait, ns: monoNs() - queueWaitStart)
+        if Stats.enabled { stats.record(.zipperQueueWait, ns: monoNs() - queueWaitStart) }
 
         let bodySize = UInt64(file.buffer.readableBytes)
         let lfh = ZipHeaders.localFileHeader(name: file.name)
         let lfhOffset = offset
         let dd = ZipHeaders.dataDescriptor(crc32: file.crc32, size: bodySize)
 
-        // Time inside the chunk producer: a high p50 here means the
-        // uploader (downstream) is the bottleneck and back-pressure is
-        // pushing back through the producer.
-        let appendStart = monoNs()
+        let appendStart: UInt64 = Stats.enabled ? monoNs() : 0
         await producer.appendCompound(lfh: lfh, body: file.buffer, dataDescriptor: dd)
-        await stats.record(.zipperAppend, ns: monoNs() - appendStart)
+        if Stats.enabled {
+            stats.record(.zipperAppend, ns: monoNs() - appendStart)
+            // appendCompound today decomposes to 3 nested `await append(...)`
+            // calls — 3 actor hops per file. Counter proves it (or proves
+            // a future fix). Tests H3 in PERF-PLAN.md.
+            stats.bumpProducerHops(3)
+        }
 
         offset += UInt64(lfh.count) + bodySize + UInt64(dd.count)
         await byteBudget.release(file.releaseBytes)
@@ -243,7 +278,7 @@ private func runZipStage(
         if processed % 200 == 0 {
             logger.info("zip: \(processed)/\(files.count) entries")
         }
-        queueWaitStart = monoNs()
+        if Stats.enabled { queueWaitStart = monoNs() }
     }
 
     // Central directory + ZIP64 EOCD + locator + EOCD.
@@ -287,9 +322,9 @@ private func runUploadStage(
         // Time the uploader waits for the next sealed chunk: high p50 here
         // = chunks aren't ready (zipper-bound). Low p50 = upload pool is
         // saturated and chunks queue up.
-        var queueWaitStart = monoNs()
+        var queueWaitStart: UInt64 = Stats.enabled ? monoNs() : 0
         for await chunk in producer.stream {
-            await stats.record(.uploaderQueueWait, ns: monoNs() - queueWaitStart)
+            if Stats.enabled { stats.record(.uploaderQueueWait, ns: monoNs() - queueWaitStart) }
 
             if inFlight >= Tunables.maxConcurrentUploads {
                 if let p = try await group.next() {
@@ -298,7 +333,7 @@ private func runUploadStage(
                 }
             }
             group.addTask {
-                let t0 = monoNs()
+                let t0: UInt64 = Stats.enabled ? monoNs() : 0
                 let cp = try await uploadPart(
                     s3: s3,
                     upload: upload,
@@ -306,12 +341,12 @@ private func runUploadStage(
                     data: chunk.data,
                     logger: logger
                 )
-                await stats.record(.uploadPart, ns: monoNs() - t0)
+                if Stats.enabled { stats.record(.uploadPart, ns: monoNs() - t0) }
                 await producer.releaseSlot()
                 return cp
             }
             inFlight += 1
-            queueWaitStart = monoNs()
+            if Stats.enabled { queueWaitStart = monoNs() }
         }
         while let p = try await group.next() {
             completed.append(p)

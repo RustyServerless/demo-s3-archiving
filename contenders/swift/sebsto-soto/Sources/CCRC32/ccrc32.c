@@ -59,3 +59,17 @@ uint32_t ccrc32_update(uint32_t crc, const uint8_t *data, size_t len) {
 
     return ~crc;
 }
+
+#if defined(__linux__)
+#include <malloc.h>
+size_t ccrc32_mallinfo_uordblks(void) {
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
+    struct mallinfo2 mi = mallinfo2();
+    return mi.uordblks;
+#else
+    return 0;
+#endif
+}
+#else
+size_t ccrc32_mallinfo_uordblks(void) { return 0; }
+#endif

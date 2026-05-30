@@ -14,4 +14,10 @@
 // implementation.
 uint32_t ccrc32_update(uint32_t crc, const uint8_t *data, size_t len);
 
+// Returns mallinfo2().uordblks on Linux/glibc >= 2.33, else 0. This lives
+// in the CCRC32 target purely to avoid adding a second C SwiftPM target
+// for one tiny shim — the Swift side calls it via Stats.report() under
+// `#if os(Linux)`.
+size_t ccrc32_mallinfo_uordblks(void);
+
 #endif
