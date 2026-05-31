@@ -1,53 +1,107 @@
-# Swift contender — `sebsto-soto` (Soto)
+<!-- markdownlint-disable MD013 -->
+# Swift contender — `sebsto-soto`
 
-Architectural reference for the shippable Swift contender in this repo:
-`contenders/swift/sebsto-soto/`. This is the variant that lands ZIPs end-to-end
-and posts measurable `run_price_usd` numbers (~380 s / 1.72× the Rust reference).
+The Swift contender that ships in this repo. A Lambda that, given
+`{bucket_name, files_prefix, archive_key}`, lists every object under
+`s3://${bucket_name}/${files_prefix}/`, reads them all, and uploads a
+flat STORED ZIP archive to `s3://${bucket_name}/${archive_key}` — in a
+single Lambda invocation, on Graviton2, 512 MB memory, 600 s timeout.
 
-This document describes **what the code does today**. For the run-by-run
-performance log and lessons learned, see `RESULTS.md` (sibling file).
+This document describes what the code does today. It is the only doc in
+this directory.
 
-A second branch, `contender/swift-sebsto-classic-awssdk`, ships the same
-architecture on top of the AWS SDK for Swift instead of Soto; it timed out at
-600 s and is kept as a comparison point. See the *Sibling experiment* section
-at the end of this doc.
-
-A third variant, `swift-sebsto` (predicted-layout, parallel writer using a
-`PartActor`), was built and benchmarked at 532 s — slower than `sebsto-soto`
-— and removed from the repo. The full post-mortem is in `RESULTS.md`; see the
-project's git history (`contender/swift-sebsto` branch, deleted) for the code.
-
-## What the contender does
-
-The repo is a Lambda S3-archiving benchmark. A Step Function invokes each
-registered contender Lambda with `{ bucket_name, files_prefix, archive_key }`,
-the Lambda must read ~3000 objects (~15 GB total) from
-`s3://${bucket_name}/${files_prefix}/` and stream a flat **STORED ZIP** to
-`s3://${bucket_name}/${archive_key}` within 600 s. A control Lambda then
-re-hashes every entry's decompressed bytes and verifies the entry name matches
-the SHA-256 of the content (entry name == basename == hex SHA-256). Contenders
-are ranked by `run_price_usd` (ascending) — the real Lambda invocation price
-given memory, duration, architecture, and ephemeral storage.
-
-Per-Lambda configuration (see `templates/contenders.yml`):
+## Per-Lambda configuration
 
 | Setting | Value |
 |---|---|
 | Runtime | `provided.al2023` |
 | Architecture | `arm64` (Graviton2) |
-| Memory | `512 MB` (~0.29 vCPU) |
-| Timeout | `600 s` |
-| Handler | `swift.handler` (ignored by custom runtime; matches project convention) |
+| Memory | 512 MB (~0.29 vCPU) |
+| Timeout | 600 s |
+| Handler | `swift.handler` (ignored — `bootstrap` is executed) |
 
-The reference Rust contender (`contenders/rust/jeremie-rodon/`) lands at ~213 s
-with ~350 MB peak RSS. Soto-classic lands at ~380 s with ~470 MB peak.
+## Two critical design decisions for performance
 
-## Architecture — three-stage streaming pipeline
+### 1. Use Soto, not the official AWS SDK for Swift
 
-A direct port of the Rust reference's `download → zip → upload` pipeline,
-written in Swift 6 with structured concurrency. All three stages run as
-sibling `async let` children of a single `runPipeline` task; if any stage
-throws, the others are cancelled.
+Soto is a community AWS SDK built on top of [SwiftNIO](https://github.com/apple/swift-nio)
+and [AsyncHTTPClient](https://github.com/swift-server/async-http-client).
+The official AWS SDK for Swift (`aws-sdk-swift`) is built on top of the
+[AWS Common Runtime](https://github.com/awslabs/aws-crt-swift) (`aws-crt-swift`) — a set
+of C libraries shared with the other AWS SDKs (Java, Python, …).
+
+We measured both, on the same architecture, in the same Lambda
+configuration. **The aws-sdk-swift port times out at 600 s on the same
+workload that Soto completes in 250 s.** The bottleneck is the HTTP
+transport: aws-crt-swift's `Smithy.ByteStream` API delivers download
+chunks as fresh `Data` allocations and forces uploads through `Data`,
+and `FlexibleChecksumsRequestMiddleware` collects any provided stream
+into a single `Data` for SigV4 signing — no zero-copy path is
+available. On a 0.29 vCPU Lambda, that overhead compounds enough to
+push the run over 600 s.
+
+Soto, by contrast, hands us NIO `ByteBuffer` end-to-end and accepts
+`ByteBuffer` zero-copy on `S3.uploadPart`. That is decision #2.
+
+### 2. Use NIO `ByteBuffer` instead of Foundation `Data`
+
+If you don't write Swift on the server every day, this distinction is
+not obvious. Both look like "an array of bytes". Why does it matter?
+
+**`Foundation.Data`** is the standard Swift "blob of bytes" type. It is
+copy-on-write, like Swift's `Array`, and it is *opaque about its
+storage*: an instance may be backed by one contiguous heap allocation,
+or by several disjoint segments stitched together at the API surface.
+The hot-path consequence:
+
+- Every `Data.append(other:)` checks whether the receiver is uniquely
+  referenced (cheap), grows the backing buffer if needed (potentially
+  reallocates and copies the existing bytes), then memcpys the new
+  bytes into place.
+- When you ask for a contiguous pointer (`withUnsafeBytes`), Foundation
+  may have to flatten the segments first, which copies bytes you didn't
+  ask to copy.
+- It carries Foundation's bridging surface — types like `NSData`,
+  Objective-C interop, even on Linux where there is no Objective-C
+  runtime.
+
+**`NIOCore.ByteBuffer`** is the byte-buffer type used inside SwiftNIO.
+It is value-typed (also copy-on-write), but with three crucial
+differences for our workload:
+
+- **One contiguous allocation, always.** A ByteBuffer is a slice over
+  exactly one underlying buffer. `withUnsafeReadableBytes` always hands
+  back a single contiguous pointer-and-length, no flattening needed.
+- **Reader index + writer index, no bookkeeping copies.** Splitting a
+  ByteBuffer (`readSlice(length:)`) and concatenating
+  (`writeBuffer(&other:)`) advance internal indices over the same
+  storage. Slicing is zero-copy; concatenation is a single memcpy.
+- **Allocator-aware.** The default `ByteBufferAllocator` recycles
+  storage from a per-event-loop arena, so high-throughput pipelines
+  pay much less malloc/free overhead than `Data` does on its general
+  allocator.
+
+In our pipeline this matters at three places:
+
+| Hot-path location | Per-run cost if we used `Data` | What `ByteBuffer` saves |
+|---|---|---|
+| Download accumulator (`downloadFile`) | One `Data.append(_:count:)` per ~80 KB frame, ~250k frames/run, with possible re-allocation as the buffer grows | One pre-sized allocation per file, one `writeBuffer` memcpy per frame |
+| Producer→uploader chunk (`ChunkProducer`) | Each 10 MiB chunk built via `Data.append`; passed to `S3.uploadPart` as `Data` | Built directly in a 10 MiB `ByteBuffer`; passed as `AWSHTTPBody(buffer:)` zero-copy |
+| `S3.uploadPart` body | `AWSHTTPBody(bytes: Data)` copies into a fresh `ByteBuffer` internally before NIO emits it on the wire | `AWSHTTPBody(buffer:)` wraps the existing ByteBuffer with no copy |
+
+Concretely, switching from `Data` to `ByteBuffer` on the upload path
+alone eliminates ~15 GiB of avoidable copies per run (10 MiB × ~1500
+parts) and reduces NIO `ByteBufferAllocator` arena pressure (which is
+what makes the warm Lambda's RSS climb on `Data`-based code).
+
+If `Data` is your shovel, `ByteBuffer` is the conveyor belt — designed
+for moving lots of bytes through one pipe.
+
+## Architecture
+
+A three-stage streaming pipeline. All three stages run as sibling
+`async let` children of a single `runPipeline` task; if any throws, the
+others are cancelled.
 
 ```
                                  ┌──────────────────────────────────────┐
@@ -60,9 +114,8 @@ ListObjectsV2                    │                                      │
    │   │  Stage A         │ AsyncStream<DownloadedFile>│              │  │
    ├──►│  Downloader      ├───────────────────────────►│  Stage B     │  │
    │   │  TaskGroup × N   │                            │  Zipper      │  │
-   │   │  (per-task GET + │                            │  (single     │  │
-   │   │   inline CRC32)  │                            │   consumer,  │  │
-   │   └──────────────────┘                            │   serial)    │  │
+   │   └──────────────────┘                            │   (single    │  │
+   │                                                   │   consumer)  │  │
    │                                                   └──────┬───────┘  │
    │                                                          │          │
    │                                                          ▼          │
@@ -78,7 +131,6 @@ ListObjectsV2                    │                                      │
    │                                                  │  Stage C       │ │
    │                                                  │  Uploader      │ │
    │                                                  │  TaskGroup × 3 │ │
-   │                                                  │  (S3 UploadPart)│
    │                                                  └────────────────┘ │
    │                                                                     │
    └─── ByteSemaphore.release ◄─ released by zipper after each file ─────┘
@@ -86,66 +138,61 @@ ListObjectsV2                    │                                      │
 
 ### Stage A — Downloader (`runDownloadStage` in `Archiver.swift`)
 
-- A `withThrowingTaskGroup` of N worker tasks. Concurrency is implicitly bounded
-  by the byte budget (see below): a new download task is `addTask`'d only after
-  `byteBudget.acquire(file.size)` succeeds, so at any moment the in-flight set
-  fits in 20 MiB.
-- Each task: `s3.getObject` → iterate `response.body` (an
-  `AsyncSequence<ByteBuffer>` from AsyncHTTPClient via Soto), accumulating
-  frames into one pre-sized per-file `ByteBuffer` and updating a `CRC32` over
-  each frame's bytes inline.
-- On EOF, sends a `DownloadedFile { name, buffer, crc32, releaseBytes }` into
-  `FileChannel` (an `AsyncStream<DownloadedFile>` wrapper).
-- Computing CRC32 in the downloader (rather than in the single zipper) means
-  CRC work is parallelised across N tasks. The CRC implementation is a tiny
-  C shim that uses the ARMv8 `__crc32{b,h,w,d}` intrinsics — see `Sources/CCRC32/`.
-- `ByteBuffer` (not `Data`) is the carrier all the way through: switching
-  `Data.append(contentsOf: [UInt8])` per frame to `ByteBuffer.writeBuffer`
-  was an early try (Run 4) — measured slightly *worse*, then kept anyway
-  because subsequent reads showed the per-frame `Data` path was wasted
-  allocation we did not need to pay for.
+A `withThrowingTaskGroup` of N worker tasks. Concurrency is bounded by
+the byte budget: a new download task is `addTask`'d only after
+`byteBudget.acquire(file.size)` succeeds, so at any moment the in-flight
+set fits in 20 MiB. With ~5 MB files that gives ~4 concurrent tasks
+(observed mean: 1.96–2.66, max 5).
 
-### Stage B — Zipper (`runZipStage`)
+Each task:
 
-- **Single consumer** of `FileChannel.stream`. Files arrive in download
-  completion order (not list order, but that does not matter — the central
-  directory is built from the order we observe).
-- Per file: emit local-file-header (LFH) + body bytes + data descriptor (DD)
-  into the `ChunkProducer`. The bodies are NOT held in the zipper; they are
-  forwarded as `ByteBuffer` slices, one zero-copy memcpy into the chunk
-  accumulator.
-- After all files, the zipper builds the central directory, ZIP64 EOCD, ZIP64
-  EOCD locator, and EOCD, appending each into the chunk producer in order.
-- Calls `byteBudget.release(file.releaseBytes)` after handing off each file's
-  bytes to the chunk producer, so a downloader can resume.
+- Calls `s3.getObject` (Soto returns an `AWSHTTPBody`, which is an
+  `AsyncSequence<ByteBuffer>` over the response body).
+- Pre-allocates one `ByteBuffer` of exactly `expectedSize` bytes.
+- Iterates the body and `writeBuffer(&frame)`s each frame into the
+  accumulator — one memcpy per frame, no re-allocation.
+- After the body is fully read, runs CRC32 once over the contiguous
+  readable view (see CRC32 below).
+- Sends a `DownloadedFile { name, buffer, crc32, releaseBytes }` into
+  the `FileChannel` (a `nonisolated`-friendly `AsyncStream` wrapper).
 
-The zipper is intentionally single-threaded and serial. Run-5 instrumentation
-(see `RESULTS.md`) showed the zipper stage sums to ~4.4 s out of ~372 s — 0.1%
-of runtime. Parallelising it is not where the time is.
+### Stage B — Zipper (`runZipStage` in `Archiver.swift`)
 
-### Stage C — Uploader (`runUploadStage`)
+Single consumer of `FileChannel.stream`. Files arrive in download
+completion order, not list order — that's fine because the central
+directory is built from the order observed.
 
-- Pulls `UploadChunk` items from `producer.stream` (an `AsyncStream` driven
-  by `ChunkProducer`).
-- Drives a `withThrowingTaskGroup` of up to `Tunables.maxConcurrentUploads`
-  in-flight `S3.uploadPart` calls. Each completed part records its `eTag` +
-  `partNumber`; the final list is sorted and sealed via
-  `completeMultipartUpload`.
-- After each upload completes, calls `producer.releaseSlot()` so the producer
-  can build more chunks (see ChunkProducer backpressure).
+Per file:
+
+- Emits local-file-header (LFH) + body bytes + data descriptor (DD)
+  into the `ChunkProducer` via `appendCompound(lfh:body:dataDescriptor:)`.
+- Releases the byte budget so a downloader can resume.
+- Records the entry in the central-directory entries array.
+
+After all files: the zipper builds the central directory, ZIP64 EOCD,
+ZIP64 EOCD locator, and EOCD; appends each into the chunk producer in
+order; calls `producer.finish()`.
+
+### Stage C — Uploader (`runUploadStage` in `Archiver.swift`)
+
+A `withThrowingTaskGroup` of up to `Tunables.maxConcurrentUploads = 3`
+in-flight `S3.uploadPart` calls. After each upload completes, calls
+`producer.releaseSlot()` so the producer can build more chunks. The
+final list of `S3.CompletedPart` is returned to `runArchiveJob`, which
+calls `S3.completeMultipartUpload`.
 
 ### `ChunkProducer` (`ChunkProducer.swift`)
 
-- Swift `actor`. Buckets writes from the zipper into fixed-size 10 MiB chunks
-  and emits each sealed chunk on an `AsyncStream<UploadChunk>` for the uploader.
-- Has two `append` overloads — `Data` (for the small ZIP headers) and
-  `ByteBuffer` (for the big file bodies, zero-copy from the downloader's
-  per-file accumulator) — plus an `appendCompound(lfh:body:dataDescriptor:)`
-  convenience that the zipper uses to do LFH+body+DD as one operation.
-- Backpressure: at most `bufferChunksCount` (= 4) chunks may be outstanding
-  (built-but-not-yet-uploaded). The producer suspends in `waitForSlot()` when
-  the in-flight count is at the ceiling. Combined with the 10 MiB chunk size
-  this caps the producer→uploader path at 40 MiB.
+Swift `actor`. Buckets writes from the zipper into fixed-size 10 MiB
+chunks and emits each sealed chunk on a `nonisolated AsyncStream<UploadChunk>`
+for the uploader.
+
+- Internal buffer is a `ByteBuffer` sized exactly to `chunkSize`.
+- Two append overloads — `Data` (for the small ZIP headers) and
+  `ByteBuffer` (for the big file bodies, zero-copy).
+- Backpressure: at most `bufferChunksCount = 2` chunks may be
+  outstanding (built but not yet uploaded). The producer suspends in
+  `waitForSlot()` when the in-flight count is at the ceiling.
 
 ### Backpressure summary
 
@@ -154,14 +201,12 @@ Three independent budgets keep the 512 MB Lambda within memory:
 | Budget | Mechanism | Capacity |
 |---|---|---|
 | In-flight downloads | `ByteSemaphore` over file sizes | 20 MiB |
-| Producer-buffered chunks | `ChunkProducer.maxInFlight` | 4 chunks × 10 MiB = 40 MiB |
+| Producer-buffered chunks | `ChunkProducer.maxInFlight` | 2 chunks × 10 MiB = 20 MiB |
 | Concurrent uploads | TaskGroup size cap | 3 |
 
-These three are *not* additive on the hot path — once a file is fully
-downloaded and the body has been memcpy'd into the chunk producer, the byte
-budget is released; the producer then owns the bytes. Peak observed memory
-across runs: 452–511 MB (the swing is mostly Foundation / NIO buffer churn
-and Lambda's own runtime overhead).
+These are not additive on the hot path — once a file is fully
+downloaded and its bytes have been memcpy'd into the chunk producer,
+the byte budget is released and the producer owns the bytes.
 
 ## Tunables (`Pipeline.swift`)
 
@@ -170,13 +215,12 @@ enum Tunables {
     static let maxDownloadsMemory: Int = 20 * 1024 * 1024   // 20 MiB
     static let maxConcurrentUploads: Int = 3
     static let chunkSize: Int = 10 * 1024 * 1024            // 10 MiB
-    static let bufferChunksCount: Int = 4                    // ChunkProducer in-flight ceiling
+    static let bufferChunksCount: Int = 2                   // ChunkProducer in-flight ceiling
 }
 ```
 
-The HTTP client connection pool is configured in `main.swift` (not in
-`Tunables`) because it must be set on the AsyncHTTPClient before the AWSClient
-is built:
+The HTTP client connection pool is configured in `main.swift` because it
+must be set on the AsyncHTTPClient before the AWSClient is built:
 
 ```swift
 httpConfig.connectionPool.concurrentHTTP1ConnectionsPerHostSoftLimit = 32
@@ -184,18 +228,11 @@ httpConfig.timeout.read = .seconds(120)
 httpConfig.timeout.connect = .seconds(10)
 ```
 
-The pool ceiling was raised from the default 8 to 32 in Run 7 to avoid GETs
-serialising behind the connection pool. That change moved the run from
-~385 s → ~367 s; it is the only tunable change that has produced a measurable
-improvement.
-
 ## ZIP format
 
-STORED only (no DEFLATE), GP flag bit 3 set so CRC32 + sizes are emitted in a
-data descriptor *after* each file body — required because the downloader does
-not know the body size ahead of the LFH (it does, from `ListObjectsV2`, but
-emitting in the descriptor keeps the Rust reference layout intact for
-A/B comparison). ZIP64 is mandatory: the archive total exceeds 4 GiB.
+STORED only (no DEFLATE), GP flag bit 3 set so CRC32 + sizes are emitted
+in a data descriptor *after* each file body. ZIP64 is mandatory: the
+archive total exceeds 4 GiB.
 
 | Record | Size | Notes |
 |---|---|---|
@@ -206,20 +243,62 @@ A/B comparison). ZIP64 is mandatory: the archive total exceeds 4 GiB.
 | ZIP64 EOCD locator | 20 | sig, disk=0, ZIP64-EOCD offset, totalDisks=1 |
 | EOCD | 22 | All counts/offsets are `0xFFFF` / `0xFFFFFFFF` (defer to ZIP64) |
 
-Filenames are pure ASCII (SHA-256 hex, 64 chars), so no UTF-8 GP-flag tweaks
-are required. There are no directory entries and no extra fields beyond the
-mandatory ZIP64 one. All implementation lives in
+Filenames are pure ASCII (SHA-256 hex, 64 chars), so no UTF-8 GP-flag
+tweaks are required. There are no directory entries and no extra fields
+beyond the mandatory ZIP64 one. All implementation lives in
 `Sources/SwiftSebstoSoto/Zip/Headers.swift`.
+
+## CRC32
+
+Pure-Swift slicing-by-8 implementation in `Zip/CRC32.swift`. ~125 LOC,
+no C dependency, no platform intrinsics. The IEEE polynomial
+(`0xEDB88320` reflected), as used by ZIP/zlib.
+
+Why not the ARMv8 `__crc32{b,h,w,d}` hardware intrinsics (which would
+require a tiny C shim)? Two reasons:
+
+- **Single-language comparison.** The Rust reference contender uses the
+  pure-Rust `zip` crate's CRC. Calling out to C would muddy the
+  Swift-vs-Rust comparison.
+- **It is actually faster on this CPU.** The `__crc32d` intrinsic has a
+  serial dependency chain (each call depends on the previous CRC
+  result). Slicing-by-8 issues 8 parallel table lookups per byte
+  position, which the out-of-order core on Graviton2 schedules across
+  multiple memory ports. On a 0.29 vCPU allocation, the memory-level
+  parallelism wins: ~4 ms per 5 MB file in pure Swift vs ~76 ms with
+  the intrinsics + the cost of crossing the Swift→C boundary on a
+  non-contiguous source. Removing the C path also unblocked the
+  downloader's per-task pipeline, since the CRC was running inline at
+  end of each file and serializing the next download.
+
+The implementation is verified against standard reference vectors:
+empty, `"a"`, `"123456789"` (RFC 3720 = `0xCBF43926`), 32×0x00, 32×0xFF,
+chunked splits, and a 1 MiB cross-check against a slicing-by-1
+reference.
 
 ## Optional profiling instrumentation — `STATS=1`
 
-`Stats.swift` defines an `actor Stats` that records per-stage durations
-(`downloadFile`, `zipperQueueWait`, `zipperAppend`, `uploadPart`,
-`uploaderQueueWait`) and emits a `n / sum / p50 / p95 / p99 / max` line per
-stage at the end of a run. It is gated on the `STATS` environment variable —
-truthy values are `1`, `true`, `yes` (case-insensitive). When unset, both
-`record` and `report` short-circuit to no-ops, leaving only the `monoNs()`
-calls at the call sites (~30 ns each).
+`Stats.swift` defines a `final class Stats` (lock-protected via
+`NIOLockedValueBox`) that records per-stage durations and aggregate
+gauges, and emits a per-stage report at the end of a run.
+
+| Stage | What it measures |
+|---|---|
+| `downloadFile` | total time inside the per-task body iteration + CRC |
+| `downloadInFrame` | time of the single CRC pass at end of file |
+| `zipperQueueWait` | time the zipper waits for the next downloaded file |
+| `zipperAppend` | time inside `producer.appendCompound` |
+| `uploadPart` | time inside `S3.uploadPart` |
+| `uploaderQueueWait` | time the uploader waits for the next sealed chunk |
+| `downloadInFlight` | time-weighted mean + max concurrent download tasks |
+| `producerHops` | counter of `ChunkProducer.appendCompound` actor hops |
+| `peakRSS` | end-of-run `getrusage(RUSAGE_SELF).ru_maxrss` |
+
+Gated on the `STATS` environment variable — truthy values are `1`,
+`true`, `yes` (case-insensitive). `Stats.enabled` is read once at cold
+start. When unset, every call site short-circuits via an inlined
+`if Stats.enabled` check — neither `monoNs()` nor `record()` runs, no
+allocation, no actor hop, no lock acquisition.
 
 To enable for one run:
 
@@ -229,63 +308,54 @@ aws lambda update-function-configuration \
   --environment 'Variables={STATS=1}'
 ```
 
-Then trigger the Step Function and read the stats from CloudWatch Logs at
-the end of the run. Switch back off afterwards (un-set or `STATS=0`) — the
-samples accumulate in an unbounded array, so a long-lived warm Lambda will
-slowly grow them.
+Then trigger the Step Function and read the stats from CloudWatch Logs
+at the end of the run. Switch back off afterwards.
 
-The instrumentation is the tool that produced the Run 5 / Run 7 breakdowns
-in `RESULTS.md` and is the way to investigate further regressions.
+The clock is `clock_gettime(CLOCK_MONOTONIC)` via a platform-conditional
+libc import (`Darwin.C`, `Glibc`, `Musl`) — see `monoNs()` in
+`Stats.swift`. Reading it costs ~30 ns per call.
 
-The clock used is `clock_gettime(CLOCK_MONOTONIC)` via a platform-conditional
-libc import (`Darwin.C`, `Glibc`, `Musl`) — see `monoNs()` in `Stats.swift`.
-
-## File map (sebsto-soto)
+## File map
 
 ```
 contenders/swift/sebsto-soto/
-├── Package.swift                        SwiftPM manifest, Swift 6.0
+├── Package.swift                      SwiftPM manifest, Swift 6.0
 ├── Package.resolved
-├── scripts/test-codebuild-locally.sh    Manual reproduce-the-CI-build helper
+├── scripts/test-codebuild-locally.sh  Manual reproduce-the-CI-build helper
 └── Sources/
-    ├── CCRC32/
-    │   ├── ccrc32.c                     ARMv8 __crc32 intrinsics + sw fallback
-    │   └── include/ccrc32.h
     └── SwiftSebstoSoto/
-        ├── main.swift                   Cold-start: HTTPClient, AWSClient, S3,
-        │                                LambdaRuntime entry point.
-        ├── Pipeline.swift               Tunables, FileInfo/JobInfo, listFiles,
-        │                                multipart upload helpers, ByteSemaphore,
-        │                                ArchivingError.
-        ├── Archiver.swift               runArchiveJob + runPipeline; the three
-        │                                stage functions (download/zip/upload)
-        │                                and the per-file downloader.
-        ├── ChunkProducer.swift          actor ChunkProducer + UploadChunk type;
-        │                                10 MiB chunking + slot semaphore.
-        ├── Stats.swift                  Optional profiling actor (STATS env var)
-        │                                + monoNs() platform-conditional clock.
+        ├── main.swift                 Cold-start: HTTPClient, AWSClient, S3,
+        │                              LambdaRuntime entry point
+        ├── Pipeline.swift             Tunables, FileInfo/JobInfo, listFiles,
+        │                              multipart upload helpers, ByteSemaphore,
+        │                              ArchivingError
+        ├── Archiver.swift             runArchiveJob + runPipeline; the three
+        │                              stage functions and the per-file downloader
+        ├── ChunkProducer.swift        actor ChunkProducer + UploadChunk type;
+        │                              10 MiB chunking + slot semaphore
+        ├── Stats.swift                Optional profiling class (STATS env var)
+        │                              + monoNs() platform-conditional clock
         └── Zip/
-            ├── Headers.swift            LFH, DD, CD, ZIP64 EOCD encoders.
-            └── CRC32.swift              Swift wrapper over CCRC32.
+            ├── Headers.swift          LFH, DD, CD, ZIP64 EOCD encoders
+            └── CRC32.swift            Pure-Swift slicing-by-8 CRC32
 ```
 
-## Stack decisions
+No C target, no native dependencies beyond the SwiftPM packages
+declared in `Package.swift`.
+
+## Stack decisions (summary table)
 
 | Concern | Decision | Why |
 |---|---|---|
-| Lambda runtime | `swift-aws-lambda-runtime` v2.x | Closure-based `LambdaRuntime { (event, context) in … }`, Codable JSON in/out. |
-| AWS SDK | **Soto 7.x** | AsyncHTTPClient (swift-nio) → smaller binary, lower cold start, native `AsyncSequence<ByteBuffer>` streaming. AWS SDK for Swift was tried as a sibling experiment; see *Sibling experiment* below. |
-| ZIP writer | Hand-rolled (`Zip/Headers.swift`) | ZIPFoundation requires a URL or full-`Data` backing — incompatible with 15 GB-doesn't-fit-in-/tmp streaming. ~150 LOC of Swift gets us streaming + ZIP64. |
-| CRC32 | Tiny C shim with ARMv8 `__crc32{b,h,w,d}` intrinsics; software fallback present but never hit on Graviton2. |
-| Foundation | `FoundationEssentials` on Linux (`#if canImport(FoundationEssentials)`), `Foundation` on macOS for local builds. Smaller binary on Linux. |
-| Architecture | arm64 (Graviton2) | Matches Rust reference; cheaper per GB-s. |
-| Memory | 512 MB | Same as Rust reference. Peak observed ~470–510 MB. |
-| Concurrency | Swift 6 strict concurrency, structured `withThrowingTaskGroup`, actors for shared state, `AsyncStream` for inter-stage queues. |
-
-A redesign that swapped the actors for `NIOLockedValueBox` was scoped (the
-old `DESIGN-LOCK-LIGHT.md`, now removed) and never built — Run 5
-instrumentation showed actor cost was 4.4 s out of 372 s, so the redesign
-would not have moved the ranking. See `RESULTS.md` for details.
+| Lambda runtime | `swift-aws-lambda-runtime` v2.x | Closure-based `LambdaRuntime { (event, context) in … }`, Codable JSON in/out |
+| **AWS SDK** | **Soto 7.x** (community) | NIO `ByteBuffer` end-to-end, zero-copy upload via `AWSHTTPBody(buffer:)`. The official aws-sdk-swift forces `Data` everywhere and times out on this workload — see "Two critical design decisions" above |
+| **Byte buffer** | **NIO `ByteBuffer`** | Single contiguous allocation, reader/writer indices, allocator-pooled; vs Foundation `Data`'s opaque storage and per-`append` re-allocation risk |
+| ZIP writer | Hand-rolled (`Zip/Headers.swift`) | ZIPFoundation requires a URL or full-`Data` backing — incompatible with 15 GB-doesn't-fit-in-/tmp streaming. ~150 LOC of Swift gets us streaming + ZIP64 |
+| CRC32 | Pure-Swift slicing-by-8 | Single-language vs Rust comparison; faster than the ARMv8 intrinsic on this CPU due to memory-level parallelism (see CRC32 section) |
+| Foundation | `FoundationEssentials` on Linux (`#if canImport(FoundationEssentials)`), `Foundation` on macOS for local builds | Smaller binary on Linux |
+| Architecture | arm64 (Graviton2) | Matches Rust reference; cheaper per GB-s |
+| Memory | 512 MB | Same as Rust reference. Peak observed ~390 MB |
+| Concurrency | Swift 6 strict concurrency, structured `withThrowingTaskGroup`, actors for shared state, `AsyncStream` for inter-stage queues |
 
 ## Build & deploy
 
@@ -295,7 +365,7 @@ section):
 ```bash
 SWIFT_CONTENDER_LAMBDA_PATH=./contenders/swift
 for LAMBDA_DIR in "$SWIFT_CONTENDER_LAMBDA_PATH"/*/; do
-  [ -d "$LAMBDA_DIR" ] || continue            # skips DESIGN.md, RESULTS.md
+  [ -d "$LAMBDA_DIR" ] || continue            # skips DESIGN.md
   LAMBDA=$(basename "$LAMBDA_DIR")
   cd $SWIFT_CONTENDER_LAMBDA_PATH/$LAMBDA
   swift build -c release --static-swift-stdlib -Xswiftc -Osize
@@ -310,62 +380,49 @@ done
 
 Notes:
 
-- The Swift toolchain (`swift-6.3.2-RELEASE` for `amazonlinux2023-aarch64`) is
-  installed in the `install` phase, with the tarball cached under `.swift-cache/`
-  and verified against the Swift signing GPG key.
-- `--static-swift-stdlib` builds bundle the Swift runtime into the binary so
-  the Lambda doesn't need a Swift layer.
-- After build, the contender directory is **emptied** and replaced by a single
-  `bootstrap` binary — that is what `aws cloudformation package` zips.
+- The Swift toolchain (`swift-6.3.2-RELEASE` for `amazonlinux2023-aarch64`)
+  is installed in the `install` phase, with the tarball cached under
+  `.swift-cache/` and verified against the Swift signing GPG key.
+- `--static-swift-stdlib` builds bundle the Swift runtime into the binary
+  so the Lambda doesn't need a Swift layer.
+- After build, the contender directory is **emptied** and replaced by a
+  single `bootstrap` binary — that is what `aws cloudformation package`
+  zips.
 - SwiftPM build artefacts are persisted via the CodeBuild S3 cache
   (`contenders/swift/*/.build/**/*`) so warm rebuilds are fast.
 
 ## CFN registration (`templates/contenders.yml`)
 
-Two `AWS::Serverless::Function` blocks plus matching `AWS::Logs::LogGroup`
-entries are registered:
+```yaml
+SwiftSebstoSotoFunction:
+  Type: AWS::Serverless::Function
+  Properties:
+    FunctionName: !Sub ${ProjectName}-swift-sebsto-soto
+    CodeUri: ../contenders/swift/sebsto-soto
+    Runtime: provided.al2023
+    MemorySize: 512
+    Timeout: 600
+    Architectures: [arm64]
+    Handler: swift.handler   # ignored by provided.al2023
+    Role: !GetAtt LambdaContenderRole.Arn
+```
 
-- `SwiftSebstoSotoFunction` — `CodeUri: ../contenders/swift/sebsto-soto`
-- `SwiftSebstoClassicAWSSDKFunction` — sibling experiment, see below
-
-Both use `Runtime: provided.al2023`, `MemorySize: 512`, `Timeout: 600`,
-`Architectures: [arm64]`, `Handler: swift.handler` (ignored), and reference
-`LambdaContenderRole`. Their ARNs are added to the `ContenderArns` output
-between the `BEGIN/END CONTENDER ARN LIST` markers so the Step Function picks
-them up.
+The function ARN is added to the `ContenderArns` output between the
+`BEGIN/END CONTENDER ARN LIST` markers so the Step Function picks it
+up.
 
 ## Verification
 
-1. **CI build passes**: CodePipeline for `demo-s3-archiving-ci` shows the
-   Swift build block produced a `bootstrap` for both contenders.
-2. **Stack deployed**: `demo-s3-archiving-root` → `CREATE_COMPLETE`, with
-   the Swift function ARNs in `ContenderArns`.
-3. **Successful invocation**: trigger the Step Function with the published
-   `ContenderArns`. The contender should appear under `success` (not `failure`)
-   in the ranked output.
-4. **Control-Lambda check**: the in-state-machine control Lambda re-hashes the
-   ZIP entries and validates entry-name == SHA-256(content). A failure here
-   appears as `invalid: content hash mismatch`.
+1. **CI build passes**: CodePipeline shows the Swift build block produced
+   a `bootstrap`.
+2. **Stack deployed**: the root stack reaches `CREATE_COMPLETE` with the
+   Swift function ARN in `ContenderArns`.
+3. **Successful invocation**: triggering the Step Function with the
+   published `ContenderArns` produces the contender under `success` (not
+   `failure`) in the ranked output.
+4. **Control-Lambda check**: the in-state-machine control Lambda
+   re-hashes the ZIP entries via SHA-256 and validates entry-name ==
+   SHA-256(content). A failure here appears as
+   `invalid: content hash mismatch`.
 5. **Memory check**: CloudWatch `Max Memory Used` should be < 512 MB.
-   Anything ≥ 510 MB is on the edge of OOM (Run 6 at 511 MB with the
-   `maxDownloadsMemory=40 MiB` bump stalled and timed out — see Run 6).
-
-## Sibling experiment — `swift-sebsto-classic-awssdk`
-
-A second branch, `contender/swift-sebsto-classic-awssdk`, ports this code to
-the AWS SDK for Swift (aws-sdk-swift) instead of Soto. Same architecture,
-same backpressure model, same ZIP encoder, same CRC shim — only the SDK
-calls differ:
-
-- Dependency: `aws-sdk-swift` (AWSS3) instead of `soto` (SotoS3)
-- HTTP client: aws-crt-swift (CRT) instead of AsyncHTTPClient (NIO)
-- Body iteration: `Smithy.ByteStream.stream(stream).readAsync(upToCount:)`
-  instead of Soto's native `AsyncSequence<ByteBuffer>` body
-- Pool config: `HttpClientConfiguration.maxConnectionsPerEndpoint = 32`
-
-It registered as `SwiftSebstoClassicAWSSDKFunction` and was benchmarked
-against Soto in a 3-way run (Rust + Soto + AWS SDK). Result: **timed out at
-600 s** while reaching ~2200/3000 entries (projected ~13 minutes total).
-Soto remains the winning Swift variant. See `RESULTS.md` Run 9 for the run
-data and the `contender/swift-sebsto-classic-awssdk` branch for the source
-diff.
+   Anything ≥ 480 MB is on the edge of OOM.
