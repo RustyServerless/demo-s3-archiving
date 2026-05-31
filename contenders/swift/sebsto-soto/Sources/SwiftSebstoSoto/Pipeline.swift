@@ -8,47 +8,25 @@ import FoundationEssentials
 import Foundation
 #endif
 
-// Tunables.
-//
-// History:
-//   - Run-5: downloader-bound (1256 s of summed download work vs 4 s
-//     zipper). Per-task GET ~12 MB/s vs Rust's ~35 MB/s.
-//   - Run-7: raised AsyncHTTPClient pool ceiling 8 → 32 (in main.swift).
-//   - Run-6: tried `maxDownloadsMemory` 20 → 40 MiB; OOM'd at 511 MB.
-//   - C1+C2.5: ByteBuffer end-to-end on upload + pre-sized download
-//     buffer; reclaimed RSS to ~417 MB.
-//   - **C3 reverted**: bumping budget to 32 MiB doubled mean in-flight
-//     (1.96 → 4.16) but only saved 2.2 s wall-clock — and Max Memory
-//     Used jumped 417 → 490 MB. Cold-2 OOM-killed. The S3 bandwidth was
-//     already saturated; more concurrency just spreads it thinner
-//     (per-task p50 doubled 376 ms → 626 ms). Net: tiny speed win, big
-//     OOM risk. Reverted to 20 MiB.
-// Lambda configures vCPU proportionally to memory: at 1769 MB you get
-// 1 full vCPU, so at 512 MB you get ~0.29 vCPU and at 1024 MB ~0.58.
-// More memory also means more headroom for in-flight downloads. We
-// scale `maxDownloadsMemory` accordingly, reading the actual memory
-// allocation from the standard Lambda runtime env var
-// `AWS_LAMBDA_FUNCTION_MEMORY_SIZE` (set by the Lambda service —
-// documented at
-// https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html).
-//
-// Heuristic: keep ~4% of the configured memory available for downloads.
-// At 512 MB → 20 MiB. At 1024 MB → 40 MiB. At 1769 MB → ~70 MiB.
-// Falls back to 20 MiB on local builds where the env var is absent.
-let lambdaMemoryMB: Int = {
-    guard let s = ProcessInfo.processInfo.environment["AWS_LAMBDA_FUNCTION_MEMORY_SIZE"],
-          let n = Int(s) else { return 512 }
-    return n
-}()
-
+// Tuned for the default 512 MB / arm64 Lambda configuration. Together
+// these caps keep total in-flight memory at ~80 MiB, well within budget.
 enum Tunables {
-    // ~4% of configured Lambda memory, clamped to a 20 MiB floor.
-    static let maxDownloadsMemory: Int = max(20, lambdaMemoryMB * 4 / 100) * 1024 * 1024
+    /// Total bytes of in-flight downloads. With files averaging ~5 MB,
+    /// this gates concurrency to ~4 simultaneous downloads.
+    static let maxDownloadsMemory: Int = 20 * 1024 * 1024   // 20 MiB
+
+    /// Cap on concurrent `S3.uploadPart` calls.
     static let maxConcurrentUploads: Int = 3
+
+    /// Multipart-upload part size. S3 allows 5 MiB–5 GiB per part; 10 MiB
+    /// keeps the part count moderate (~1500 for a 15 GiB archive)
+    /// without buffering too much.
     static let chunkSize: Int = 10 * 1024 * 1024            // 10 MiB
-    // R1: matches Rust reference (BUFFER_CHUNKS_COUNT=2). Caps producer→
-    // uploader path at 2 × 10 MiB = 20 MiB.
-    static let bufferChunksCount: Int = 2                   // ChunkProducer in-flight ceiling
+
+    /// Maximum number of sealed-but-not-yet-uploaded chunks held by the
+    /// `ChunkProducer`. Caps the producer→uploader path at
+    /// `bufferChunksCount × chunkSize` = 20 MiB.
+    static let bufferChunksCount: Int = 2
 }
 
 struct FileInfo: Sendable {
@@ -63,8 +41,10 @@ struct JobInfo: Codable, Sendable {
     let archive_key: String
 }
 
-// Counting semaphore: throttles total in-flight bytes for downloads. Async by
-// design — `acquire` suspends when the budget is exhausted.
+/// Counting semaphore over a byte budget. Throttles the total bytes of
+/// in-flight downloads. `acquire(_:)` suspends when the budget is
+/// exhausted; `release(_:)` wakes the front waiter (or several, in
+/// order) once enough capacity is back.
 actor ByteSemaphore {
     private let capacity: Int
     private var available: Int
@@ -76,9 +56,9 @@ actor ByteSemaphore {
     }
 
     func acquire(_ amount: Int) async {
-        // Cap the request at full capacity — a single file may be larger than
-        // the budget; we still want the download to make progress (it'll
-        // block other downloads while it owns the whole budget).
+        // Cap the request at full capacity — a single file may exceed the
+        // budget on its own; we still want it to make progress (it will
+        // block other downloads while it holds the whole budget).
         let needed = min(amount, capacity)
         if available >= needed {
             available -= needed
@@ -93,9 +73,8 @@ actor ByteSemaphore {
     func release(_ amount: Int) {
         let toRelease = min(amount, capacity)
         available += toRelease
-        // Wake the front waiter if its request now fits. We don't reorder,
-        // so a huge waiter won't starve smaller ones — that matches the
-        // Rust tokio Semaphore semantics for `acquire_many_owned`.
+        // Wake waiters in FIFO order so a large waiter at the head
+        // doesn't get starved by an unbounded stream of smaller ones.
         while let head = waiters.first, available >= head.needed {
             waiters.removeFirst()
             head.cont.resume()
@@ -147,10 +126,10 @@ func uploadPart(
     data: ByteBuffer,
     logger: Logger
 ) async throws -> S3.CompletedPart {
-    // AWSHTTPBody(buffer:) is zero-copy — Soto wraps the ByteBuffer
-    // directly and AsyncHTTPClient streams it without re-copying.
-    // See PERF-PLAN.md H2 finding (verified by reading
-    // soto-core/Sources/SotoCore/HTTP/AWSHTTPBody.swift:40).
+    // `AWSHTTPBody(buffer:)` is zero-copy: Soto wraps the ByteBuffer
+    // directly and AsyncHTTPClient streams it onto the wire without
+    // re-copying. The `bytes:` overload would copy `Data` into a fresh
+    // ByteBuffer first.
     let response = try await s3.uploadPart(
         S3.UploadPartRequest(
             body: AWSHTTPBody(buffer: data),

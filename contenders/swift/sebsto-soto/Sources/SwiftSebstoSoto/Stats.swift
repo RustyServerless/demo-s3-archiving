@@ -15,58 +15,50 @@ import FoundationEssentials
 import Foundation
 #endif
 
-// Read once at cold start. Truthy values: "1", "true", "yes" (case-insensitive).
-//
-// Public on the `Stats` type so call sites can gate the timer setup itself —
-// not just the recording. Pattern at every hot-path call site:
-//
-//     if Stats.enabled {
-//         let t0 = monoNs()
-//         … work …
-//         stats.record(.downloadFile, ns: monoNs() - t0)
-//     } else {
-//         … work …
-//     }
-//
-// When STATS=0 the entire timing/dispatch path is skipped — no monoNs(),
-// no record(), no lock acquisition.
+/// Read once at cold start. Truthy values: `1`, `true`, `yes`
+/// (case-insensitive). When false, every call site short-circuits via an
+/// inlined `if Stats.enabled` check — no allocation, no lock acquisition,
+/// no monoNs() reads.
 let statsEnabled: Bool = {
     guard let v = ProcessInfo.processInfo.environment["STATS"]?.lowercased() else { return false }
     return v == "1" || v == "true" || v == "yes"
 }()
 
-// Thread-safe collector for per-stage duration samples.
-//
-// Replaces an earlier `actor Stats` because the actor hop was paid even when
-// STATS=0 (the `guard statsEnabled` lived inside the actor body, so the
-// dispatch already happened). With a class + lock and the guard hoisted to
-// call sites, the disabled path is a single load + branch — no allocation,
-// no actor scheduling.
-//
-// When enabled: the lock is held for the duration of one array append per
-// recorded sample. ~9000 file-scoped samples + ~1500 part-scoped over a
-// 3000-file run; negligible vs the wall-clock.
+/// Thread-safe collector for per-stage duration samples.
+///
+/// Implemented as a `final class` + `NIOLockedValueBox` rather than an
+/// `actor` so the disabled-path guard at call sites is a single load +
+/// branch (no actor hop, no allocation). With STATS=1 the lock is held
+/// for the duration of one array append per recorded sample — negligible
+/// vs. the wall-clock cost of the work being measured.
 final class Stats: @unchecked Sendable {
     static let enabled: Bool = statsEnabled
 
     enum Stage: String, CaseIterable {
-        case downloadFile           // Time inside `getObject` body collect + CRC.
-        case downloadInFrame        // Time of the CRC pass over the collected body.
-        case zipperQueueWait        // Time the zipper waits for the next downloaded file.
-        case zipperAppend           // Time inside `producer.appendCompound`.
-        case uploadPart             // Time inside `S3.uploadPart`.
-        case uploaderQueueWait      // Time the uploader waits for the next sealed chunk.
+        /// Time inside the per-file `getObject` body iteration + CRC.
+        case downloadFile
+        /// Time of the single CRC pass at end of file.
+        case downloadInFrame
+        /// Time the zipper waits for the next downloaded file.
+        case zipperQueueWait
+        /// Time inside `producer.appendCompound` (file LFH + body + DD).
+        case zipperAppend
+        /// Time inside `S3.uploadPart`.
+        case uploadPart
+        /// Time the uploader waits for the next sealed chunk.
+        case uploaderQueueWait
     }
 
     private struct State {
         var samples: [Stage: [UInt64]] = [:]
-        // Time-weighted in-flight gauges. We sample a counter at each
-        // (start, stop) event; integral = Σ value * (t - tPrev).
+        // Time-weighted in-flight download gauge. The counter is sampled
+        // at each (start, stop) event; integral = Σ value × (t - tPrev),
+        // so `integral / total time` is the time-weighted mean.
         var downloadInFlight: Int = 0
         var downloadInFlightMax: Int = 0
         var downloadInFlightLastT: UInt64 = 0
         var downloadInFlightIntegral: UInt64 = 0
-        // Hop counter for ChunkProducer.appendCompound. Tests H3.
+        // Counter of `ChunkProducer.appendCompound` actor hops.
         var producerHops: UInt64 = 0
     }
 
@@ -92,8 +84,8 @@ final class Stats: @unchecked Sendable {
         }
     }
 
-    // Hot path. Only reached from call sites that have already checked
-    // `Stats.enabled`, so the guard inside is a redundant safety net.
+    /// Hot path. Call sites guard with `if Stats.enabled` before calling;
+    /// the guard inside is a redundant safety net.
     @inline(__always)
     func record(_ stage: Stage, ns: UInt64) {
         guard Stats.enabled else { return }
@@ -167,10 +159,10 @@ final class Stats: @unchecked Sendable {
             logger.info("stats[producerHops]: total=\(snapshot.producerHops)")
         }
 
-        // Peak RSS. ru_maxrss is KB on Linux, bytes on Darwin.
-        // On glibc, RUSAGE_SELF is imported as a `__rusage_who` enum but
-        // getrusage takes `__rusage_who_t` (Int32) — cast through rawValue.
-        // On Darwin RUSAGE_SELF is already an Int32 (a #define).
+        // Peak RSS via getrusage. `ru_maxrss` is KB on Linux and bytes on
+        // Darwin. On glibc, `RUSAGE_SELF` is imported as a `__rusage_who`
+        // enum but `getrusage` takes `__rusage_who_t` (Int32); cast via
+        // rawValue. On Darwin, `RUSAGE_SELF` is already an Int32 macro.
         var ru = rusage()
         #if canImport(Glibc) || canImport(Musl)
         let who = __rusage_who_t(RUSAGE_SELF.rawValue)
@@ -185,16 +177,11 @@ final class Stats: @unchecked Sendable {
             #endif
             logger.info("stats[peakRSS]: \(String(format: "%.1f", peakMB))MB")
         }
-
-        // heapInUse stat dropped along with the CCRC32 C shim that backed
-        // it. peakRSS via getrusage above is the more important number;
-        // mallinfo2 was a nice-to-have that required a C target.
     }
 }
 
-// Monotonic nanosecond clock via clock_gettime(CLOCK_MONOTONIC). Pattern
-// adapted from swift-aws-lambda-runtime/Sources/AWSLambdaRuntime/LambdaClock.swift.
-// Reading once costs ~30 ns on Graviton2.
+/// Monotonic nanosecond clock via `clock_gettime(CLOCK_MONOTONIC)`.
+/// Reading once costs ~30 ns on Graviton.
 @inlinable
 func monoNs() -> UInt64 {
     var ts = timespec()

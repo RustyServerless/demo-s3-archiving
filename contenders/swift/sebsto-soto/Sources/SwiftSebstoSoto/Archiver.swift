@@ -10,15 +10,14 @@ import Foundation
 
 // One downloaded file's bytes plus the byte-budget release amount.
 //
-// Carries a ByteBuffer (not Data) to keep the bytes in NIO's native
-// representation all the way through the pipeline. The downloader iterates
-// `response.body` which already yields ByteBuffer; converting to Data was
-// causing two allocations + a Sequence iteration per ~64 KB NIO frame
-// (~250k iterations across the run). ByteBuffer.writeBuffer is a memcpy
-// into a pre-sized backing store — one operation per frame, no iteration.
+// `buffer` is `ByteBuffer` (not `Foundation.Data`) so the bytes stay in
+// NIO's native representation end-to-end. Soto's `response.body` yields
+// `ByteBuffer` frames, the chunk producer consumes `ByteBuffer`, and the
+// upload path accepts `AWSHTTPBody(buffer:)` zero-copy. Going through
+// `Data` would force allocations and copies on every ~64 KB frame.
 //
-// CRC32 is also computed in the downloader, in parallel across N tasks,
-// rather than in the single-threaded zipper.
+// CRC32 is computed in the downloader (parallel across the per-file
+// task group) rather than in the single-threaded zipper.
 struct DownloadedFile: Sendable {
     let name: String
     let buffer: ByteBuffer
@@ -61,10 +60,8 @@ func runArchiveJob(s3: S3, job: JobInfo, logger: Logger) async throws {
     )
     logger.info("archive: multipart upload started (id=\(upload.uploadId))")
 
-    // Pre-reserve the per-stage sample arrays so a STATS=1 run doesn't
-    // include array reallocation in its measurements. estimatedParts is a
-    // ceiling — the real archive lands a bit under (chunkSize=10 MiB,
-    // ~17 GiB total → ~1700 parts).
+    // Pre-reserve Stats sample arrays so STATS=1 runs don't include
+    // array reallocation in their measurements.
     let totalBytes = files.reduce(0) { $0 + $1.size }
     let estimatedParts = max(1, totalBytes / Tunables.chunkSize + 8)
     let stats = Stats(estimatedFiles: files.count, estimatedParts: estimatedParts)
@@ -168,28 +165,10 @@ private func runDownloadStage(
     }
 }
 
-// Streams the body into a pre-sized ByteBuffer, then runs CRC32 once
-// over the full readable view at end-of-file.
-//
-// History:
-//   - Run 10/11: streaming with per-frame CRC (multiple short ccrc32
-//     calls per file) — the ARMv8 __crc32{b,h,w,d} intrinsics are
-//     fastest on long contiguous runs.
-//   - Run 13 (C2): switched to `response.body.collect(upTo:)` — single
-//     code path, single CRC pass, but +13 MB peakRSS vs C1 because
-//     `collect` grows its accumulator by doubling and the freed
-//     intermediate buffers don't return to the OS (NIO/glibc arena
-//     retention).
-//   - Run 14 (C2.5, this code): pre-allocate the destination
-//     ByteBuffer at exactly `expectedSize` (no doubling-growth, no
-//     intermediate frees), stream into it, CRC once at end. Keeps C2's
-//     code-simplification wins (single path, whole-file CRC) while
-//     eliminating C2's allocation churn.
-//
-// Memory model is now deterministic: each in-flight download owns
-// exactly one expectedSize-byte ByteBuffer. With maxDownloadsMemory =
-// 20 MiB ÷ ~5 MB ≈ 4 concurrent downloads, that's ~20 MiB of body
-// storage at any moment, predictable for raising the byte budget in C3.
+// Streams the body into a `ByteBuffer` pre-allocated at exactly
+// `expectedSize`, then runs CRC32 once over the full readable view at
+// EOF. The pre-sized allocation gives a deterministic per-file memory
+// footprint and avoids growth-doubling reallocations during the read.
 private func downloadFile(
     s3: S3,
     bucket: String,
@@ -257,9 +236,8 @@ private func runZipStage(
         await producer.appendCompound(lfh: lfh, body: file.buffer, dataDescriptor: dd)
         if Stats.enabled {
             stats.record(.zipperAppend, ns: monoNs() - appendStart)
-            // appendCompound today decomposes to 3 nested `await append(...)`
-            // calls — 3 actor hops per file. Counter proves it (or proves
-            // a future fix). Tests H3 in PERF-PLAN.md.
+            // `appendCompound` decomposes to 3 nested `await append(...)`
+            // calls inside the producer — 3 actor hops per file.
             stats.bumpProducerHops(3)
         }
 

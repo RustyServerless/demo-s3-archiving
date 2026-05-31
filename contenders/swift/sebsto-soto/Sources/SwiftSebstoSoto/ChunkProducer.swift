@@ -6,22 +6,21 @@ import FoundationEssentials
 import Foundation
 #endif
 
-// Async byte sink that buckets writes into fixed-size chunks and emits them
-// for upload. Replaces the Rust reference's SlabRing — same role (decouples
-// the synchronous ZIP writer from the asynchronous multipart uploader, with
-// backpressure when the uploader lags) but uses Swift's native AsyncStream +
-// a counting semaphore instead of a hand-rolled busy-spinning ring.
+// Async byte sink that buckets writes into fixed-size chunks and emits
+// them on a `nonisolated AsyncStream<UploadChunk>` for the uploader.
+// Decouples the synchronous ZIP writer from the asynchronous multipart
+// uploader, with backpressure when the uploader can't keep up.
 //
 // Memory model: at most `maxInFlight` chunks of `chunkSize` bytes are
-// outstanding (= built but not yet uploaded). With chunkSize=10 MiB and
-// maxInFlight=4 that's a 40 MiB ceiling for the producer→uploader path.
+// outstanding (built but not yet uploaded). With `chunkSize` = 10 MiB
+// and `maxInFlight` = 2 that's a 20 MiB ceiling for the producer→
+// uploader path.
 //
-// Storage: NIO `ByteBuffer` end-to-end. Soto's `AWSHTTPBody(buffer:)`
-// accepts a ByteBuffer zero-copy (see PERF-PLAN.md / RESULTS.md H2 finding);
-// using `Data` here would force a Data → ByteBuffer copy on every uploadPart
-// call — at 10 MiB × ~1500 parts that's ~15 GiB of avoidable copies and the
-// associated NIO ByteBufferAllocator arena pressure (a contributor to the
-// warm-run RSS climb).
+// Storage is NIO `ByteBuffer` end-to-end — `Soto.AWSHTTPBody(buffer:)`
+// wraps a ByteBuffer zero-copy on the wire. Going through `Data` would
+// force a Data→ByteBuffer copy on every `uploadPart` call, which is
+// ~15 GiB of avoidable copies and ByteBufferAllocator arena churn for
+// a 15 GiB archive split into 10 MiB parts.
 actor ChunkProducer {
     let chunkSize: Int
     private let maxInFlight: Int
@@ -41,7 +40,7 @@ actor ChunkProducer {
         let data: ByteBuffer
     }
 
-    init(chunkSize: Int = 10 * 1024 * 1024, maxInFlight: Int = 4) {
+    init(chunkSize: Int = 10 * 1024 * 1024, maxInFlight: Int = 2) {
         self.chunkSize = chunkSize
         self.maxInFlight = maxInFlight
         self.allocator = ByteBufferAllocator()
@@ -51,9 +50,8 @@ actor ChunkProducer {
         self.continuation = continuationOut
     }
 
-    // Append a small Data (used for ZIP headers — LFH, DD, central directory
-    // records, EOCDs). Headers are tiny (≤ ~150 B each) so withUnsafeBytes
-    // overhead is negligible vs the 10 MiB chunk-size.
+    /// Append a small `Data` blob — used for ZIP headers (local file header,
+    /// data descriptor, central directory records, EOCDs).
     func append(_ bytes: Data) async {
         let total = bytes.count
         guard total > 0 else { return }
@@ -72,13 +70,12 @@ actor ChunkProducer {
         }
     }
 
-    // ByteBuffer append — zero-copy memcpy via NIO. Used for file payloads
-    // on the hot path (5 MB per call × 3000 files).
-    //
-    // Hot path (file fits in current chunk): writeImmutableBuffer is one
-    // memcpy. Spill path: readSlice splits the source into chunk-sized
-    // pieces, each writeBuffer is one memcpy, no allocation per slice
-    // (slices are views over the same backing storage).
+    /// Append a `ByteBuffer` — used for the hot file-body path. The fast
+    /// path (input fits in the current chunk) is a single memcpy via
+    /// `writeImmutableBuffer`. The spill path (input crosses one or more
+    /// chunk boundaries) splits the source into chunk-sized slices —
+    /// `readSlice` is zero-copy because slices view the same backing
+    /// storage; each `writeBuffer` is then one memcpy.
     func append(_ byteBuf: ByteBuffer) async {
         let total = byteBuf.readableBytes
         guard total > 0 else { return }
@@ -105,17 +102,16 @@ actor ChunkProducer {
         }
     }
 
-    // Coalesced LFH + body + data descriptor: still 3 actor hops today
-    // (one per `await append`), but the body path is the hot 5 MB one.
-    // C4 in PERF-PLAN.md will collapse this into a single hop.
+    /// Append the three byte ranges that make up one ZIP entry —
+    /// local file header, body, then data descriptor — in order.
     func appendCompound(lfh: Data, body: ByteBuffer, dataDescriptor: Data) async {
         await append(lfh)
         await append(body)
         await append(dataDescriptor)
     }
 
-    // Mark the producer as done. Emits any remaining partial chunk and closes
-    // the stream so the consumer's for-await loop terminates.
+    /// Mark the producer as done. Emits any remaining partial chunk and
+    /// closes the stream so the consumer's `for await` loop terminates.
     func finish() async {
         if buffer.readableBytes > 0 {
             await emitFullChunk()
@@ -124,8 +120,8 @@ actor ChunkProducer {
         continuation.finish()
     }
 
-    // Called by the uploader when it has finished sending a chunk so the
-    // producer can continue building the next ones.
+    /// Called by the uploader when it has finished sending a chunk so the
+    /// producer can build the next ones.
     func releaseSlot() {
         if inFlight > 0 { inFlight -= 1 }
         if let w = slotWaiters.first {

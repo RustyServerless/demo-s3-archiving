@@ -1,16 +1,7 @@
-// CRC32 with the IEEE polynomial (0xEDB88320 reflected), the polynomial ZIP
-// uses. Pure Swift, no C shim, no platform intrinsics — Slicing-by-8.
-//
-// Slicing-by-8 processes 8 bytes per loop iteration via 8 parallel table
-// lookups. About 5–10× faster than the byte-at-a-time implementation;
-// slower than the ARMv8 `__crc32{b,h,w,d}` intrinsics but the difference
-// is bounded by the data size we hash. At 15 GiB total across the run
-// and ~2.6 mean concurrent downloaders, the per-task CRC contribution
-// is small relative to network wait time.
-//
-// Reference: Intel "Fast CRC Computation Using PCLMULQDQ Instruction"
-// describes the slicing approach. The 8 256-entry tables are computed at
-// process start (lazy on first use).
+// Pure-Swift CRC32 with the IEEE polynomial (0xEDB88320 reflected) used
+// by ZIP. Slicing-by-8: processes 8 bytes per loop iteration via 8
+// parallel table lookups. The 8 256-entry tables are computed once on
+// first use.
 struct CRC32 {
     private(set) var value: UInt32 = 0
 

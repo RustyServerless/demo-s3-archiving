@@ -10,14 +10,13 @@ import FoundationEssentials
 import Foundation
 #endif
 
-// One HTTPClient + AWSClient + S3 client, instantiated once at cold start
-// so subsequent warm invocations skip the connection setup.
+// One HTTPClient + AWSClient + S3 client, instantiated once at cold start so
+// warm invocations skip connection setup.
 //
-// Run-5 profiling showed downloader-bound runtime at ~12 MB/s per task with
-// the default `HTTPClient.shared` (8 connections per host). With 10+
-// concurrent S3 GETs, requests serialize behind the pool. Raise the soft
-// limit and tighten timeouts so a misbehaving connection doesn't stall the
-// whole pipeline.
+// `concurrentHTTP1ConnectionsPerHostSoftLimit` is raised from the
+// AsyncHTTPClient default of 8 because the pipeline issues download GETs
+// and upload PUTs concurrently to the same host (S3); the default would
+// serialise requests behind a too-small connection pool.
 var httpConfig = HTTPClient.Configuration()
 httpConfig.connectionPool.concurrentHTTP1ConnectionsPerHostSoftLimit = 32
 httpConfig.timeout.read = .seconds(120)
@@ -35,7 +34,6 @@ let s3 = S3(client: awsClient, region: region)
 
 let runtime = LambdaRuntime { (event: JobInfo, context: LambdaContext) async throws -> String in
     context.logger.info("event: bucket=\(event.bucket_name) prefix=\(event.files_prefix) archive=\(event.archive_key)")
-    context.logger.info("tunables: lambdaMemory=\(lambdaMemoryMB)MB maxDownloadsMemory=\(Tunables.maxDownloadsMemory / 1024 / 1024)MiB")
     try await runArchiveJob(s3: s3, job: event, logger: context.logger)
     return "ok"
 }

@@ -1,13 +1,21 @@
 <!-- markdownlint-disable MD013 -->
 # Swift contender — `sebsto-soto`
 
-The Swift contender that ships in this repo. A Lambda that, given
-`{bucket_name, files_prefix, archive_key}`, lists every object under
-`s3://${bucket_name}/${files_prefix}/`, reads them all, and uploads a
-flat STORED ZIP archive to `s3://${bucket_name}/${archive_key}` — in a
-single Lambda invocation, on Graviton, 512 MB memory, 600 s timeout.
+A single-Lambda implementation of the
+[demo-s3-archiving](../../README.md) benchmark contract: given a
+`{bucket_name, files_prefix, archive_key}` input, list every object
+under `s3://${bucket_name}/${files_prefix}/`, fetch them all, build a
+flat **STORED** ZIP archive, and upload that archive to
+`s3://${bucket_name}/${archive_key}` — all in one invocation, on a
+512 MB / arm64 / `provided.al2023` Lambda with a 600 s timeout.
 
-This document describes what the code doesand the design choices I made.
+The benchmark bucket holds 3 000 objects totalling ~15 GB. The 512 MB
+memory ceiling means we cannot buffer the archive on disk or in memory;
+everything must stream.
+
+This README walks through the design choices, the architecture, the
+tunables, and the measured performance against the Rust reference
+contender that ships in the same repo.
 
 ## Per-Lambda configuration
 
@@ -19,14 +27,15 @@ This document describes what the code doesand the design choices I made.
 | Timeout | 600 s |
 | Handler | `swift.handler` (ignored — `bootstrap` is executed) |
 
-## Two critical design decisions for performance
+## Two performance design decisions
 
 ### 1. Use Soto, not the official AWS SDK for Swift
 
-Two SDKs exist for calling AWS services from Swift:
+Two AWS SDKs exist for Swift:
 
-- **The official [AWS SDK for Swift](https://github.com/awslabs/aws-sdk-swift)** —
-  built on top of the [AWS Common Runtime (`aws-crt-swift`)](https://github.com/awslabs/aws-crt-swift),
+- **The official [AWS SDK for Swift](https://github.com/awslabs/aws-sdk-swift)**
+  — built on top of the
+  [AWS Common Runtime (`aws-crt-swift`)](https://github.com/awslabs/aws-crt-swift),
   a set of C libraries shared across the official SDKs for several
   languages (Java, Python, JavaScript, …). Generated from the same
   Smithy service models as those other SDKs.
@@ -35,36 +44,34 @@ Two SDKs exist for calling AWS services from Swift:
   [AsyncHTTPClient](https://github.com/swift-server/async-http-client),
   Apple's official server-side Swift HTTP stack. Pure Swift end-to-end.
 
-We started this contender on the official AWS SDK for Swift. With the
-same architecture and the same optimisations applied to both, our
-measurements were:
+Measured with the same Swift application code on top of each SDK,
+running the same workload on the same Lambda configuration:
 
 | SDK | Cold-1 wall-clock | Cold-2 wall-clock | `uploadPart` p50 |
 |---|---|---|---|
 | **Soto** | **250 s** | **250 s** | **200 ms** |
 | AWS SDK for Swift | 544 s | timeout @ 600 s | 680 ms |
 
-Identical Swift application code: same three-stage pipeline, same byte
-budget, same chunk size, same pure-Swift CRC32, same backpressure
-model. Only the SDK calls differ. Despite that, the AWS SDK port runs
-**at the edge of the 600 s Lambda timeout** — succeeding once, timing
-out the next time. That's not a viable production stance.
+Same three-stage pipeline, same byte budget, same chunk size, same
+pure-Swift CRC32, same backpressure model — only the SDK calls differ.
+The aws-sdk-swift port runs **at the edge of the 600 s Lambda timeout**:
+it succeeds once and times out the next time. Not viable for production.
 
-Why the gap? Two reasons, both at the HTTP transport:
+The gap is at the HTTP transport layer:
 
 - **`S3.uploadPart` is 3.4× slower per call** on aws-crt-swift than on
-  AsyncHTTPClient (680 ms vs 200 ms p50 for a 10 MiB part). With ~1500
-  parts in the run, that single difference accounts for ~700 s of
+  AsyncHTTPClient (680 ms vs 200 ms p50 for a 10 MiB part). With ~1 500
+  parts per archive, that single difference accounts for ~700 s of
   extra work.
-- **The API surface forces extra copies.** aws-sdk-swift exposes the
-  S3 response body as a `Smithy.ByteStream` whose only progressive read
+- **The API surface forces extra copies.** aws-sdk-swift exposes the S3
+  response body as `Smithy.ByteStream`, whose only progressive read
   primitive is `readAsync(upToCount:)` returning a fresh `Data`. The
   upload body is `ByteStream.data(Data?)` or `.stream(Stream)` — no
-  ByteBuffer init. Any custom Stream gets collected back into a single
+  ByteBuffer init. Any custom `Stream` is collected back into a single
   `Data` by `FlexibleChecksumsRequestMiddleware` before SigV4 signing,
-  so there is no zero-copy path even with manual bridging. Combined
-  with `Data`'s allocation behaviour (see decision #2), this multiplies
-  CRT-internal memcpys.
+  so even manual bridging cannot avoid the copy. Combined with `Data`'s
+  allocation behaviour (see decision #2), this multiplies CRT-internal
+  memcpys.
 
 Soto, by contrast, hands us NIO `ByteBuffer` end-to-end and accepts
 `ByteBuffer` zero-copy on `S3.uploadPart` via `AWSHTTPBody(buffer:)`.
@@ -76,31 +83,30 @@ If you don't write Swift on the server every day, this distinction is
 not obvious. Both look like "an array of bytes". Why does it matter?
 
 **`Foundation.Data`** is the standard Swift "blob of bytes" type. It is
-copy-on-write, like Swift's `Array`, and it is *opaque about its
-storage*: an instance may be backed by one contiguous heap allocation,
+copy-on-write, like Swift's `Array`, and it is **opaque about its
+storage**: an instance may be backed by one contiguous heap allocation,
 or by several disjoint segments stitched together at the API surface.
-The hot-path consequence:
+The hot-path consequences:
 
 - Every `Data.append(other:)` checks whether the receiver is uniquely
   referenced (cheap), grows the backing buffer if needed (potentially
-  reallocates and copies the existing bytes), then memcpys the new
+  reallocating and copying the existing bytes), then memcpys the new
   bytes into place.
 - When you ask for a contiguous pointer (`withUnsafeBytes`), Foundation
-  may have to flatten the segments first, which copies bytes you didn't
+  may have to flatten the segments first — copying bytes you didn't
   ask to copy.
-- It carries Foundation's bridging surface — types like `NSData`,
-  Objective-C interop, even on Linux where there is no Objective-C
-  runtime.
+- It carries Foundation's bridging surface — `NSData`, Objective-C
+  interop, even on Linux where there is no Objective-C runtime.
 
 **`NIOCore.ByteBuffer`** is the byte-buffer type used inside SwiftNIO.
-It is value-typed (also copy-on-write), but with three crucial
-differences for our workload:
+Also value-typed and copy-on-write, but with three crucial differences
+for our workload:
 
 - **One contiguous allocation, always.** A ByteBuffer is a slice over
   exactly one underlying buffer. `withUnsafeReadableBytes` always hands
   back a single contiguous pointer-and-length, no flattening needed.
-- **Reader index + writer index, no bookkeeping copies.** Splitting a
-  ByteBuffer (`readSlice(length:)`) and concatenating
+- **Reader index + writer index.** Splitting a ByteBuffer
+  (`readSlice(length:)`) and concatenating
   (`writeBuffer(&other:)`) advance internal indices over the same
   storage. Slicing is zero-copy; concatenation is a single memcpy.
 - **Allocator-aware.** The default `ByteBufferAllocator` recycles
@@ -110,16 +116,16 @@ differences for our workload:
 
 In our pipeline this matters at three places:
 
-| Hot-path location | Per-run cost if we used `Data` | What `ByteBuffer` saves |
+| Hot-path location | Cost using `Data` | What `ByteBuffer` saves |
 |---|---|---|
-| Download accumulator (`downloadFile`) | One `Data.append(_:count:)` per ~80 KB frame, ~250k frames/run, with possible re-allocation as the buffer grows | One pre-sized allocation per file, one `writeBuffer` memcpy per frame |
+| Download accumulator (`downloadFile`) | One `Data.append(_:count:)` per ~64 KB frame, ~250k frames per run, with possible re-allocation as the buffer grows | One pre-sized allocation per file, one `writeBuffer` memcpy per frame |
 | Producer→uploader chunk (`ChunkProducer`) | Each 10 MiB chunk built via `Data.append`; passed to `S3.uploadPart` as `Data` | Built directly in a 10 MiB `ByteBuffer`; passed as `AWSHTTPBody(buffer:)` zero-copy |
 | `S3.uploadPart` body | `AWSHTTPBody(bytes: Data)` copies into a fresh `ByteBuffer` internally before NIO emits it on the wire | `AWSHTTPBody(buffer:)` wraps the existing ByteBuffer with no copy |
 
-Concretely, switching from `Data` to `ByteBuffer` on the upload path
-alone eliminates ~15 GiB of avoidable copies per run (10 MiB × ~1500
-parts) and reduces NIO `ByteBufferAllocator` arena pressure (which is
-what makes the warm Lambda's RSS climb on `Data`-based code).
+Switching from `Data` to `ByteBuffer` on the upload path alone
+eliminates ~15 GiB of avoidable copies per run (10 MiB × ~1 500 parts)
+and reduces NIO `ByteBufferAllocator` arena pressure (which would
+otherwise make the warm Lambda's RSS climb).
 
 If `Data` is your shovel, `ByteBuffer` is the conveyor belt — designed
 for moving lots of bytes through one pipe.
@@ -166,10 +172,10 @@ ListObjectsV2                    │                                      │
 ### Stage A — Downloader (`runDownloadStage` in `Archiver.swift`)
 
 A `withThrowingTaskGroup` of N worker tasks. Concurrency is bounded by
-the byte budget: a new download task is `addTask`'d only after
+the byte budget: a new download task is added only after
 `byteBudget.acquire(file.size)` succeeds, so at any moment the in-flight
-set fits in 20 MiB. With ~5 MB files that gives ~4 concurrent tasks
-(observed mean: 1.96–2.66, max 5).
+set fits in 20 MiB. With ~5 MB files, that gives ~4 concurrent tasks
+in steady state.
 
 Each task:
 
@@ -181,7 +187,7 @@ Each task:
 - After the body is fully read, runs CRC32 once over the contiguous
   readable view (see CRC32 below).
 - Sends a `DownloadedFile { name, buffer, crc32, releaseBytes }` into
-  the `FileChannel` (a `nonisolated`-friendly `AsyncStream` wrapper).
+  the `FileChannel` — a thin `AsyncStream` wrapper.
 
 ### Stage B — Zipper (`runZipStage` in `Archiver.swift`)
 
@@ -211,15 +217,15 @@ calls `S3.completeMultipartUpload`.
 ### `ChunkProducer` (`ChunkProducer.swift`)
 
 Swift `actor`. Buckets writes from the zipper into fixed-size 10 MiB
-chunks and emits each sealed chunk on a `nonisolated AsyncStream<UploadChunk>`
-for the uploader.
+chunks and emits each sealed chunk on a
+`nonisolated AsyncStream<UploadChunk>` for the uploader.
 
 - Internal buffer is a `ByteBuffer` sized exactly to `chunkSize`.
 - Two append overloads — `Data` (for the small ZIP headers) and
   `ByteBuffer` (for the big file bodies, zero-copy).
 - Backpressure: at most `bufferChunksCount = 2` chunks may be
-  outstanding (built but not yet uploaded). The producer suspends in
-  `waitForSlot()` when the in-flight count is at the ceiling.
+  outstanding. The producer suspends in `waitForSlot()` when the
+  in-flight count is at the ceiling.
 
 ### Backpressure summary
 
@@ -246,8 +252,8 @@ enum Tunables {
 }
 ```
 
-The HTTP client connection pool is configured in `main.swift` because it
-must be set on the AsyncHTTPClient before the AWSClient is built:
+The HTTP client connection pool is configured in `main.swift` because
+it must be set on AsyncHTTPClient before the AWSClient is built:
 
 ```swift
 httpConfig.connectionPool.concurrentHTTP1ConnectionsPerHostSoftLimit = 32
@@ -257,15 +263,15 @@ httpConfig.timeout.connect = .seconds(10)
 
 ## ZIP format
 
-STORED only (no DEFLATE), GP flag bit 3 set so CRC32 + sizes are emitted
-in a data descriptor *after* each file body. ZIP64 is mandatory: the
-archive total exceeds 4 GiB.
+STORED only (no DEFLATE), GP flag bit 3 set so CRC32 + sizes are
+emitted in a data descriptor *after* each file body. ZIP64 records are
+emitted unconditionally because the archive total exceeds 4 GiB.
 
 | Record | Size | Notes |
 |---|---|---|
-| Local file header (LFH) | 30 + nameLen | Fields: sig, version 45, GP flag 0x0008, method STORED (0), DOS time/date (fixed 2010-01-01), CRC=0, compSize=0, uncSize=0, nameLen, extraLen=0, name |
+| Local file header (LFH) | 30 + nameLen | sig, version 45, GP flag 0x0008, method STORED (0), DOS time/date (fixed 2010-01-01), CRC=0, compSize=0, uncSize=0, nameLen, extraLen=0, name |
 | Data descriptor (ZIP64) | 24 | sig, CRC32, 8B compSize, 8B uncSize (== compSize because STORED) |
-| Central directory record | 46 + nameLen + 28 | Last 28 bytes are the ZIP64 extended-info extra field (uncSize8, compSize8, lfhOffset8). The 32-bit fields in the CD record are set to `0xFFFFFFFF` to force readers to read from the ZIP64 extra. |
+| Central directory record | 46 + nameLen + 28 | Last 28 bytes are the ZIP64 extended-info extra field (uncSize8, compSize8, lfhOffset8). The 32-bit fields in the CD record are set to `0xFFFFFFFF` to force readers to use the ZIP64 extra. |
 | ZIP64 EOCD record | 56 | sig, sizeOfRest=44, version, disk numbers, entry count (×2), CD size, CD offset |
 | ZIP64 EOCD locator | 20 | sig, disk=0, ZIP64-EOCD offset, totalDisks=1 |
 | EOCD | 22 | All counts/offsets are `0xFFFF` / `0xFFFFFFFF` (defer to ZIP64) |
@@ -287,20 +293,17 @@ require a tiny C shim)? Two reasons:
 - **Single-language comparison.** The Rust reference contender uses the
   pure-Rust `zip` crate's CRC. Calling out to C would muddy the
   Swift-vs-Rust comparison.
-- **It is actually faster on this CPU.** The `__crc32d` intrinsic has a
-  serial dependency chain (each call depends on the previous CRC
-  result). Slicing-by-8 issues 8 parallel table lookups per byte
-  position, which the out-of-order core on Graviton2 schedules across
-  multiple memory ports. On a 0.29 vCPU allocation, the memory-level
-  parallelism wins: ~4 ms per 5 MB file in pure Swift vs ~76 ms with
-  the intrinsics + the cost of crossing the Swift→C boundary on a
-  non-contiguous source. Removing the C path also unblocked the
-  downloader's per-task pipeline, since the CRC was running inline at
-  end of each file and serializing the next download.
+- **It is faster on this CPU.** The `__crc32d` intrinsic has a serial
+  dependency chain (each call depends on the previous CRC result).
+  Slicing-by-8 issues 8 parallel table lookups per byte position,
+  which the out-of-order core on Graviton schedules across multiple
+  memory ports. On a 0.29 vCPU allocation the memory-level parallelism
+  wins: ~4 ms per 5 MB file in pure Swift vs ~76 ms with the intrinsics
+  + the Swift→C boundary cost on a non-contiguous source.
 
 The implementation is verified against standard reference vectors:
-empty, `"a"`, `"123456789"` (RFC 3720 = `0xCBF43926`), 32×0x00, 32×0xFF,
-chunked splits, and a 1 MiB cross-check against a slicing-by-1
+empty, `"a"`, `"123456789"` (= `0xCBF43926`, RFC 3720), 32×0x00,
+32×0xFF, chunked splits, and a 1 MiB cross-check against a slicing-by-1
 reference.
 
 ## Optional profiling instrumentation — `STATS=1`
@@ -325,7 +328,8 @@ Gated on the `STATS` environment variable — truthy values are `1`,
 `true`, `yes` (case-insensitive). `Stats.enabled` is read once at cold
 start. When unset, every call site short-circuits via an inlined
 `if Stats.enabled` check — neither `monoNs()` nor `record()` runs, no
-allocation, no actor hop, no lock acquisition.
+allocation, no actor hop, no lock acquisition. Enabling instrumentation
+adds ~10–25 s to a full run.
 
 To enable for one run:
 
@@ -375,12 +379,12 @@ declared in `Package.swift`.
 | Concern | Decision | Why |
 |---|---|---|
 | Lambda runtime | `swift-aws-lambda-runtime` v2.x | Closure-based `LambdaRuntime { (event, context) in … }`, Codable JSON in/out |
-| **AWS SDK** | **Soto 7.x** (community) | NIO `ByteBuffer` end-to-end, zero-copy upload via `AWSHTTPBody(buffer:)`. The official aws-sdk-swift forces `Data` everywhere and times out on this workload — see "Two critical design decisions" above |
+| **AWS SDK** | **Soto 7.x** (community) | NIO `ByteBuffer` end-to-end, zero-copy upload via `AWSHTTPBody(buffer:)`. The official aws-sdk-swift forces `Data` everywhere and times out on this workload — see "Two performance design decisions" above |
 | **Byte buffer** | **NIO `ByteBuffer`** | Single contiguous allocation, reader/writer indices, allocator-pooled; vs Foundation `Data`'s opaque storage and per-`append` re-allocation risk |
 | ZIP writer | Hand-rolled (`Zip/Headers.swift`) | ZIPFoundation requires a URL or full-`Data` backing — incompatible with 15 GB-doesn't-fit-in-/tmp streaming. ~150 LOC of Swift gets us streaming + ZIP64 |
 | CRC32 | Pure-Swift slicing-by-8 | Single-language vs Rust comparison; faster than the ARMv8 intrinsic on this CPU due to memory-level parallelism (see CRC32 section) |
 | Foundation | `FoundationEssentials` on Linux (`#if canImport(FoundationEssentials)`), `Foundation` on macOS for local builds | Smaller binary on Linux |
-| Architecture | arm64 (Graviton2) | Matches Rust reference; cheaper per GB-s |
+| Architecture | arm64 (Graviton) | Matches Rust reference; cheaper per GB-s |
 | Memory | 512 MB | Same as Rust reference. Peak observed ~390 MB |
 | Concurrency | Swift 6 strict concurrency, structured `withThrowingTaskGroup`, actors for shared state, `AsyncStream` for inter-stage queues |
 
@@ -392,7 +396,7 @@ section):
 ```bash
 SWIFT_CONTENDER_LAMBDA_PATH=./contenders/swift
 for LAMBDA_DIR in "$SWIFT_CONTENDER_LAMBDA_PATH"/*/; do
-  [ -d "$LAMBDA_DIR" ] || continue            # skips DESIGN.md
+  [ -d "$LAMBDA_DIR" ] || continue            # skip sibling files (this README, etc.)
   LAMBDA=$(basename "$LAMBDA_DIR")
   cd $SWIFT_CONTENDER_LAMBDA_PATH/$LAMBDA
   swift build -c release --static-swift-stdlib -Xswiftc -Osize
@@ -441,10 +445,9 @@ up.
 ## Results
 
 10 sequential Step Function executions, each invoking both the Swift
-contender and the Rust reference. Same Lambda configuration for both,
-in eu-west-3, on the same 3000-object / ~15 GB test bucket. STATS
-instrumentation off on Swift (we are measuring production, not the
-profiler). All 10 runs succeeded.
+contender and the Rust reference. Same Lambda configuration for both
+(512 MB / arm64 / 600 s timeout), in eu-west-3, on the same 3 000-object
+/ ~15 GB test bucket. STATS instrumentation off. All 10 runs succeeded.
 
 ### Per-run table
 
@@ -468,7 +471,7 @@ profiler). All 10 runs succeeded.
 | **Swift** | **212.4** | 219.5 | 235.8 | 237.6 | 223.3 | **9.13** |
 | **Rust** | 210.4 | 211.6 | 211.8 | 211.9 | 211.3 | 0.52 |
 
-### `run_price_usd` (lower is better — ranking metric)
+### `run_price_usd` (lower is better — the project's ranking metric)
 
 |  | min | p50 | p90 | max | mean |
 |---|---|---|---|---|---|
@@ -481,23 +484,20 @@ profiler). All 10 runs succeeded.
 |---|---|---|---|---|---|
 | Ratio | 1.003 | 1.039 | 1.120 | 1.129 | **1.057** |
 
-### Reading these numbers
+### Reading the numbers
 
-- **The best Swift run beat the worst Rust run** (Swift 212.4 s vs
-  Rust 211.9 s max) — within sampling noise.
+- **The best Swift run was 0.7 s slower than its paired Rust run** —
+  within sampling noise (run 4: 212.4 s vs 211.7 s).
 - **The median Swift run is 1.039× Rust** — about 8 s slower on a
   211 s baseline.
-- **Swift mean cost is 5.7% higher than Rust** ($0.001489 vs
+- **Swift's mean cost is 5.7% higher than Rust** ($0.001489 vs
   $0.001409 per invocation).
-- Rust's wall-clock standard deviation is **0.52 s over 10 runs**;
-  Swift's is **9.13 s** — Rust is metronomic, Swift more variable.
-  The Swift variance correlates with sandbox cold-vs-warm placement
-  across the 10 runs (the high outliers are colder cases). The Rust
-  binary's static cold start is short enough that it's invisible at
-  this granularity.
-- The earlier project-history figure of "Swift 250 s" was measured
-  with `STATS=1` instrumentation enabled. The instrumentation costs
-  ~25 s of run time; with it off, the contender lands as above.
+- **Rust is metronomic, Swift is variable.** Rust's wall-clock
+  standard deviation across 10 runs is **0.52 s**; Swift's is
+  **9.13 s**. The Swift variance correlates with sandbox cold-vs-warm
+  placement — the high outliers are colder cases, and a statically
+  linked Rust binary's cold start is short enough that it's invisible
+  at this granularity.
 
 ## Verification
 

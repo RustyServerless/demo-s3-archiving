@@ -4,9 +4,11 @@ import FoundationEssentials
 import Foundation
 #endif
 
-// Streaming ZIP encoder. STORED only, GP flag bit 3 (data descriptor) set so
-// CRC + sizes are emitted *after* each file's data. ZIP64 is mandatory because
-// the archive total exceeds 4 GiB.
+// Streaming ZIP encoder. Method = STORED (no compression). GP flag bit 3
+// is set so CRC + sizes are written in a data descriptor *after* each
+// file's body — necessary because we stream the body before knowing the
+// CRC. ZIP64 records are emitted unconditionally so archives larger than
+// 4 GiB are valid.
 
 enum ZipSig: UInt32 {
     case localFileHeader = 0x04034b50
@@ -30,8 +32,8 @@ enum ZipHeaders {
     static let gpFlag: UInt16 = 0x0008
     static let versionNeededZip64: UInt16 = 45
     static let versionMadeByUnix: UInt16 = (3 << 8) | 45
-    // Fixed mtime: 2010-01-01 00:00:00 — matches the project's CI strategy of
-    // touching all files to that date for reproducible archives.
+    // Fixed mtime (2010-01-01 00:00:00) so two runs over the same input
+    // produce byte-identical archives.
     static let dosTime: UInt16 = 0
     static let dosDate: UInt16 = (30 << 9) | (1 << 5) | 1  // 2010-01-01
 
