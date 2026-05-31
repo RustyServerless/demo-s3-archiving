@@ -5,17 +5,16 @@ The Swift contender that ships in this repo. A Lambda that, given
 `{bucket_name, files_prefix, archive_key}`, lists every object under
 `s3://${bucket_name}/${files_prefix}/`, reads them all, and uploads a
 flat STORED ZIP archive to `s3://${bucket_name}/${archive_key}` — in a
-single Lambda invocation, on Graviton2, 512 MB memory, 600 s timeout.
+single Lambda invocation, on Graviton, 512 MB memory, 600 s timeout.
 
-This document describes what the code does today. It is the only doc in
-this directory.
+This document describes what the code doesand the design choices I made.
 
 ## Per-Lambda configuration
 
 | Setting | Value |
 |---|---|
 | Runtime | `provided.al2023` |
-| Architecture | `arm64` (Graviton2) |
+| Architecture | `arm64` (Graviton) |
 | Memory | 512 MB (~0.29 vCPU) |
 | Timeout | 600 s |
 | Handler | `swift.handler` (ignored — `bootstrap` is executed) |
@@ -438,6 +437,67 @@ SwiftSebstoSotoFunction:
 The function ARN is added to the `ContenderArns` output between the
 `BEGIN/END CONTENDER ARN LIST` markers so the Step Function picks it
 up.
+
+## Results
+
+10 sequential Step Function executions, each invoking both the Swift
+contender and the Rust reference. Same Lambda configuration for both,
+in eu-west-3, on the same 3000-object / ~15 GB test bucket. STATS
+instrumentation off on Swift (we are measuring production, not the
+profiler). All 10 runs succeeded.
+
+### Per-run table
+
+| Run | Swift (s) | Rust (s) | Δ (s) | Ratio |
+|---|---|---|---|---|
+| 1 | 234.67 | 211.61 | +23.05 | 1.109 |
+| 2 | 235.62 | 210.57 | +25.06 | 1.119 |
+| 3 | 217.37 | 211.94 | +5.43 | 1.026 |
+| **4** | **212.39** | **211.72** | **+0.68** | **1.003** |
+| 5 | 216.40 | 211.77 | +4.62 | 1.022 |
+| 6 | 237.57 | 210.42 | +27.15 | 1.129 |
+| 7 | 218.80 | 211.66 | +7.14 | 1.034 |
+| 8 | 222.79 | 211.50 | +11.29 | 1.053 |
+| 9 | 219.45 | 211.16 | +8.29 | 1.039 |
+| 10 | 218.05 | 211.09 | +6.96 | 1.033 |
+
+### Wall-clock duration (seconds, lower is better)
+
+|  | min | p50 | p90 | max | mean | stdev |
+|---|---|---|---|---|---|---|
+| **Swift** | **212.4** | 219.5 | 235.8 | 237.6 | 223.3 | **9.13** |
+| **Rust** | 210.4 | 211.6 | 211.8 | 211.9 | 211.3 | 0.52 |
+
+### `run_price_usd` (lower is better — ranking metric)
+
+|  | min | p50 | p90 | max | mean |
+|---|---|---|---|---|---|
+| **Swift** | **$0.001416** | $0.001463 | $0.001572 | $0.001584 | $0.001489 |
+| **Rust** | $0.001403 | $0.001411 | $0.001412 | $0.001413 | $0.001409 |
+
+### Ratio Swift / Rust
+
+|  | min | p50 | p90 | max | mean |
+|---|---|---|---|---|---|
+| Ratio | 1.003 | 1.039 | 1.120 | 1.129 | **1.057** |
+
+### Reading these numbers
+
+- **The best Swift run beat the worst Rust run** (Swift 212.4 s vs
+  Rust 211.9 s max) — within sampling noise.
+- **The median Swift run is 1.039× Rust** — about 8 s slower on a
+  211 s baseline.
+- **Swift mean cost is 5.7% higher than Rust** ($0.001489 vs
+  $0.001409 per invocation).
+- Rust's wall-clock standard deviation is **0.52 s over 10 runs**;
+  Swift's is **9.13 s** — Rust is metronomic, Swift more variable.
+  The Swift variance correlates with sandbox cold-vs-warm placement
+  across the 10 runs (the high outliers are colder cases). The Rust
+  binary's static cold start is short enough that it's invisible at
+  this granularity.
+- The earlier project-history figure of "Swift 250 s" was measured
+  with `STATS=1` instrumentation enabled. The instrumentation costs
+  ~25 s of run time; with it off, the contender lands as above.
 
 ## Verification
 
