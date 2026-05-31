@@ -27,7 +27,10 @@ enum Tunables {
     static let maxDownloadsMemory: Int = 20 * 1024 * 1024   // 20 MiB
     static let maxConcurrentUploads: Int = 3
     static let chunkSize: Int = 10 * 1024 * 1024            // 10 MiB
-    static let bufferChunksCount: Int = 4                   // ChunkProducer in-flight ceiling
+    // R1: matches Rust reference (BUFFER_CHUNKS_COUNT=2). Caps producer→
+    // uploader path at 2 × 10 MiB = 20 MiB instead of 4 × 10 MiB = 40 MiB.
+    // Predicted: -20 MB peakRSS, no wall-clock change.
+    static let bufferChunksCount: Int = 2                   // ChunkProducer in-flight ceiling
 }
 
 struct FileInfo: Sendable {
