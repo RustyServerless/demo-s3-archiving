@@ -461,6 +461,107 @@ single-run variance band. The honest summary: the changes that
 improved peakRSS (C1, C2.5) are real wins; R1 is cosmetic; everything
 else is noise.
 
+## Run 18 — pure-Swift CRC32 (drop CCRC32 C target)
+
+Stack: same. Build: `016747c`. STATS=1.
+
+Removed the entire `CCRC32` C target — replaced the slicing-by-1 +
+ARMv8 `__crc32{b,h,w,d}` intrinsics path with a pure-Swift slicing-by-8
+table implementation in `Zip/CRC32.swift`. Goal was eliminating the C
+dependency for a clean Swift-vs-Rust comparison; expected a small
+regression in the ±10 s noise band.
+
+**Result: massive improvement, far outside any noise band.**
+
+| Run | Type | Swift (s) | Rust (s) | run_price_usd | Ratio |
+|---|---|---|---|---|---|
+| 18.cold-1 | cold | **250.2** | 212.4 | $0.001673 | **1.18×** |
+| 18.cold-2 | cold | **250.0** | 211.2 | $0.001667 | **1.18×** |
+
+Two cold runs within 0.2 s of each other.
+
+### Per-stage diff (R1 cold-2 → PSC cold-1)
+
+| Metric | R1 cold-2 | PSC cold-1 | Δ |
+|---|---|---|---|
+| **Wall-clock** | 360.4 s | **250.2 s** | **-110.2 s (-30.6%)** |
+| downloadFile sum | 1136.6 s | **796.6 s** | **-340 s (-30%)** |
+| downloadFile p50 | 376 ms | **263 ms** | -113 ms |
+| **downloadInFrame sum** | 245.2 s | **32.0 s** | **-213 s (-87%)** |
+| **downloadInFrame p50** | 76 ms | **4 ms** | **-72 ms (-95%!)** |
+| zipperQueueWait | 348.8 s | 233.2 s | -116 s |
+| zipperAppend | 11.9 s | 14.3 s | +2 s |
+| uploadPart | 342.1 s | 324.4 s | -18 s |
+| uploaderQueueWait | 360.9 s | 248.3 s | -113 s |
+| downloadInFlight mean | 1.96 | 1.96 | unchanged |
+| peakRSS | 388.4 MB | 392.3 MB | flat |
+| Max Memory Used (CW) | 417 MB | 420 MB | flat |
+
+### Why pure-Swift CRC is *faster* than ARMv8 hardware CRC32
+
+1. **The CRC pass was on the downloader's critical path.** With C the
+   pass took 76 ms p50 per 5 MB file. That's 76 ms per file blocking
+   the downloader from issuing the next frame — happening N times in
+   parallel across the in-flight task group. Removing 72 ms × ~3000
+   files / 1.96 mean concurrency ≈ 110 s of serialized work, which
+   matches the observed wall-clock drop almost exactly.
+
+2. **Slicing-by-8 in Swift > C with `__crc32d` here.** The C path
+   processed 8 bytes per `__crc32d` call but with a true serial
+   dependency chain (each call depends on prev's CRC). The pure-Swift
+   slicing-by-8 also processes 8 bytes per iteration but exposes 8
+   parallel table loads per byte position; on a 0.29 vCPU Lambda the
+   memory-level parallelism wins over the intrinsic's tight latency
+   chain. Net: ~140 MB/s (C) → ~1250 MB/s (pure Swift) for a 5 MB
+   contiguous Data.
+
+3. **Possibly avoided segment-fragmentation cost.** The C entry point
+   was called via `withContiguousStorageIfAvailable` on a
+   `ByteBufferView`; if the buffer's readable bytes happened to be
+   non-contiguous the fast path silently fell back to slow paths.
+   The pure-Swift implementation gets a single slice over a
+   pre-sized ByteBuffer, guaranteed contiguous.
+
+### Correctness
+
+Standalone Swift app at `/tmp/crc-check/main.swift` (not committed)
+verified the pure-Swift CRC32 against 9 reference vectors:
+- empty, "a", "123456789" (RFC 3720 0xCBF43926), "fox" sentence,
+  32×0x00, 32×0xFF, 7-byte fragment, 4-chunk split,
+  1 MiB xorshift cross-check vs slicing-by-1 reference.
+
+All passed. Production runs also passed the control Lambda's
+content-validation (SHA-256 of decompressed entries matches the entry
+name) — though note: the Rust `zip` crate does NOT verify CRC for
+STORED entries with data descriptors, so the run-success signal alone
+isn't a CRC check. The reference vectors are the authoritative test.
+
+### Total Swift performance trajectory
+
+| | Wall | Ratio | run_price_usd | Δ vs baseline |
+|---|---|---|---|---|
+| Run 10 baseline | 374.7 s | 1.77× | $0.002498 | — |
+| C1 (ByteBuffer upload) | 371.6 s | 1.76× | $0.002477 | -3 s |
+| C2 (collect default) | 368.7 s | 1.74× | $0.002458 | -6 s |
+| C2.5 (pre-sized + collect) | 363.9 s | 1.72× | $0.002426 | -11 s |
+| R1 (bufferChunks=2) | 360.4 s | 1.72× | $0.002403 | -14 s |
+| **PSC (pure-Swift CRC)** | **250.0 s** | **1.18×** | **$0.001667** | **-125 s (-33%)** |
+
+The big win was the very last change. Removing the C dependency,
+which we expected to be a small regression, instead unblocked the
+downloader's per-task pipeline and dropped 30% off the wall-clock.
+
+### Bench-validation gap surfaced
+
+The Rust `zip` crate's reader (used by the control Lambda) does NOT
+verify CRC32 for STORED entries with GP flag bit 3 set (data
+descriptor). Verified by reading `zip2/src/crc32.rs` and `read.rs`:
+the data descriptor's CRC is never parsed/checked, only the value
+from the local file header (which we set to 0 for streamed STORED).
+Implication: a contender could ship a wrong CRC and the Step Function
+would still report success. Not a problem for our run since the
+reference vectors prove correctness, but worth flagging upstream.
+
 ## Run-by-run history
 
 ### Rust reference (`rust-jeremie-rodon`)
