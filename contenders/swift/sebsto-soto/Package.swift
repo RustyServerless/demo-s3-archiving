@@ -23,16 +23,11 @@ let package = Package(
                 .product(name: "AsyncHTTPClient", package: "async-http-client"),
                 .product(name: "NIOCore", package: "swift-nio"),
                 .product(name: "Logging", package: "swift-log"),
-                "CCRC32",
             ],
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency"),
                 .unsafeFlags(["-O"], .when(configuration: .release)),
             ]
-        ),
-        .target(
-            name: "CCRC32",
-            publicHeadersPath: "include"
         ),
     ]
 )

@@ -5,7 +5,6 @@ import NIOConcurrencyHelpers
 import Darwin.C
 #elseif canImport(Glibc)
 import Glibc
-import CCRC32  // ccrc32_mallinfo_uordblks shim — Linux-only, hence the conditional import
 #elseif canImport(Musl)
 import Musl
 #endif
@@ -187,17 +186,9 @@ final class Stats: @unchecked Sendable {
             logger.info("stats[peakRSS]: \(String(format: "%.1f", peakMB))MB")
         }
 
-        #if os(Linux)
-        // mallinfo2 is the modern variant (>=glibc 2.33). AL2023 ships glibc 2.34.
-        // Accessed via the C wrapper; if unavailable at link time the wrapper
-        // returns zeros. See CCRC32/ccrc32.c — same target also exposes a
-        // mallinfo2 shim to keep us from adding a second C target.
-        let heapBytes = ccrc32_mallinfo_uordblks()
-        if heapBytes > 0 {
-            let heapMB = Double(heapBytes) / (1024.0 * 1024.0)
-            logger.info("stats[heapInUse]: \(String(format: "%.1f", heapMB))MB")
-        }
-        #endif
+        // heapInUse stat dropped along with the CCRC32 C shim that backed
+        // it. peakRSS via getrusage above is the more important number;
+        // mallinfo2 was a nice-to-have that required a C target.
     }
 }
 
