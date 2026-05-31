@@ -16,13 +16,15 @@ import Foundation
 //   - Run-7: raised AsyncHTTPClient pool ceiling 8 → 32 (in main.swift).
 //   - Run-6: tried `maxDownloadsMemory` 20 → 40 MiB; OOM'd at 511 MB.
 //   - C1+C2.5: ByteBuffer end-to-end on upload + pre-sized download
-//     buffer; reclaimed enough headroom (Max Memory Used now 417 MB,
-//     down from 437–460) to safely raise the byte budget.
-//   - C3 (this commit): raise `maxDownloadsMemory` 20 → 32 MiB.
-//     Predicted in-flight downloads: 32 ÷ ~5 MB ≈ 6 (was ≈ 4).
-//     Worst-case extra body storage: +12 MiB. Headroom: 95 MB.
+//     buffer; reclaimed RSS to ~417 MB.
+//   - **C3 reverted**: bumping budget to 32 MiB doubled mean in-flight
+//     (1.96 → 4.16) but only saved 2.2 s wall-clock — and Max Memory
+//     Used jumped 417 → 490 MB. Cold-2 OOM-killed. The S3 bandwidth was
+//     already saturated; more concurrency just spreads it thinner
+//     (per-task p50 doubled 376 ms → 626 ms). Net: tiny speed win, big
+//     OOM risk. Reverted to 20 MiB.
 enum Tunables {
-    static let maxDownloadsMemory: Int = 32 * 1024 * 1024   // 32 MiB
+    static let maxDownloadsMemory: Int = 20 * 1024 * 1024   // 20 MiB
     static let maxConcurrentUploads: Int = 3
     static let chunkSize: Int = 10 * 1024 * 1024            // 10 MiB
     static let bufferChunksCount: Int = 4                   // ChunkProducer in-flight ceiling

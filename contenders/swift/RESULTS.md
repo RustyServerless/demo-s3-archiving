@@ -353,6 +353,57 @@ Total Phase C wins so far vs Run 10 baseline (374.7 s):
 C3 is next. With ~95 MB headroom we can try `maxDownloadsMemory` 20 →
 32 MiB without expecting OOM.
 
+## Run 15 — Phase C3: byte budget 20 → 32 MiB (REVERTED)
+
+Stack: same. Build: `13c3b33`. STATS=1.
+
+| Run | Type | Swift (s) | Rust (s) | Status |
+|---|---|---|---|---|
+| 15.cold-1 | cold | 361.5 | 212.7 | OK |
+| 15.cold-2 | cold | **OOM** | 213.3 | crash: Runtime.OutOfMemory |
+
+### Per-stage diff (C2.5 cold-1 → C3 cold-1)
+
+| Metric | C2.5 cold-1 | C3 cold-1 | Δ |
+|---|---|---|---|
+| Wall-clock | 363.7 s | 361.5 s | -2.2 s |
+| **downloadInFlight mean** | 1.96 | **4.16** | **+2.2 (+112%)** |
+| downloadInFlight max | 5 | 8 | +3 |
+| downloadFile sum | 1136.6 s | 1893.3 s | **+757 s** |
+| downloadFile p50 | 376 ms | 626 ms | **+250 ms** |
+| uploadPart sum | 342.1 s | 412.1 s | +70 s |
+| **peakRSS** | 388.4 MB | **467.4 MB** | **+79 MB** |
+| **Max Memory Used (CW)** | 417 MB | **490 MB** | **+73 MB → 22 MB headroom** |
+
+### Findings — C3 reverted
+
+**The S3 bandwidth was already saturated at the per-task level.**
+Doubling the byte budget doubled mean concurrency but per-task download
+time also doubled (376 → 626 ms p50). Net wall-clock saving = 2.2 s,
+upload-side cost = +70 s of summed work, RSS cost = +73 MB.
+
+Cold-2 OOM-killed at 512 MB. C3 is unsafe even with C1+C2.5's headroom
+gains. **Reverting `maxDownloadsMemory` to 20 MiB.**
+
+### What this teaches
+
+- The byte-budget hypothesis from Phase B was *partly* wrong. We
+  thought "downloads are budget-bound, raise budget = faster". They
+  are budget-bound for in-flight count, but the underlying network
+  pipe is already filled by ~2 concurrent downloads. Adding more just
+  makes each slower.
+- This means the remaining 1.7× gap to Rust is likely **not** about
+  in-flight concurrency. It's about per-task throughput inside
+  AsyncHTTPClient/Soto, or wall-clock-blocking that we haven't
+  identified yet.
+- The headroom we gained from C1+C2.5 (95 MB) is real but cannot be
+  cashed in via byte budget alone.
+
+### Best result locked
+
+**C2.5: Swift 363.7 s, 1.71× Rust, $0.002425.** Down from baseline
+374.7 s (-3%). Modest but real.
+
 ## Run-by-run history
 
 ### Rust reference (`rust-jeremie-rodon`)
