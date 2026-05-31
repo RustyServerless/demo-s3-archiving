@@ -404,6 +404,63 @@ gains. **Reverting `maxDownloadsMemory` to 20 MiB.**
 **C2.5: Swift 363.7 s, 1.71× Rust, $0.002425.** Down from baseline
 374.7 s (-3%). Modest but real.
 
+## Run 16 — Phase R1: bufferChunksCount 4 → 2 (match Rust)
+
+Stack: same. Build: `0dd1b11`. STATS=1.
+
+After analyzing Rust reference end-to-end, found one tunable mismatch:
+Rust BUFFER_CHUNKS_COUNT=2 vs our 4. Otherwise the algorithms are
+identical (download streams into pre-allocated Vec/ByteBuffer, byte-
+budget semaphore, 3 concurrent uploads, etc.).
+
+| Run | Type | Swift (s) | Rust (s) | run_price_usd | Ratio |
+|---|---|---|---|---|---|
+| 16.cold-1 | cold | 371.1 | 213.5 | $0.002474 | 1.74× |
+| 16.cold-2 | cold | **360.4** | 209.3 | $0.002403 | **1.72×** |
+
+Wide cold-to-cold variance (10.7 s). Cold-2 is the new best wall-clock.
+
+### Per-stage diff (C2.5 cold-1 → R1 cold-1)
+
+| Metric | C2.5 cold-1 | R1 cold-1 | Δ |
+|---|---|---|---|
+| Wall-clock | 363.7 s | 371.1 s | +7.4 s (cold-1 unlucky) |
+| **peakRSS** | **388.4 MB** | **396.6 MB** | **+8 MB** ← no expected savings |
+| Max Memory Used (CW) | 417 MB | 427 MB | +10 MB |
+| downloadInFlight mean | 1.96 | 2.66 | +0.7 |
+
+### Findings
+
+- **R1's predicted -20 MB peakRSS did not materialize.** Reducing the
+  in-flight chunk cap from 4 to 2 had no measurable effect on Max
+  Memory. Implication: we were never actually holding 4 outstanding
+  chunks — the upload pool of 3 keeps chunks moving fast enough that
+  2 outstanding is the steady state regardless of the cap. R1 is
+  effectively a no-op for memory.
+- Wall-clock variance between R1 cold-1 (371) and cold-2 (360) is
+  10.7 s — ~3% of runtime. We've been treating ±3 s as significant;
+  in fact one-shot variance is 10× that. **Most of our small
+  per-iteration deltas have been noise.**
+- The "best" result is R1 cold-2 at **360.4 s, 1.72× Rust** —
+  effectively unchanged from C2.5 (363.7 s ± noise).
+
+### Decision — skip R2
+
+R2 was contingent on R1 freeing real headroom for a smaller, safer C3
+budget bump. Since R1 didn't free anything and the C3 attempt at 32 MiB
+already showed the bandwidth is saturated (per-task time scaled
+proportional to in-flight count), R2 (24 MiB) would deliver maybe 1 s
+for OOM risk. **Not worth it.**
+
+### Best result locked
+
+**Swift: 360.4 s, 1.72× Rust, $0.002403** (R1 cold-2).
+
+Down from the 374.7 s baseline by ~3.8% — but inside the ±10 s
+single-run variance band. The honest summary: the changes that
+improved peakRSS (C1, C2.5) are real wins; R1 is cosmetic; everything
+else is noise.
+
 ## Run-by-run history
 
 ### Rust reference (`rust-jeremie-rodon`)
