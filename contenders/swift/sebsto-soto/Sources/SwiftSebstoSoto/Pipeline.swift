@@ -23,13 +23,31 @@ import Foundation
 //     already saturated; more concurrency just spreads it thinner
 //     (per-task p50 doubled 376 ms → 626 ms). Net: tiny speed win, big
 //     OOM risk. Reverted to 20 MiB.
+// Lambda configures vCPU proportionally to memory: at 1769 MB you get
+// 1 full vCPU, so at 512 MB you get ~0.29 vCPU and at 1024 MB ~0.58.
+// More memory also means more headroom for in-flight downloads. We
+// scale `maxDownloadsMemory` accordingly, reading the actual memory
+// allocation from the standard Lambda runtime env var
+// `AWS_LAMBDA_FUNCTION_MEMORY_SIZE` (set by the Lambda service —
+// documented at
+// https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html).
+//
+// Heuristic: keep ~4% of the configured memory available for downloads.
+// At 512 MB → 20 MiB. At 1024 MB → 40 MiB. At 1769 MB → ~70 MiB.
+// Falls back to 20 MiB on local builds where the env var is absent.
+let lambdaMemoryMB: Int = {
+    guard let s = ProcessInfo.processInfo.environment["AWS_LAMBDA_FUNCTION_MEMORY_SIZE"],
+          let n = Int(s) else { return 512 }
+    return n
+}()
+
 enum Tunables {
-    static let maxDownloadsMemory: Int = 20 * 1024 * 1024   // 20 MiB
+    // ~4% of configured Lambda memory, clamped to a 20 MiB floor.
+    static let maxDownloadsMemory: Int = max(20, lambdaMemoryMB * 4 / 100) * 1024 * 1024
     static let maxConcurrentUploads: Int = 3
     static let chunkSize: Int = 10 * 1024 * 1024            // 10 MiB
     // R1: matches Rust reference (BUFFER_CHUNKS_COUNT=2). Caps producer→
-    // uploader path at 2 × 10 MiB = 20 MiB instead of 4 × 10 MiB = 40 MiB.
-    // Predicted: -20 MB peakRSS, no wall-clock change.
+    // uploader path at 2 × 10 MiB = 20 MiB.
     static let bufferChunksCount: Int = 2                   // ChunkProducer in-flight ceiling
 }
 

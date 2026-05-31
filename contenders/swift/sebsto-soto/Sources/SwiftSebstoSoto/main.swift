@@ -35,6 +35,7 @@ let s3 = S3(client: awsClient, region: region)
 
 let runtime = LambdaRuntime { (event: JobInfo, context: LambdaContext) async throws -> String in
     context.logger.info("event: bucket=\(event.bucket_name) prefix=\(event.files_prefix) archive=\(event.archive_key)")
+    context.logger.info("tunables: lambdaMemory=\(lambdaMemoryMB)MB maxDownloadsMemory=\(Tunables.maxDownloadsMemory / 1024 / 1024)MiB")
     try await runArchiveJob(s3: s3, job: event, logger: context.logger)
     return "ok"
 }
