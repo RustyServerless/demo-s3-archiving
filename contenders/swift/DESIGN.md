@@ -24,24 +24,52 @@ this directory.
 
 ### 1. Use Soto, not the official AWS SDK for Swift
 
-Soto is a community AWS SDK built on top of [SwiftNIO](https://github.com/apple/swift-nio)
-and [AsyncHTTPClient](https://github.com/swift-server/async-http-client).
-The official AWS SDK for Swift (`aws-sdk-swift`) is built on top of the
-[AWS Common Runtime](https://github.com/awslabs/aws-crt-swift) (`aws-crt-swift`) — a set
-of C libraries shared with the other AWS SDKs (Java, Python, …).
+Two SDKs exist for calling AWS services from Swift:
 
-We measured both, on the same architecture, in the same Lambda
-configuration. **The aws-sdk-swift port times out at 600 s on the same
-workload that Soto completes in 250 s.** The bottleneck is the HTTP
-transport: aws-crt-swift's `Smithy.ByteStream` API delivers download
-chunks as fresh `Data` allocations and forces uploads through `Data`,
-and `FlexibleChecksumsRequestMiddleware` collects any provided stream
-into a single `Data` for SigV4 signing — no zero-copy path is
-available. On a 0.29 vCPU Lambda, that overhead compounds enough to
-push the run over 600 s.
+- **The official [AWS SDK for Swift](https://github.com/awslabs/aws-sdk-swift)** —
+  built on top of the [AWS Common Runtime (`aws-crt-swift`)](https://github.com/awslabs/aws-crt-swift),
+  a set of C libraries shared across the official SDKs for several
+  languages (Java, Python, JavaScript, …). Generated from the same
+  Smithy service models as those other SDKs.
+- **[Soto](https://github.com/soto-project/soto)** — a community SDK
+  built on top of [SwiftNIO](https://github.com/apple/swift-nio) and
+  [AsyncHTTPClient](https://github.com/swift-server/async-http-client),
+  Apple's official server-side Swift HTTP stack. Pure Swift end-to-end.
+
+We started this contender on the official AWS SDK for Swift. With the
+same architecture and the same optimisations applied to both, our
+measurements were:
+
+| SDK | Cold-1 wall-clock | Cold-2 wall-clock | `uploadPart` p50 |
+|---|---|---|---|
+| **Soto** | **250 s** | **250 s** | **200 ms** |
+| AWS SDK for Swift | 544 s | timeout @ 600 s | 680 ms |
+
+Identical Swift application code: same three-stage pipeline, same byte
+budget, same chunk size, same pure-Swift CRC32, same backpressure
+model. Only the SDK calls differ. Despite that, the AWS SDK port runs
+**at the edge of the 600 s Lambda timeout** — succeeding once, timing
+out the next time. That's not a viable production stance.
+
+Why the gap? Two reasons, both at the HTTP transport:
+
+- **`S3.uploadPart` is 3.4× slower per call** on aws-crt-swift than on
+  AsyncHTTPClient (680 ms vs 200 ms p50 for a 10 MiB part). With ~1500
+  parts in the run, that single difference accounts for ~700 s of
+  extra work.
+- **The API surface forces extra copies.** aws-sdk-swift exposes the
+  S3 response body as a `Smithy.ByteStream` whose only progressive read
+  primitive is `readAsync(upToCount:)` returning a fresh `Data`. The
+  upload body is `ByteStream.data(Data?)` or `.stream(Stream)` — no
+  ByteBuffer init. Any custom Stream gets collected back into a single
+  `Data` by `FlexibleChecksumsRequestMiddleware` before SigV4 signing,
+  so there is no zero-copy path even with manual bridging. Combined
+  with `Data`'s allocation behaviour (see decision #2), this multiplies
+  CRT-internal memcpys.
 
 Soto, by contrast, hands us NIO `ByteBuffer` end-to-end and accepts
-`ByteBuffer` zero-copy on `S3.uploadPart`. That is decision #2.
+`ByteBuffer` zero-copy on `S3.uploadPart` via `AWSHTTPBody(buffer:)`.
+That is decision #2.
 
 ### 2. Use NIO `ByteBuffer` instead of Foundation `Data`
 
