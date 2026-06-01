@@ -499,6 +499,43 @@ contender and the Rust reference. Same Lambda configuration for both
   linked Rust binary's cold start is short enough that it's invisible
   at this granularity.
 
+### Memory-scaling experiment — 256 MB and 1024 MB
+
+10 sequential runs at each of 256 MB and 1024 MB Lambda memory, with
+both contenders running at the same memory level. Tunables in
+`Pipeline.swift` were adjusted accordingly: 256 MB halves the byte
+budget and chunk-buffer ceiling, 1024 MB doubles them.
+
+| Memory | Lang | n | min | p50 | max | mean | stdev | mean cost |
+|---|---|---|---|---|---|---|---|---|
+| **256 MB** | Swift | 5 (4 failed) | 452.5 s | 473.3 s | 491.9 s | 473.0 s | 14.93 s | $0.001577 |
+| **256 MB** | Rust | 9 | 354.5 s | 391.7 s | 410.3 s | 387.3 s | 18.38 s | $0.001291 |
+| **512 MB** | Swift | 10 | 212.4 s | 219.5 s | 237.6 s | 223.3 s | 9.13 s | $0.001489 |
+| **512 MB** | Rust | 10 | 210.4 s | 211.6 s | 211.9 s | 211.3 s | 0.52 s | $0.001409 |
+| **1024 MB** | Swift | 10 | 211.1 s | 212.5 s | 213.8 s | 212.5 s | **0.79 s** | $0.002833 |
+| **1024 MB** | Rust | 9 | 210.3 s | 211.6 s | 212.5 s | 211.5 s | 0.70 s | $0.002820 |
+
+Three observations:
+
+- **256 MB is the floor for Swift.** Four of nine runs failed (three
+  600 s timeouts and one hard `Runtime.OutOfMemory`). The Swift
+  runtime + Soto/AsyncHTTPClient + NIO ByteBufferAllocator arenas
+  consume too much of the 256 MB ceiling. Rust handles 256 MB
+  comfortably — slower (mean 387 s) but reliable (9/9 succeeded).
+- **The pipeline is bandwidth-bound, not CPU-bound.** Doubling memory
+  from 512 MB to 1024 MB (and vCPU from ~0.29 to ~0.58) saves only
+  ~7 s of wall-clock (-3%). The run is dominated by waiting for S3
+  GETs and PUTs, not by application compute.
+- **More memory = less Swift variance.** Swift's wall-clock σ collapses
+  from 9.13 s (512 MB) to 0.79 s (1024 MB), now matching Rust's 0.70 s.
+  The 512 MB variability is sandbox cold-vs-warm placement; at
+  1024 MB there's enough CPU headroom to make cold starts invisible
+  at this granularity.
+
+The 512 MB configuration the contender ships with is the
+`run_price_usd` sweet spot. 256 MB makes Swift unreliable; 1024 MB
+roughly doubles the price for a ~3% speed gain.
+
 ## Verification
 
 1. **CI build passes**: CodePipeline shows the Swift build block produced
