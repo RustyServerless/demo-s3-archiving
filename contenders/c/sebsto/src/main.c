@@ -297,11 +297,11 @@ static int list_objects(const char *files_prefix, obj_list_t *out) {
 
         struct aws_s3_meta_request_options mopt = {0};
         mopt.type = AWS_S3_META_REQUEST_TYPE_DEFAULT;
+        mopt.operation_name = aws_byte_cursor_from_c_str("ListObjectsV2");
         mopt.message = req;
         mopt.user_data = &lc;
         mopt.body_callback = list_recv_body;
         mopt.finish_callback = list_finish;
-        /* GET-style; CRT will sign as a normal HTTP request. */
 
         struct aws_s3_meta_request *mr = aws_s3_client_make_meta_request(g_s3, &mopt);
         if (!mr) {
