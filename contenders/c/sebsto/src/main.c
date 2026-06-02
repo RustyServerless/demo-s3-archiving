@@ -4,13 +4,12 @@
  *
  *   download (CRT meta-requests, parallel)
  *      → zipper thread (STORE-only, CRC32 via zlib)
- *      → upload (CRT multipart PUT reading from a ring buffer via aws_input_stream)
+ *      → upload (CRT multipart PUT consuming bytes via aws_s3_meta_request_write)
  *
  * No tracing / OTel — Lambda CloudWatch logs are sufficient for the benchmark.
  */
 
 #include "json.h"
-#include "ring.h"
 #include "runtime.h"
 #include "util.h"
 #include "zip.h"
@@ -24,9 +23,9 @@
 #include <aws/http/request_response.h>
 #include <aws/io/channel_bootstrap.h>
 #include <aws/io/event_loop.h>
+#include <aws/io/future.h>
 #include <aws/io/host_resolver.h>
 #include <aws/io/logging.h>
-#include <aws/io/stream.h>
 #include <aws/io/tls_channel_handler.h>
 #include <aws/io/uri.h>
 #include <aws/s3/s3.h>
@@ -48,9 +47,6 @@
 
 /* Memory cap on pending downloaded data waiting for the zipper. */
 #define MAX_DOWNLOAD_INFLIGHT_BYTES (32u * 1024 * 1024)
-
-/* Ring buffer size between zipper and uploader — sized to hold a few CRT parts. */
-#define RING_CAPACITY               (32u * 1024 * 1024)
 
 /* CRT throughput hint (Gb/s). Higher = more connections. */
 #define CRT_THROUGHPUT_GBPS 25.0
@@ -466,68 +462,50 @@ static struct aws_s3_meta_request *start_download(download_t *d, const char *key
     return mr;
 }
 
-/* ---------- Upload stage: PUT meta-request reading from a ring ----------
+/* ---------- Pipeline: download -> zipper -> upload ----------
  *
- * CRT calls aws_input_stream_read repeatedly; we block on ring_read until
- * either bytes arrive or the producer closes the ring.
+ * Upload uses aws_s3_meta_request_write (send_using_async_writes=true). The
+ * zipper thread emits ZIP bytes synchronously; each emission becomes one
+ * write() call that we wait on via aws_future_void_wait. CRT's internal
+ * buffering replaces the ring buffer.
  */
 
 typedef struct {
-    struct aws_input_stream base;
-    struct aws_allocator   *alloc;
-    ring_t                 *ring;
-    int64_t                 length;     /* total length, known up-front */
-    int64_t                 position;
-} ring_input_stream_t;
-
-static int ris_seek(struct aws_input_stream *s, int64_t off, enum aws_stream_seek_basis basis) {
-    /* CRT shouldn't seek a streaming source; reject. */
-    (void)s; (void)off; (void)basis;
-    return aws_raise_error(AWS_ERROR_UNIMPLEMENTED);
-}
-
-static int ris_read(struct aws_input_stream *s, struct aws_byte_buf *dest) {
-    ring_input_stream_t *r = (ring_input_stream_t *)s;
-    size_t avail = dest->capacity - dest->len;
-    if (!avail) return AWS_OP_SUCCESS;
-    size_t got = ring_read(r->ring, dest->buffer + dest->len, avail);
-    dest->len += got;
-    r->position += (int64_t)got;
-    return AWS_OP_SUCCESS;
-}
-
-static int ris_status(struct aws_input_stream *s, struct aws_stream_status *st) {
-    ring_input_stream_t *r = (ring_input_stream_t *)s;
-    st->is_end_of_stream = (r->position >= r->length);
-    st->is_valid = true;
-    return AWS_OP_SUCCESS;
-}
-
-static int ris_get_length(struct aws_input_stream *s, int64_t *out) {
-    ring_input_stream_t *r = (ring_input_stream_t *)s;
-    *out = r->length;
-    return AWS_OP_SUCCESS;
-}
-
-static struct aws_input_stream_vtable g_ris_vtable = {
-    .seek = ris_seek,
-    .read = ris_read,
-    .get_status = ris_status,
-    .get_length = ris_get_length,
-};
-
-/* ---------- Pipeline: download -> zipper -> upload ---------- */
-
-typedef struct {
-    obj_list_t  *objs;
-    ring_t      *ring;
-    int          ok;
+    obj_list_t                 *objs;
+    struct aws_s3_meta_request *upload_mr;   /* set before zipper runs */
+    int                         write_failed;
+    int                         ok;
 } zipper_args_t;
+
+/* Synchronous wrapper: feed `n` bytes (or eof) to the upload meta-request and
+ * block until CRT consumes them. Returns 0 on success. */
+static int upload_write_sync(void *user, const uint8_t *data, size_t n, int eof) {
+    zipper_args_t *a = (zipper_args_t *)user;
+    if (a->write_failed) return -1;
+
+    struct aws_byte_cursor c = { .ptr = (uint8_t *)data, .len = n };
+    struct aws_future_void *f = aws_s3_meta_request_write(a->upload_mr, c, eof != 0);
+    if (!f) {
+        LOG("aws_s3_meta_request_write returned null");
+        a->write_failed = 1;
+        return -1;
+    }
+    /* Wait indefinitely. UINT64_MAX in CRT idiom is "no timeout". */
+    aws_future_void_wait(f, UINT64_MAX);
+    int err = aws_future_void_get_error(f);
+    aws_future_void_release(f);
+    if (err) {
+        LOG("upload write failed: %s", aws_error_str(err));
+        a->write_failed = 1;
+        return -1;
+    }
+    return 0;
+}
 
 static void *zipper_thread(void *user) {
     zipper_args_t *a = (zipper_args_t *)user;
     zip_writer_t z;
-    zip_writer_init(&z, a->ring);
+    zip_writer_init(&z, upload_write_sync, a);
 
     /* Drive parallel downloads with at most MAX_CONCURRENT_DOWNLOADS in flight,
      * capped by MAX_DOWNLOAD_INFLIGHT_BYTES of pending data. As each download
@@ -600,7 +578,18 @@ static void *zipper_thread(void *user) {
         }
 
         /* Feed to zipper. */
-        zip_writer_add(&z, a->objs->items[idx].name, dls[idx].body.data, dls[idx].body.len);
+        if (zip_writer_add(&z, a->objs->items[idx].name,
+                           dls[idx].body.data, dls[idx].body.len) != 0) {
+            a->ok = 0;
+            inflight_bytes -= a->objs->items[idx].size;
+            inflight--;
+            completed++;
+            finished_order[idx] = 1;
+            buf_free(&dls[idx].body);
+            aws_s3_meta_request_release(mrs[idx]);
+            mrs[idx] = NULL;
+            goto end;
+        }
 
         inflight_bytes -= a->objs->items[idx].size;
         inflight--;
@@ -611,12 +600,14 @@ static void *zipper_thread(void *user) {
         mrs[idx] = NULL;
     }
 
-    zip_writer_finish(&z);
-    a->ok = 1;
+    if (zip_writer_finish(&z) == 0) a->ok = 1;
+    else a->ok = 0;
 
 end:
-    /* Make sure we close even on early-exit so the uploader unblocks. */
-    ring_close(a->ring);
+    /* Always send eof to the uploader so it unblocks even on early-exit. */
+    if (!a->write_failed) {
+        upload_write_sync(a, NULL, 0, 1);
+    }
 
     for (size_t i = 0; i < a->objs->n; i++) {
         if (mrs[i]) {
@@ -636,40 +627,7 @@ end:
     return NULL;
 }
 
-/* Pre-compute total ZIP size so we can give CRT a Content-Length. STORE-only,
- * so size is sum(local_header + name + payload) + sum(central + name + extra)
- * + EOCD (+ ZIP64 records if needed). */
-static uint64_t compute_zip_size(const obj_list_t *o) {
-    uint64_t total = 0;
-    uint64_t running = 0;
-    /* Local headers + payload. */
-    for (size_t i = 0; i < o->n; i++) {
-        size_t name_len = strlen(o->items[i].name);
-        total += 30 + name_len + o->items[i].size;
-        running += 30 + name_len + o->items[i].size;
-    }
-    /* Central directory entries (size depends on running local-header offset). */
-    uint64_t cd_size = 0;
-    uint64_t r2 = 0;
-    for (size_t i = 0; i < o->n; i++) {
-        size_t name_len = strlen(o->items[i].name);
-        int z64_size = (o->items[i].size >= 0xFFFFFFFFULL);
-        int z64_off  = (r2 >= 0xFFFFFFFFULL);
-        size_t extra = (z64_size || z64_off) ? (4 + (z64_size ? 16 : 0) + (z64_off ? 8 : 0)) : 0;
-        cd_size += 46 + name_len + extra;
-        r2 += 30 + name_len + o->items[i].size;
-    }
-    total += cd_size;
-    /* EOCD always; ZIP64 EOCD+locator if needed. */
-    int need64 = (o->n >= 0xFFFF) ||
-                 (running >= 0xFFFFFFFFULL) ||
-                 (cd_size >= 0xFFFFFFFFULL);
-    total += 22;
-    if (need64) total += 56 + 20;
-    return total;
-}
-
-/* Upload a streaming PUT of total `total_size` bytes from `ring`. */
+/* Upload meta-request finish state. */
 typedef struct {
     int done;
     int error_code;
@@ -689,8 +647,10 @@ static void up_finish(struct aws_s3_meta_request *mr,
     pthread_mutex_unlock(&c->m);
 }
 
-static int upload_zip(const char *archive_key, ring_t *ring, uint64_t total_size) {
-    /* path = "/<archive_key>" */
+/* Build the PUT meta-request configured for async writes. The caller drives
+ * the body via aws_s3_meta_request_write (see upload_write_sync). */
+static struct aws_s3_meta_request *start_upload(const char *archive_key,
+                                                upload_call_t *uc) {
     buf_t path; buf_init(&path);
     buf_append_u8(&path, '/');
     static const char *hex = "0123456789ABCDEF";
@@ -708,94 +668,77 @@ static int upload_zip(const char *archive_key, ring_t *ring, uint64_t total_size
     aws_http_message_set_request_method(req, aws_byte_cursor_from_c_str("PUT"));
     aws_http_message_set_request_path(req, aws_byte_cursor_from_c_str((const char *)path.data));
 
-    char clen[32]; snprintf(clen, sizeof(clen), "%" PRIu64, total_size);
-    struct aws_http_header headers[] = {
-        { aws_byte_cursor_from_c_str("Host"), aws_byte_cursor_from_string(g_endpoint_host) },
-        { aws_byte_cursor_from_c_str("Content-Type"), aws_byte_cursor_from_c_str("application/zip") },
-        { aws_byte_cursor_from_c_str("Content-Length"), aws_byte_cursor_from_c_str(clen) },
+    /* Host + Content-Type only — Content-Length is handled by CRT for async writes. */
+    struct aws_http_header h_host = {
+        .name = aws_byte_cursor_from_c_str("Host"),
+        .value = aws_byte_cursor_from_string(g_endpoint_host),
     };
-    for (size_t i = 0; i < sizeof(headers) / sizeof(headers[0]); i++) {
-        aws_http_message_add_header(req, headers[i]);
-    }
-
-    /* Build our streaming input stream. */
-    ring_input_stream_t ris = {0};
-    ris.base.vtable = &g_ris_vtable;
-    ris.base.impl = &ris;
-    ris.alloc = g_alloc;
-    ris.ring = ring;
-    ris.length = (int64_t)total_size;
-    aws_http_message_set_body_stream(req, &ris.base);
-
-    upload_call_t uc = {0};
-    pthread_mutex_init(&uc.m, NULL);
-    pthread_cond_init(&uc.cv, NULL);
+    struct aws_http_header h_type = {
+        .name = aws_byte_cursor_from_c_str("Content-Type"),
+        .value = aws_byte_cursor_from_c_str("application/zip"),
+    };
+    aws_http_message_add_header(req, h_host);
+    aws_http_message_add_header(req, h_type);
 
     struct aws_s3_meta_request_options mopt = {0};
     mopt.type = AWS_S3_META_REQUEST_TYPE_PUT_OBJECT;
+    mopt.send_using_async_writes = true;
     mopt.message = req;
-    mopt.user_data = &uc;
+    mopt.user_data = uc;
     mopt.finish_callback = up_finish;
 
     struct aws_s3_meta_request *mr = aws_s3_client_make_meta_request(g_s3, &mopt);
     if (!mr) {
-        LOG("upload_zip: make_meta_request failed: %s", aws_error_str(aws_last_error()));
-        aws_http_message_release(req);
-        buf_free(&path);
-        ring_close(ring);
-        pthread_mutex_destroy(&uc.m);
-        pthread_cond_destroy(&uc.cv);
-        return -1;
+        LOG("start_upload: make_meta_request failed: %s", aws_error_str(aws_last_error()));
     }
-
-    pthread_mutex_lock(&uc.m);
-    while (!uc.done) pthread_cond_wait(&uc.cv, &uc.m);
-    pthread_mutex_unlock(&uc.m);
-
-    aws_s3_meta_request_release(mr);
     aws_http_message_release(req);
     buf_free(&path);
-    pthread_mutex_destroy(&uc.m);
-    pthread_cond_destroy(&uc.cv);
-
-    if (uc.error_code) {
-        LOG("upload_zip failed: %s", aws_error_str(uc.error_code));
-        return -1;
-    }
-    return 0;
+    return mr;
 }
 
 /* ---------- Per-invocation handler ---------- */
 
 static int handle_invocation(const char *bucket_name, const char *files_prefix,
                              const char *archive_key) {
-    (void)bucket_name;  /* set via global g_bucket once at cold start */
+    (void)bucket_name;  /* g_bucket is set at cold start */
 
-    /* List the source files. */
     obj_list_t objs = {0};
     if (list_objects(files_prefix, &objs) != 0) return -1;
     LOG("Listed %zu objects under %s/", objs.n, files_prefix);
 
-    /* Compute total ZIP size for Content-Length. */
-    uint64_t total = compute_zip_size(&objs);
-    LOG("Computed ZIP size: %" PRIu64 " bytes", total);
+    upload_call_t uc = {0};
+    pthread_mutex_init(&uc.m, NULL);
+    pthread_cond_init(&uc.cv, NULL);
 
-    ring_t ring;
-    ring_init(&ring, RING_CAPACITY);
+    struct aws_s3_meta_request *mr = start_upload(archive_key, &uc);
+    if (!mr) {
+        obj_list_free(&objs);
+        pthread_mutex_destroy(&uc.m);
+        pthread_cond_destroy(&uc.cv);
+        return -1;
+    }
 
-    zipper_args_t zargs = { .objs = &objs, .ring = &ring, .ok = 0 };
+    zipper_args_t zargs = { .objs = &objs, .upload_mr = mr, .write_failed = 0, .ok = 0 };
+
     pthread_t z_tid;
     pthread_create(&z_tid, NULL, zipper_thread, &zargs);
-
-    /* Upload reads from the ring on this thread. */
-    int up_rc = upload_zip(archive_key, &ring, total);
-
     pthread_join(z_tid, NULL);
-    ring_free(&ring);
 
-    int rc = (zargs.ok && up_rc == 0) ? 0 : -1;
+    /* Wait for CRT to finalize the multipart upload. */
+    pthread_mutex_lock(&uc.m);
+    while (!uc.done) pthread_cond_wait(&uc.cv, &uc.m);
+    pthread_mutex_unlock(&uc.m);
+
+    aws_s3_meta_request_release(mr);
+
+    int rc = (zargs.ok && uc.error_code == 0) ? 0 : -1;
+    if (uc.error_code) {
+        LOG("upload finished with error: %s", aws_error_str(uc.error_code));
+    }
 
     obj_list_free(&objs);
+    pthread_mutex_destroy(&uc.m);
+    pthread_cond_destroy(&uc.cv);
     return rc;
 }
 
