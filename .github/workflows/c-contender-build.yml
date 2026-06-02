@@ -45,16 +45,16 @@ jobs:
         if: steps.crt-cache.outputs.cache-hit != 'true'
         run: |
           set -e
-          export AWS_C_COMMON_TAG=v0.11.7
-          export S2N_TLS_TAG=v1.5.13
-          export AWS_C_CAL_TAG=v0.8.5
-          export AWS_C_IO_TAG=v0.16.4
-          export AWS_CHECKSUMS_TAG=v0.2.3
-          export AWS_C_COMPRESSION_TAG=v0.3.1
-          export AWS_C_HTTP_TAG=v0.9.2
-          export AWS_C_SDKUTILS_TAG=v0.2.3
-          export AWS_C_AUTH_TAG=v0.8.4
-          export AWS_C_S3_TAG=v0.7.7
+          export AWS_C_COMMON_TAG=v0.14.0
+          export S2N_TLS_TAG=v1.7.3
+          export AWS_C_CAL_TAG=v0.9.14
+          export AWS_C_IO_TAG=v0.26.3
+          export AWS_CHECKSUMS_TAG=v0.2.10
+          export AWS_C_COMPRESSION_TAG=v0.3.2
+          export AWS_C_HTTP_TAG=v0.11.0
+          export AWS_C_SDKUTILS_TAG=v0.2.4
+          export AWS_C_AUTH_TAG=v0.10.3
+          export AWS_C_S3_TAG=v0.12.4
 
           PREFIX="$PWD/.crt-cache/install"
           BUILD_DIR="$PWD/.crt-cache/build"
