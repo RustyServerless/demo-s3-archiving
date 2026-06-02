@@ -315,26 +315,52 @@ phases:
       # Convention (mirrors Rust/Go): contenders live at
       # `contenders/swift/<dev_id>/` as standalone SwiftPM packages whose
       # executable product is named `bootstrap`.
+      #
+      # Cache strategy: tar the .build directory (preserving internal
+      # timestamps) keyed on sha256(Package.swift). The install.finally
+      # and build.finally phases reset all file mtimes, which breaks
+      # SwiftPM's incremental compilation. Restoring from a tar right
+      # before `swift build` gives SwiftPM correct timestamps regardless
+      # of the touch commands.
       - |
         SWIFT_CONTENDER_LAMBDA_PATH=./contenders/swift
         if [ -d "$SWIFT_CONTENDER_LAMBDA_PATH" ]; then
-          # Iterate directories only; sibling files (e.g. DESIGN.md) must
-          # be skipped — they are not SwiftPM packages.
+          SWIFT_CACHE_DIR="$CODEBUILD_SRC_DIR/.swift-build-cache"
+          mkdir -p "$SWIFT_CACHE_DIR"
           for LAMBDA_DIR in "$SWIFT_CONTENDER_LAMBDA_PATH"/*/; do
             [ -d "$LAMBDA_DIR" ] || continue
             LAMBDA=$(basename "$LAMBDA_DIR")
             echo "Building Swift contender $LAMBDA"
             cd $SWIFT_CONTENDER_LAMBDA_PATH/$LAMBDA
+
+            # Cache restore: extract .build tar if Package.swift hash matches
+            CACHE_TAR="$SWIFT_CACHE_DIR/${LAMBDA}.tar"
+            CACHE_HASH_FILE="$SWIFT_CACHE_DIR/${LAMBDA}.package-hash"
+            CURRENT_HASH=$(sha256sum Package.swift | cut -d' ' -f1)
+            if [ -f "$CACHE_TAR" ] && [ -f "$CACHE_HASH_FILE" ]; then
+              PREVIOUS_HASH=$(cat "$CACHE_HASH_FILE")
+              if [ "$CURRENT_HASH" = "$PREVIOUS_HASH" ]; then
+                echo "Swift cache hit for $LAMBDA (Package.swift unchanged)"
+                tar xf "$CACHE_TAR"
+              else
+                echo "Swift cache miss for $LAMBDA (Package.swift changed)"
+              fi
+            else
+              echo "Swift cache miss for $LAMBDA (no previous cache)"
+            fi
+
             swift build -c release --static-swift-stdlib -Xswiftc -Osize
+
+            # Cache save: tar .build preserving timestamps
+            tar cf "$CACHE_TAR" .build
+            echo "$CURRENT_HASH" > "$CACHE_HASH_FILE"
+
             BIN=$(swift build -c release --static-swift-stdlib --show-bin-path)/bootstrap
             if [ ! -f "$BIN" ]; then
               echo "ERROR: Swift build did not produce $BIN" >&2
               exit 1
             fi
             strip "$BIN" || true
-            # `swift build --show-bin-path` returns an absolute path while
-            # we are still inside $SWIFT_CONTENDER_LAMBDA_PATH/$LAMBDA, so
-            # use $BIN directly — do not prepend the relative dir.
             cp "$BIN" /tmp/bootstrap-$LAMBDA
             cd $CODEBUILD_SRC_DIR
             find $SWIFT_CONTENDER_LAMBDA_PATH/$LAMBDA -mindepth 1 -delete
@@ -392,12 +418,5 @@ cache:
     - rust_target_md5sum/**/* # Where we store md5sum for code
     - previous_dependencies_tree # The last seen dependencies tree
     - previous_build_rust_version # The last seen Rust toolchain version
-
-
-    # NOTE: Disabled because as of now Swift do not take advantage of the cache and just bloats it.
-    # # Per-contender SwiftPM caches: package checkouts + compile artifacts.
-    # # Keyed under the contender directory so each Swift contender keeps
-    # # its own .build state. Saves ~10 min on warm rebuilds.
-    # - contenders/swift/*/.build/**/*
-    # # Swift toolchain tarball cache (~85 MB, saves ~30 s download).
-    # - .swift-cache/**/*
+    - .swift-build-cache/**/* # Per-contender .build tars keyed on Package.swift hash
+    - .swift-cache/**/* # Swift toolchain tarball cache (~85 MB, saves ~30 s download)
