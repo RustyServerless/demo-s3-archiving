@@ -19,7 +19,6 @@
 // header records are appended via `Buffer.copy` straight into the
 // active chunk Buffer.
 
-import { Readable } from "node:stream";
 import { crc32 } from "node:zlib";
 import { Agent as HttpsAgent } from "node:https";
 import {
@@ -37,14 +36,15 @@ import { NodeHttpHandler } from "@smithy/node-http-handler";
 // ---------- Tunables ----------
 
 // Total bytes of in-flight downloads. With files averaging ~5 MiB this
-// admits ~12 simultaneous downloads. The S3 socket pool is sized to
-// match (see `MAX_SOCKETS`) so no download queues behind socket
-// allocation.
-const MAX_DOWNLOADS_MEMORY = 60 * 1024 * 1024;
+// admits ~6 simultaneous downloads. JS runs on a single CPU on Lambda
+// arm64 / 512 MB, so over-subscribing the event loop with 10+ in-flight
+// downloads adds latency without throughput gains. Match Rust's
+// configuration (~4 concurrent) and rely on per-socket bandwidth.
+const MAX_DOWNLOADS_MEMORY = 30 * 1024 * 1024;
 // Cap on simultaneous UploadPart calls in flight. S3's per-prefix limit
 // is much higher; the cap is purely a memory ceiling for the upload
 // path (`MAX_CONCURRENT_UPLOADS × CHUNK_SIZE_BYTES` worth of buffers).
-const MAX_CONCURRENT_UPLOADS = 4;
+const MAX_CONCURRENT_UPLOADS = 3;
 // Multipart-upload part size. S3 allows 5 MiB–5 GiB per part. Smaller
 // parts → more requests; larger parts → more memory + a longer tail
 // for the final part to flush.
@@ -54,9 +54,10 @@ const CHUNK_SIZE_BYTES = 10 * 1024 * 1024;
 // `BUFFER_CHUNKS_COUNT × CHUNK_SIZE_BYTES`.
 const BUFFER_CHUNKS_COUNT = 2;
 // Per-host HTTPS connection pool. Sized for the combined download +
-// upload concurrency; smaller pools serialize requests behind socket
-// allocation and erase the pipeline's parallelism.
-const MAX_SOCKETS = 64;
+// upload concurrency plus a small safety margin. Wildly over-sized
+// pools are fine memory-wise but cause TLS handshake storms when
+// multiple Lambdas hit S3 simultaneously.
+const MAX_SOCKETS = 16;
 
 // ---------- Module-level S3 client (cold start once) ----------
 
@@ -76,14 +77,78 @@ const s3 = new S3Client({
     connectionTimeout: 5_000,
     socketTimeout: 120_000,
   }),
-  // SDK adaptive retries: S3 keep-alive sockets are routinely closed
-  // on the server side after ~20 s idle. Reusing a just-closed socket
-  // surfaces as `TimeoutError: socket hang up`. The SDK retries those
-  // transparently — disabling retries (`maxAttempts: 1`) crashes the
-  // Lambda on the first lost socket of a 10-minute run.
-  maxAttempts: 5,
-  retryMode: "adaptive",
+  // SDK retries: S3 keep-alive sockets are routinely closed on the
+  // server side after ~20 s idle, surfacing as `TimeoutError: socket
+  // hang up` if reused. The SDK retries those transparently. Standard
+  // mode (not adaptive) — adaptive backoff compounds badly when 10
+  // Lambdas hit the same prefix simultaneously.
+  maxAttempts: 3,
+  retryMode: "standard",
 });
+
+// ---------- Stats ----------
+
+// Minimal histogram recorder. Stage timings (downloadFile, getBody,
+// crc32, uploadPart, queue waits) accumulate per key; `report` emits
+// count/min/p50/p90/p99/max as a single JSON line so CloudWatch Logs
+// Insights can query them with `parse @message`.
+class Stats {
+  private samples: Map<string, number[]> = new Map();
+  private counts: Map<string, number> = new Map();
+  private startMs: number;
+  private filesProcessed = 0;
+  private partsUploaded = 0;
+  constructor() {
+    this.startMs = Date.now();
+  }
+  // High-resolution monotonic clock in ms; nothing else is timing-safe
+  // across actor hops.
+  now(): number {
+    return Number(process.hrtime.bigint() / 1_000_000n);
+  }
+  record(key: string, ms: number): void {
+    let arr = this.samples.get(key);
+    if (!arr) {
+      arr = [];
+      this.samples.set(key, arr);
+    }
+    arr.push(ms);
+    this.counts.set(key, (this.counts.get(key) ?? 0) + 1);
+  }
+  bumpFilesProcessed(): void {
+    this.filesProcessed += 1;
+    if (this.filesProcessed % 250 === 0) {
+      const elapsed = (Date.now() - this.startMs) / 1000;
+      console.log(
+        `progress: ${this.filesProcessed} files zipped, ${this.partsUploaded} parts uploaded, t=${elapsed.toFixed(1)}s`,
+      );
+    }
+  }
+  bumpPartsUploaded(): void {
+    this.partsUploaded += 1;
+  }
+  report(): void {
+    const summary: Record<string, unknown> = {
+      total_ms: Date.now() - this.startMs,
+      files_processed: this.filesProcessed,
+      parts_uploaded: this.partsUploaded,
+    };
+    for (const [k, arr] of this.samples) {
+      arr.sort((a, b) => a - b);
+      const n = arr.length;
+      summary[k] = {
+        n,
+        min: arr[0],
+        p50: arr[Math.floor(n * 0.5)],
+        p90: arr[Math.floor(n * 0.9)],
+        p99: arr[Math.floor(n * 0.99)],
+        max: arr[n - 1],
+        sum_ms: arr.reduce((s, v) => s + v, 0),
+      };
+    }
+    console.log("STATS " + JSON.stringify(summary));
+  }
+}
 
 // ---------- Types ----------
 
@@ -445,37 +510,44 @@ async function listFiles(bucket: string, filesPrefix: string): Promise<FileInfo[
   return out;
 }
 
-// Stream the GetObject body into a single pre-allocated Buffer of
-// exactly `expectedSize`. The Body chunks are appended via
-// `Buffer.copy`, avoiding the doubling-growth reallocations the
-// `node:stream` `consumers.buffer()` helper does internally. CRC32 is
-// computed once over the full buffer at EOF.
+// Collect the GetObject body via the SDK's native helper. This avoids
+// the per-frame `for await` JS callback overhead (each ~64 KiB chunk
+// would otherwise crossover into JS, fire a microtask, and run a
+// `Buffer.copy` — for 3000 × 5 MiB files that's ~240k callbacks).
+// `transformToByteArray()` keeps the loop in C++ and returns a single
+// `Uint8Array` view backed by an internally-allocated Buffer.
 async function downloadFile(
   bucket: string,
   key: string,
   expectedSize: number,
+  stats: Stats,
 ): Promise<{ body: Buffer; crc: number }> {
+  const t0 = stats.now();
   const response = await s3.send(
     new GetObjectCommand({ Bucket: bucket, Key: key }),
   );
-  const stream = response.Body as Readable;
-  const out = Buffer.allocUnsafe(expectedSize);
-  let cursor = 0;
-  for await (const chunk of stream) {
-    const c = chunk as Buffer;
-    c.copy(out, cursor);
-    cursor += c.length;
-  }
-  if (cursor !== expectedSize) {
+  stats.record("getRequest", stats.now() - t0);
+
+  const tBody = stats.now();
+  const arr = await response.Body!.transformToByteArray();
+  stats.record("getBody", stats.now() - tBody);
+
+  if (arr.byteLength !== expectedSize) {
     throw new Error(
-      `short read on ${key}: expected ${expectedSize}, got ${cursor}`,
+      `short read on ${key}: expected ${expectedSize}, got ${arr.byteLength}`,
     );
   }
-  // Native CRC32 from `node:zlib` (added in Node 22.2). Significantly
-  // faster than any pure-JS implementation; processes the buffer in
-  // one C++ call without crossing the JS/native boundary per byte.
-  const crc = crc32(out);
-  return { body: out, crc };
+  // Wrap the underlying ArrayBuffer in a `Buffer` view (zero-copy);
+  // downstream consumers (`Buffer.copy` into chunk producer) need the
+  // Buffer-flavoured prototype.
+  const body = Buffer.from(arr.buffer, arr.byteOffset, arr.byteLength);
+
+  // Native CRC32 from `node:zlib` (added in Node 22.2): one C++ call
+  // over the whole buffer, faster than any pure-JS implementation.
+  const tCrc = stats.now();
+  const crc = crc32(body);
+  stats.record("crc32", stats.now() - tCrc);
+  return { body, crc };
 }
 
 // ---------- Pipeline stages ----------
@@ -485,6 +557,7 @@ async function runDownloadStage(
   files: FileInfo[],
   byteBudget: ByteSemaphore,
   out: FileChannel,
+  stats: Stats,
 ): Promise<void> {
   // Spawn one promise per file. The byte-budget semaphore is acquired
   // before the GET so the for-loop itself applies file-count
@@ -493,9 +566,13 @@ async function runDownloadStage(
   const inflight: Promise<void>[] = [];
   try {
     for (const file of files) {
+      const tWait = stats.now();
       await byteBudget.acquire(file.size);
+      stats.record("downloaderBudgetWait", stats.now() - tWait);
       const p = (async () => {
-        const { body, crc } = await downloadFile(bucket, file.key, file.size);
+        const tFile = stats.now();
+        const { body, crc } = await downloadFile(bucket, file.key, file.size, stats);
+        stats.record("downloadFile", stats.now() - tFile);
         out.send({ name: file.name, body, crc32: crc, releaseBytes: file.size });
       })();
       inflight.push(p);
@@ -514,12 +591,15 @@ async function runZipStage(
   fileChannel: FileChannel,
   producer: ChunkProducer,
   byteBudget: ByteSemaphore,
+  stats: Stats,
 ): Promise<void> {
   const entries: ZipEntry[] = [];
   let offset = 0n;
 
+  let tWait = stats.now();
   while (true) {
     const file = await fileChannel.recv();
+    stats.record("zipperQueueWait", stats.now() - tWait);
     if (file === null) break;
 
     const nameBytes = Buffer.from(file.name, "utf8");
@@ -528,7 +608,9 @@ async function runZipStage(
     const dd = dataDescriptor(file.crc32, body.length);
     const lfhOffset = offset;
 
+    const tAppend = stats.now();
     await producer.appendCompound(lfh, body, dd);
+    stats.record("zipperAppend", stats.now() - tAppend);
     offset += BigInt(lfh.length + body.length + dd.length);
     byteBudget.release(file.releaseBytes);
 
@@ -538,6 +620,8 @@ async function runZipStage(
       size: body.length,
       localHeaderOffset: lfhOffset,
     });
+    stats.bumpFilesProcessed();
+    tWait = stats.now();
   }
 
   const cdOffset = offset;
@@ -566,6 +650,7 @@ async function runUploadStage(
   key: string,
   uploadId: string,
   producer: ChunkProducer,
+  stats: Stats,
 ): Promise<CompletedPart[]> {
   const completed: CompletedPart[] = [];
   // Manual concurrency window: at most MAX_CONCURRENT_UPLOADS UploadPart
@@ -573,8 +658,10 @@ async function runUploadStage(
   // Promise.race` when full, removing the settled one.
   const inflight = new Set<Promise<void>>();
 
+  let tWait = stats.now();
   while (true) {
     const chunk = await producer.recv();
+    stats.record("uploaderQueueWait", stats.now() - tWait);
     if (chunk === null) break;
 
     if (inflight.size >= MAX_CONCURRENT_UPLOADS) {
@@ -583,6 +670,7 @@ async function runUploadStage(
 
     const p = (async () => {
       const partNumber = chunk.partNumber;
+      const t0 = stats.now();
       try {
         const resp = await s3.send(
           new UploadPartCommand({
@@ -596,6 +684,8 @@ async function runUploadStage(
         );
         if (!resp.ETag) throw new Error(`UploadPart ${partNumber}: no ETag`);
         completed.push({ ETag: resp.ETag, PartNumber: partNumber });
+        stats.record("uploadPart", stats.now() - t0);
+        stats.bumpPartsUploaded();
       } finally {
         producer.releaseSlot();
       }
@@ -607,6 +697,7 @@ async function runUploadStage(
     // below.
     const cleanup = () => inflight.delete(p);
     p.then(cleanup, cleanup);
+    tWait = stats.now();
   }
 
   await Promise.all(inflight);
@@ -619,7 +710,11 @@ async function runUploadStage(
 // ---------- Job orchestration ----------
 
 async function runArchiveJob(job: JobInfo): Promise<void> {
+  const stats = new Stats();
+  const tList = stats.now();
   const files = await listFiles(job.bucket_name, job.files_prefix);
+  stats.record("listFiles", stats.now() - tList);
+  console.log(`listed ${files.length} files`);
 
   const create = await s3.send(
     new CreateMultipartUploadCommand({
@@ -636,9 +731,9 @@ async function runArchiveJob(job: JobInfo): Promise<void> {
   const producer = new ChunkProducer(CHUNK_SIZE_BYTES, BUFFER_CHUNKS_COUNT);
 
   try {
-    const dl = runDownloadStage(job.bucket_name, files, byteBudget, fileChannel);
-    const zp = runZipStage(files, fileChannel, producer, byteBudget);
-    const ul = runUploadStage(job.bucket_name, job.archive_key, uploadId, producer);
+    const dl = runDownloadStage(job.bucket_name, files, byteBudget, fileChannel, stats);
+    const zp = runZipStage(files, fileChannel, producer, byteBudget, stats);
+    const ul = runUploadStage(job.bucket_name, job.archive_key, uploadId, producer, stats);
 
     // `Promise.all` rejects on the first stage failure, but the other
     // two stages keep running and may reject later. With no handler
@@ -649,6 +744,7 @@ async function runArchiveJob(job: JobInfo): Promise<void> {
     const settled = await Promise.allSettled([dl, zp, ul]);
     const firstFailure = settled.find((r) => r.status === "rejected");
     if (firstFailure && firstFailure.status === "rejected") {
+      stats.report();
       throw firstFailure.reason;
     }
     const parts = (settled[2] as PromiseFulfilledResult<CompletedPart[]>).value;
@@ -661,6 +757,7 @@ async function runArchiveJob(job: JobInfo): Promise<void> {
         MultipartUpload: { Parts: parts },
       }),
     );
+    stats.report();
   } catch (err) {
     // Abort the multipart upload to release any uploaded parts so we
     // don't accrue storage fees on failed runs.
