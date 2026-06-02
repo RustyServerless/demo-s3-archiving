@@ -602,12 +602,18 @@ static void *zipper_thread(void *user) {
 
     if (zip_writer_finish(&z) == 0) a->ok = 1;
     else a->ok = 0;
+    /* zip_writer_finish() already issued the eof=true write. Skip the cleanup
+     * eof in the normal success path; the early-exit path falls through to
+     * the eof signal below. */
+    goto cleanup;
 
 end:
-    /* Always send eof to the uploader so it unblocks even on early-exit. */
+    /* Early-exit path: always signal eof so the uploader unblocks. */
     if (!a->write_failed) {
         upload_write_sync(a, NULL, 0, 1);
     }
+
+cleanup:
 
     for (size_t i = 0; i < a->objs->n; i++) {
         if (mrs[i]) {
