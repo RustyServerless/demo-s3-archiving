@@ -37,6 +37,11 @@ phases:
   install:
     runtime-versions:
       python: 3.13
+      # Node 22 — same major as the Lambda runtime (`nodejs22.x`) so
+      # `target=node22` esbuild output never sees a feature gap. The
+      # AL2023 aarch64 standard CodeBuild image ships this runtime
+      # version; no `dnf install` needed.
+      nodejs: 22
     commands:
       - echo Entered the install phase on `date`
       - |
@@ -369,6 +374,62 @@ phases:
           done
         fi
 
+      #####################
+      # TYPESCRIPT BUILD  #
+      #####################
+      # Bundles every TypeScript contender Lambda to a single
+      # `index.js` via esbuild. The bundle includes the AWS SDK so the
+      # Lambda runtime version of `@aws-sdk/client-s3` doesn't drift
+      # under us between deployments.
+      #
+      # Convention (mirrors Rust/Go/Swift): contenders live at
+      # `contenders/typescript/<dev_id>/` as standalone npm packages
+      # whose `build` script produces `index.js` at the package root.
+      # The package itself MUST set `Handler: index.handler` in CFN.
+      #
+      # Cache strategy: per-contender `node_modules` is restored from a
+      # tar keyed on sha256(package.json) — package-lock.json is not
+      # checked in (npm install resolves at build time). The
+      # install/build `finally` blocks reset all file mtimes, so we
+      # tar with `--mtime=2010-01-01` to keep the cached archive
+      # bit-stable across runs.
+      - |
+        TYPESCRIPT_CONTENDER_LAMBDA_PATH=./contenders/typescript
+        if [ -d "$TYPESCRIPT_CONTENDER_LAMBDA_PATH" ]; then
+          NODE_CACHE_DIR="$CODEBUILD_SRC_DIR/.node-build-cache"
+          mkdir -p "$NODE_CACHE_DIR"
+          for LAMBDA_DIR in "$TYPESCRIPT_CONTENDER_LAMBDA_PATH"/*/; do
+            [ -d "$LAMBDA_DIR" ] || continue
+            LAMBDA=$(basename "$LAMBDA_DIR")
+            echo "Building TypeScript contender $LAMBDA"
+            cd $TYPESCRIPT_CONTENDER_LAMBDA_PATH/$LAMBDA
+
+            CACHE_TAR="$NODE_CACHE_DIR/${LAMBDA}.tar"
+            CACHE_HASH_FILE="$NODE_CACHE_DIR/${LAMBDA}.package-hash"
+            CURRENT_HASH=$(sha256sum package.json | cut -d' ' -f1)
+            if [ -f "$CACHE_TAR" ] && [ -f "$CACHE_HASH_FILE" ] && \
+               [ "$(cat "$CACHE_HASH_FILE")" = "$CURRENT_HASH" ]; then
+              echo "Node cache hit for $LAMBDA (package.json unchanged)"
+              tar xf "$CACHE_TAR"
+            else
+              echo "Node cache miss for $LAMBDA"
+              npm install --no-audit --no-fund --silent
+              tar cf "$CACHE_TAR" node_modules
+              echo "$CURRENT_HASH" > "$CACHE_HASH_FILE"
+            fi
+
+            npm run build
+
+            cd $CODEBUILD_SRC_DIR
+            # Strip everything except the bundled index.js so the
+            # resulting Lambda artifact is minimal (~750 KB).
+            find $TYPESCRIPT_CONTENDER_LAMBDA_PATH/$LAMBDA -mindepth 1 \
+              -not -path "$TYPESCRIPT_CONTENDER_LAMBDA_PATH/$LAMBDA/index.js" \
+              -delete
+            ls -la $TYPESCRIPT_CONTENDER_LAMBDA_PATH/$LAMBDA/index.js
+          done
+        fi
+
       ################
       # PYTHON BUILD #
       ################
@@ -420,3 +481,4 @@ cache:
     - previous_build_rust_version # The last seen Rust toolchain version
     - .swift-build-cache/**/* # Per-contender .build tars keyed on Package.swift hash
     - .swift-cache/**/* # Swift toolchain tarball cache (~85 MB, saves ~30 s download)
+    - .node-build-cache/**/* # Per-contender node_modules tars keyed on package.json hash
