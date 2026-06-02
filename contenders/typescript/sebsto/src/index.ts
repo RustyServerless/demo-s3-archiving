@@ -19,6 +19,7 @@
 // header records are appended via `Buffer.copy` straight into the
 // active chunk Buffer.
 
+import { Readable } from "node:stream";
 import { crc32 } from "node:zlib";
 import { Agent as HttpsAgent } from "node:https";
 import {
@@ -36,15 +37,17 @@ import { NodeHttpHandler } from "@smithy/node-http-handler";
 // ---------- Tunables ----------
 
 // Total bytes of in-flight downloads. With files averaging ~5 MiB this
-// admits ~6 simultaneous downloads. JS runs on a single CPU on Lambda
-// arm64 / 512 MB, so over-subscribing the event loop with 10+ in-flight
-// downloads adds latency without throughput gains. Match Rust's
-// configuration (~4 concurrent) and rely on per-socket bandwidth.
-const MAX_DOWNLOADS_MEMORY = 30 * 1024 * 1024;
-// Cap on simultaneous UploadPart calls in flight. S3's per-prefix limit
-// is much higher; the cap is purely a memory ceiling for the upload
-// path (`MAX_CONCURRENT_UPLOADS × CHUNK_SIZE_BYTES` worth of buffers).
-const MAX_CONCURRENT_UPLOADS = 3;
+// admits ~14 simultaneous downloads. Per-connection S3 throughput from
+// Node is ~10 MiB/s (less than Rust's ~20 MiB/s due to higher JS/SDK
+// overhead per body byte), so the JS contender needs more parallel
+// sockets than the Rust contender to reach comparable aggregate
+// bandwidth. Peak resident set ≈ 70 MiB downloads + 4×10 MiB chunk
+// buffers + 6×10 MiB upload bodies + V8 heap; fits in 512 MiB.
+const MAX_DOWNLOADS_MEMORY = 70 * 1024 * 1024;
+// Cap on simultaneous UploadPart calls in flight. Higher concurrency
+// here helps mask per-connection upload throughput limits the same way
+// it helps downloads.
+const MAX_CONCURRENT_UPLOADS = 6;
 // Multipart-upload part size. S3 allows 5 MiB–5 GiB per part. Smaller
 // parts → more requests; larger parts → more memory + a longer tail
 // for the final part to flush.
@@ -52,12 +55,10 @@ const CHUNK_SIZE_BYTES = 10 * 1024 * 1024;
 // In-flight chunk slots in the producer→uploader path (excluding parts
 // currently being sent). Caps producer-side memory at
 // `BUFFER_CHUNKS_COUNT × CHUNK_SIZE_BYTES`.
-const BUFFER_CHUNKS_COUNT = 2;
+const BUFFER_CHUNKS_COUNT = 3;
 // Per-host HTTPS connection pool. Sized for the combined download +
-// upload concurrency plus a small safety margin. Wildly over-sized
-// pools are fine memory-wise but cause TLS handshake storms when
-// multiple Lambdas hit S3 simultaneously.
-const MAX_SOCKETS = 16;
+// upload concurrency plus a small safety margin.
+const MAX_SOCKETS = 32;
 
 // ---------- Module-level S3 client (cold start once) ----------
 
@@ -510,12 +511,11 @@ async function listFiles(bucket: string, filesPrefix: string): Promise<FileInfo[
   return out;
 }
 
-// Collect the GetObject body via the SDK's native helper. This avoids
-// the per-frame `for await` JS callback overhead (each ~64 KiB chunk
-// would otherwise crossover into JS, fire a microtask, and run a
-// `Buffer.copy` — for 3000 × 5 MiB files that's ~240k callbacks).
-// `transformToByteArray()` keeps the loop in C++ and returns a single
-// `Uint8Array` view backed by an internally-allocated Buffer.
+// Stream the body into a single pre-allocated Buffer. We tested the
+// SDK helper `transformToByteArray()` first — it concatenates
+// internally-allocated chunks, which doubles peak per-file memory.
+// Streaming with `for await` and a known-size pre-alloc keeps a flat
+// memory footprint and lets us write directly into the destination.
 async function downloadFile(
   bucket: string,
   key: string,
@@ -529,25 +529,28 @@ async function downloadFile(
   stats.record("getRequest", stats.now() - t0);
 
   const tBody = stats.now();
-  const arr = await response.Body!.transformToByteArray();
+  const stream = response.Body as Readable;
+  const out = Buffer.allocUnsafe(expectedSize);
+  let cursor = 0;
+  for await (const chunk of stream) {
+    const c = chunk as Buffer;
+    c.copy(out, cursor);
+    cursor += c.length;
+  }
   stats.record("getBody", stats.now() - tBody);
 
-  if (arr.byteLength !== expectedSize) {
+  if (cursor !== expectedSize) {
     throw new Error(
-      `short read on ${key}: expected ${expectedSize}, got ${arr.byteLength}`,
+      `short read on ${key}: expected ${expectedSize}, got ${cursor}`,
     );
   }
-  // Wrap the underlying ArrayBuffer in a `Buffer` view (zero-copy);
-  // downstream consumers (`Buffer.copy` into chunk producer) need the
-  // Buffer-flavoured prototype.
-  const body = Buffer.from(arr.buffer, arr.byteOffset, arr.byteLength);
 
-  // Native CRC32 from `node:zlib` (added in Node 22.2): one C++ call
-  // over the whole buffer, faster than any pure-JS implementation.
+  // Native CRC32 from `node:zlib` (Node 22.2+): one C++ call over the
+  // whole buffer, faster than any pure-JS implementation.
   const tCrc = stats.now();
-  const crc = crc32(body);
+  const crc = crc32(out);
   stats.record("crc32", stats.now() - tCrc);
-  return { body, crc };
+  return { body: out, crc };
 }
 
 // ---------- Pipeline stages ----------
