@@ -471,10 +471,14 @@ static struct aws_s3_meta_request *start_download(download_t *d, const char *key
  * buffering replaces the ring buffer.
  */
 
-/* Buffer flushed to CRT in chunks of this size. CRT's internal part size is
- * 8 MB by default; we batch writes a bit smaller so the last (partial) chunk
- * before EOF is reasonable. Tunable. */
-#define UPLOAD_BATCH_BYTES (8u * 1024 * 1024)
+/* Size of each write() pushed to CRT. Per CRT docs, when a write is smaller
+ * than `part_size` (CRT_PART_SIZE_BYTES below), the data is *copied* into
+ * CRT's internal buffer and the returned future completes immediately. Choose
+ * 1 MB so the zipper thread is never blocked waiting for an actual S3
+ * round-trip — CRT continues uploading parts in the background while we keep
+ * dispatching downloads and zipping. Avoids the 9000-tiny-write overhead by
+ * still being decisively bigger than typical zip headers (~30 B). */
+#define UPLOAD_BATCH_BYTES (1u * 1024 * 1024)
 
 typedef struct {
     obj_list_t                 *objs;
