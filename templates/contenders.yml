@@ -120,6 +120,25 @@ Resources:
   # copy-paste template for new contenders. Keep it as the last block in
   # this section so newcomers always see a valid registered Lambda.
 
+  # C / sebsto  (3-stage download/zip/upload pipeline on the AWS Common Runtime — aws-c-s3)
+  CSebstoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-c-sebsto
+      CodeUri: ../contenders/c/sebsto
+      Runtime: provided.al2023
+      MemorySize: 512
+      Timeout: 600
+      Handler: c.handler
+      Architectures:
+        - arm64
+      Role: !GetAtt LambdaContenderRole.Arn
+  CSebstoFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${CSebstoFunction}
+      RetentionInDays: 90
+
   # Swift / sebsto-soto  (3-stage download/zip/upload pipeline, Soto + swift-aws-lambda-runtime)
   SwiftSebstoSotoFunction:
     Type: AWS::Serverless::Function
@@ -183,6 +202,7 @@ Outputs:
           # >>> INSERT YOUR CONTENDER ARN HERE <<<
           # Append one line per contender, mirroring the resource block you added above:
           #   - !GetAtt <Lang><DevId>Function.Arn
+          - !GetAtt CSebstoFunction.Arn
           - !GetAtt SwiftSebstoSotoFunction.Arn
           - !GetAtt RustJeremieRodonFunction.Arn
           # ----- END CONTENDER ARN LIST -----
