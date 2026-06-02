@@ -8,14 +8,15 @@ CRT_PREFIX ?= /opt/aws-crt
 CC      ?= gcc
 CFLAGS  ?= -O3 -march=armv8.2-a -flto -fno-plt -pipe -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -I$(CRT_PREFIX)/include
 LDFLAGS ?= -O3 -flto -L$(CRT_PREFIX)/lib -L$(CRT_PREFIX)/lib64 -Wl,-rpath,'$$ORIGIN/lib'
-# Static-link the CRT and openssl-style deps; libc + libdl + libpthread stay dynamic.
+# Static-link the CRT libraries; libcrypto + libc + system libs stay dynamic
+# (AL2023 Lambda runtime ships libcrypto.so so this is safe).
 LDLIBS   = \
     -Wl,-Bstatic \
     -laws-c-s3 -laws-c-auth -laws-c-http -laws-c-compression \
     -laws-c-sdkutils -laws-c-io -laws-c-cal -laws-checksums \
-    -laws-c-common -ls2n -lcrypto \
+    -laws-c-common -ls2n \
     -Wl,-Bdynamic \
-    -lz -lpthread -ldl -lm -lrt
+    -lcrypto -lz -lpthread -ldl -lm -lrt
 
 SRC     := $(wildcard src/*.c)
 OBJ     := $(SRC:.c=.o)

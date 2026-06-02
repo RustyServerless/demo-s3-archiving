@@ -509,8 +509,6 @@ static int ris_get_length(struct aws_input_stream *s, int64_t *out) {
     return AWS_OP_SUCCESS;
 }
 
-static void ris_destroy(ring_input_stream_t *r) { (void)r; /* allocated on stack */ }
-
 static struct aws_input_stream_vtable g_ris_vtable = {
     .seek = ris_seek,
     .read = ris_read,
