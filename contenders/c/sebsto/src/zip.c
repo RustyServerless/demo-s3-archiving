@@ -1,7 +1,7 @@
 #include "zip.h"
 
+#include <aws/checksums/crc.h>
 #include <string.h>
-#include <zlib.h>
 
 void zip_writer_init(zip_writer_t *z, zip_write_fn fn, void *user) {
     memset(z, 0, sizeof(*z));
@@ -68,7 +68,7 @@ int zip_writer_add(zip_writer_t *z, const char *name, const uint8_t *data, size_
     zip_entry_t *e = &z->entries[z->n_entries++];
     e->name = xstrdup(name);
     e->size = n;
-    e->crc32 = crc32(0L, data, (uInt)n);
+    e->crc32 = aws_checksums_crc32_ex(data, n, 0);
     e->local_header_off = z->offset;
 
     if (emit_local_header(z, e)) return z->write_error;

@@ -48,8 +48,9 @@
 /* Memory cap on pending downloaded data waiting for the zipper. */
 #define MAX_DOWNLOAD_INFLIGHT_BYTES (32u * 1024 * 1024)
 
-/* CRT throughput hint (Gb/s). Higher = more connections. */
-#define CRT_THROUGHPUT_GBPS 25.0
+/* CRT throughput hint (Gb/s). The Rust SDK on Lambda configures around 10 Gb/s
+ * by default; bumping higher tells CRT to keep more parallel connections to S3. */
+#define CRT_THROUGHPUT_GBPS 100.0
 
 /* Multipart part size for the final PUT (CRT splits on this). */
 #define CRT_PART_SIZE_BYTES (8u * 1024 * 1024)
@@ -470,19 +471,27 @@ static struct aws_s3_meta_request *start_download(download_t *d, const char *key
  * buffering replaces the ring buffer.
  */
 
+/* Buffer flushed to CRT in chunks of this size. CRT's internal part size is
+ * 8 MB by default; we batch writes a bit smaller so the last (partial) chunk
+ * before EOF is reasonable. Tunable. */
+#define UPLOAD_BATCH_BYTES (8u * 1024 * 1024)
+
 typedef struct {
     obj_list_t                 *objs;
-    struct aws_s3_meta_request *upload_mr;   /* set before zipper runs */
+    struct aws_s3_meta_request *upload_mr;
+    /* Write batching buffer — accumulate ZIP bytes here and flush in big
+     * chunks to amortize the per-write future round-trip with CRT. */
+    uint8_t                    *batch;
+    size_t                      batch_len;
+    size_t                      batch_cap;
     int                         write_failed;
     int                         ok;
 } zipper_args_t;
 
-/* Synchronous wrapper: feed `n` bytes (or eof) to the upload meta-request and
- * block until CRT consumes them. Returns 0 on success. */
-static int upload_write_sync(void *user, const uint8_t *data, size_t n, int eof) {
-    zipper_args_t *a = (zipper_args_t *)user;
+/* Issue one write to CRT and block on its future. Used internally by the
+ * batching layer. */
+static int crt_write_sync(zipper_args_t *a, const uint8_t *data, size_t n, int eof) {
     if (a->write_failed) return -1;
-
     struct aws_byte_cursor c = { .ptr = (uint8_t *)data, .len = n };
     struct aws_future_void *f = aws_s3_meta_request_write(a->upload_mr, c, eof != 0);
     if (!f) {
@@ -490,7 +499,6 @@ static int upload_write_sync(void *user, const uint8_t *data, size_t n, int eof)
         a->write_failed = 1;
         return -1;
     }
-    /* Wait indefinitely. UINT64_MAX in CRT idiom is "no timeout". */
     aws_future_void_wait(f, UINT64_MAX);
     int err = aws_future_void_get_error(f);
     aws_future_void_release(f);
@@ -498,6 +506,44 @@ static int upload_write_sync(void *user, const uint8_t *data, size_t n, int eof)
         LOG("upload write failed: %s", aws_error_str(err));
         a->write_failed = 1;
         return -1;
+    }
+    return 0;
+}
+
+/* Buffered write callback for zip_writer. Flushes the batch buffer when it
+ * reaches UPLOAD_BATCH_BYTES, or eagerly when eof is set. */
+static int upload_write_sync(void *user, const uint8_t *data, size_t n, int eof) {
+    zipper_args_t *a = (zipper_args_t *)user;
+    if (a->write_failed) return -1;
+
+    /* Append to batch. Resize lazily — capped at UPLOAD_BATCH_BYTES + one
+     * worst-case incoming chunk. */
+    if (n) {
+        if (a->batch_len + n > a->batch_cap) {
+            size_t need = a->batch_len + n;
+            size_t cap = a->batch_cap ? a->batch_cap : UPLOAD_BATCH_BYTES;
+            while (cap < need) cap *= 2;
+            a->batch = (uint8_t *)xrealloc(a->batch, cap);
+            a->batch_cap = cap;
+        }
+        memcpy(a->batch + a->batch_len, data, n);
+        a->batch_len += n;
+    }
+
+    /* Flush full batches. */
+    while (a->batch_len >= UPLOAD_BATCH_BYTES && !eof) {
+        if (crt_write_sync(a, a->batch, UPLOAD_BATCH_BYTES, 0) != 0) return -1;
+        if (a->batch_len > UPLOAD_BATCH_BYTES) {
+            memmove(a->batch, a->batch + UPLOAD_BATCH_BYTES,
+                    a->batch_len - UPLOAD_BATCH_BYTES);
+        }
+        a->batch_len -= UPLOAD_BATCH_BYTES;
+    }
+
+    /* On eof: flush whatever's left in the batch (with eof=true). */
+    if (eof) {
+        if (crt_write_sync(a, a->batch, a->batch_len, 1) != 0) return -1;
+        a->batch_len = 0;
     }
     return 0;
 }
@@ -630,6 +676,9 @@ cleanup:
     free(mrs);
     free(finished_order);
     zip_writer_free(&z);
+    free(a->batch);
+    a->batch = NULL;
+    a->batch_len = a->batch_cap = 0;
     return NULL;
 }
 
