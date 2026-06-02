@@ -76,10 +76,13 @@ const s3 = new S3Client({
     connectionTimeout: 5_000,
     socketTimeout: 120_000,
   }),
-  // Zero-retry: any transient failure aborts the whole job; a
-  // contender Lambda that retries individual parts wins on shaky
-  // networks but loses the wall-clock race.
-  maxAttempts: 1,
+  // SDK adaptive retries: S3 keep-alive sockets are routinely closed
+  // on the server side after ~20 s idle. Reusing a just-closed socket
+  // surfaces as `TimeoutError: socket hang up`. The SDK retries those
+  // transparently — disabling retries (`maxAttempts: 1`) crashes the
+  // Lambda on the first lost socket of a 10-minute run.
+  maxAttempts: 5,
+  retryMode: "adaptive",
 });
 
 // ---------- Types ----------
@@ -637,7 +640,18 @@ async function runArchiveJob(job: JobInfo): Promise<void> {
     const zp = runZipStage(files, fileChannel, producer, byteBudget);
     const ul = runUploadStage(job.bucket_name, job.archive_key, uploadId, producer);
 
-    const [, , parts] = await Promise.all([dl, zp, ul]);
+    // `Promise.all` rejects on the first stage failure, but the other
+    // two stages keep running and may reject later. With no handler
+    // attached, those late rejections surface as
+    // `Runtime.UnhandledPromiseRejection` and crash the Lambda.
+    // `allSettled` waits for every stage to settle, so each rejection
+    // gets a consumer; we then re-throw the first failure ourselves.
+    const settled = await Promise.allSettled([dl, zp, ul]);
+    const firstFailure = settled.find((r) => r.status === "rejected");
+    if (firstFailure && firstFailure.status === "rejected") {
+      throw firstFailure.reason;
+    }
+    const parts = (settled[2] as PromiseFulfilledResult<CompletedPart[]>).value;
 
     await s3.send(
       new CompleteMultipartUploadCommand({
