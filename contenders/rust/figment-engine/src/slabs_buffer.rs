@@ -9,7 +9,7 @@
 
 use std::{iter, sync::Arc};
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::debug;
 
 /// Lifecycle state of a single slab in the ring buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,87 +69,63 @@ mod slab {
 }
 use slab::Slab;
 
-/// Shared backing store for the ring buffer; not used directly — construct via [`SlabRing::new`].
-pub struct SlabRing {
-	buf: Vec<u8>, // single contiguous allocation
+pub struct SlabBuf {
+	buf: Vec<u8>,
 	slabs: Vec<Slab>,
 	slab_size: usize,
-	ready_tx: mpsc::UnboundedSender<SlabLease>,
 }
-
-impl SlabRing {
-	/// Allocates the ring buffer and returns a `(Writer, Reader)` pair.
-	///
-	/// The backing `Vec<u8>` is allocated at full capacity with `set_len` (contents are
-	/// uninitialised but never read before being written). The first slab is pre-marked
-	/// `Filling` so the [`Writer`] can begin immediately without claiming a free slab.
+impl SlabBuf {
 	pub fn new(slab_size: usize, slab_count: usize) -> (Writer, Reader) {
-		info!(
-			"Creating SlabRing with slab_size={}, slab_count={}",
-			slab_size, slab_count
-		);
-		// pre-allocate
 		let mut buf = Vec::with_capacity(slab_size * slab_count);
-		// safety: set_len to capacity; we manage initialization manually by writing bytes
 		unsafe {
 			buf.set_len(buf.capacity());
 		}
 
-		let (tx, rx) = mpsc::unbounded_channel::<SlabLease>(); // capacity == #slabs: never blocks producer when a slab is sealed if a free exists
-		let ring = Arc::new(Self {
-			buf,
-			slabs: iter::repeat_with(|| Slab::new(SlabState::Free))
-				.take(slab_count)
-				.collect(),
-			slab_size,
-			ready_tx: tx,
-		});
-
-		if !ring.slabs.is_empty() {
-			// mark the first slab Filling so the writer can start
-			ring.slabs[0].set_state(SlabState::Filling);
-			debug!("Initialized first slab to Filling state");
-		} else {
-			debug!("No slabs available - zero capacity SlabRing");
+		let slabs: Vec<Slab> = iter::repeat_with(|| Slab::new(SlabState::Free))
+			.take(slab_count)
+			.collect();
+		if !slabs.is_empty() {
+			slabs[0].set_state(SlabState::Filling);
 		}
+
+		let buf = Arc::new(SlabBuf {
+			buf,
+			slabs,
+			slab_size,
+		});
+		let (tx, rx) = mpsc::unbounded_channel::<SlabLease>();
 		(
 			Writer {
-				ring,
+				buf,
+				ready_tx: tx,
 				slab_idx: 0,
 				offset: 0,
 			},
 			Reader { ready_rx: rx },
 		)
 	}
-
-	/// Returns `true` if the ring was constructed with zero capacity (the `Default` writer case).
 	fn is_zero_space(&self) -> bool {
 		self.buf.is_empty()
 	}
-
-	/// Returns the byte offset of `slab_idx` within the backing buffer.
-	#[inline]
 	fn slab_start(&self, slab_idx: usize) -> usize {
 		slab_idx * self.slab_size
 	}
 }
 
 struct PinnedSlab {
-	ring: Arc<SlabRing>,
+	buf: Arc<SlabBuf>,
 	slab_idx: usize,
-	data: std::ops::Range<usize>,
+	range: std::ops::Range<usize>,
 }
 impl AsRef<[u8]> for PinnedSlab {
 	fn as_ref(&self) -> &[u8] {
-		// SAFETY: this slab is Ready for the PinnedSlab's whole lifetime; the writer
-		// cannot reclaim it until Drop (below) marks it Free, so no aliasing write occurs.
-		let ptr = unsafe { self.ring.buf.as_ptr().add(self.data.start) };
-		unsafe { std::slice::from_raw_parts(ptr, self.data.end - self.data.start) }
+		let ptr = unsafe { self.buf.buf.as_ptr().add(self.range.start) };
+		unsafe { std::slice::from_raw_parts(ptr, self.range.end - self.range.start) }
 	}
 }
 impl Drop for PinnedSlab {
 	fn drop(&mut self) {
-		let prev = self.ring.slabs[self.slab_idx].swap_state(SlabState::Free);
+		let prev = self.buf.slabs[self.slab_idx].swap_state(SlabState::Free);
 		debug_assert_eq!(prev, SlabState::Ready);
 		tracing::info!(slab_idx = self.slab_idx, "PinnedSlab freed slab");
 	}
@@ -160,44 +136,25 @@ impl Drop for PinnedSlab {
 /// While a `SlabLease` is alive the slab remains `Ready` and the writer cannot reclaim it.
 /// Dropping the lease transitions the slab back to `Free`, making it available to the writer.
 pub struct SlabLease {
-	ring: Arc<SlabRing>,
+	buf: Arc<SlabBuf>,
 	slab_idx: usize,
-	// read-only view over sealed data (exactly SLAB_SIZE bytes)
 	data: std::ops::Range<usize>,
 }
-
 impl SlabLease {
-	// in impl SlabLease — replaces into_vec
 	pub fn into_bytes(self) -> bytes::Bytes {
 		let owner = PinnedSlab {
-			ring: self.ring.clone(),
+			buf: self.buf.clone(),
 			slab_idx: self.slab_idx,
-			data: self.data.clone(),
+			range: self.data.clone(),
 		};
-		// Transfer the free-on-drop responsibility from SlabLease to PinnedSlab:
-		// forget self so SlabLease::Drop does NOT fire (which would free the slab early).
 		std::mem::forget(self);
 		bytes::Bytes::from_owner(owner)
 	}
 }
-
-// When a lease is dropped, mark slab Free.
 impl Drop for SlabLease {
 	fn drop(&mut self) {
-		debug!(
-			"Dropping SlabLease for slab_idx={}, freeing {} bytes",
-			self.slab_idx,
-			self.data.len()
-		);
-
-		let slab = &self.ring.slabs[self.slab_idx];
-		// Transition Ready/InFlight -> Free
-		let prev = slab.swap_state(SlabState::Free);
-		if prev != SlabState::Ready {
-			unreachable!("Expected Ready, got {:?}", prev);
-		}
-
-		debug!("Slab {} marked as Free", self.slab_idx);
+		let prev = self.buf.slabs[self.slab_idx].swap_state(SlabState::Free);
+		debug_assert_eq!(prev, SlabState::Ready);
 	}
 }
 
@@ -232,9 +189,10 @@ impl Reader {
 /// `tokio::task::spawn_blocking`. `flush` seals the current (possibly partial) slab so the
 /// consumer sees the trailing bytes after the ZIP central directory is written.
 pub struct Writer {
-	ring: Arc<SlabRing>,
+	buf: Arc<SlabBuf>,
+	ready_tx: mpsc::UnboundedSender<SlabLease>, // sender lives HERE, not in the shared Arc
 	slab_idx: usize,
-	offset: usize, // bytes written in current slab
+	offset: usize,
 }
 impl Default for Writer {
 	/// Creates a zero-capacity [`Writer`] backed by an empty [`SlabRing`].
@@ -242,7 +200,7 @@ impl Default for Writer {
 	/// Required because [`zipper::Zipper`] has a `W: Default` bound (the `zip` crate's
 	/// `StreamWriter` swaps the inner writer out on `finish`).
 	fn default() -> Self {
-		SlabRing::new(0, 0).0
+		SlabBuf::new(0, 0).0
 	}
 }
 impl std::io::Write for Writer {
@@ -254,7 +212,7 @@ impl std::io::Write for Writer {
 			self.offset
 		);
 
-		if self.ring.is_zero_space() {
+		if self.buf.is_zero_space() {
 			use std::io::{Error, ErrorKind};
 			debug!("Write failed: SlabRing has zero space");
 			return Err(Error::new(
@@ -265,18 +223,18 @@ impl std::io::Write for Writer {
 		let mut total_written = 0usize;
 		while buf.len() > 0 {
 			// space left in the current slab
-			let room = self.ring.slab_size - self.offset;
+			let room = self.buf.slab_size - self.offset;
 			if room == 0 {
 				debug!("Current slab full, sealing and advancing to next");
 				self.seal_and_advance();
 			}
 			let n = buf.len().min(room);
 			// SAFETY: We only write into the slab currently in Filling state, and no consumers read it yet.
-			let dst_start = self.ring.slab_start(self.slab_idx) + self.offset;
+			let dst_start = self.buf.slab_start(self.slab_idx) + self.offset;
 			unsafe {
 				std::ptr::copy_nonoverlapping(
 					buf.as_ptr(),
-					self.ring.buf.as_ptr().add(dst_start) as *mut u8,
+					self.buf.buf.as_ptr().add(dst_start) as *mut u8,
 					n,
 				);
 			}
@@ -290,7 +248,7 @@ impl std::io::Write for Writer {
 
 	fn flush(&mut self) -> std::io::Result<()> {
 		debug!("Writer flush requested");
-		if self.ring.is_zero_space() {
+		if self.buf.is_zero_space() {
 			debug!("Flush: no-op for zero space ring");
 		} else if self.offset == 0 {
 			debug!("Flush: nothing to flush");
@@ -303,7 +261,7 @@ impl std::io::Write for Writer {
 }
 impl Writer {
 	// pub fn can_write_without_blocking(&self, len: usize) -> bool {
-	//     let immediate_free_space = self.ring.slab_size - self.offset;
+	//     let immediate_free_space = self.buf.slab_size - self.offset;
 	//     if immediate_free_space >= len {
 	//         return true;
 	//     }
@@ -314,7 +272,7 @@ impl Writer {
 	//         .filter(|slab| slab.state() == SlabState::Free)
 	//         .count();
 
-	//     return immediate_free_space + currently_free_slabs_count * self.ring.slab_size >= len;
+	//     return immediate_free_space + currently_free_slabs_count * self.buf.slab_size >= len;
 	// }
 	/// Transitions the current slab from `Filling` to `Ready` and sends a [`SlabLease`] to the consumer.
 	fn seal(&mut self) {
@@ -324,17 +282,17 @@ impl Writer {
 		);
 
 		// Mark current slab Ready and enqueue a lease
-		let slab = &self.ring.slabs[self.slab_idx];
+		let slab = &self.buf.slabs[self.slab_idx];
 		let prev = slab.swap_state(SlabState::Ready);
 		if prev == SlabState::Filling {
-			let start = self.ring.slab_start(self.slab_idx);
+			let start = self.buf.slab_start(self.slab_idx);
 			let lease = SlabLease {
-				ring: self.ring.clone(),
+				buf: self.buf.clone(),
 				slab_idx: self.slab_idx,
 				data: start..(start + self.offset), // allow partial final slab too
 			};
 			// Send to consumers (unbounded channel)
-			self.ring.ready_tx.send(lease).ok();
+			self.ready_tx.send(lease).ok();
 			debug!(
 				"Sealed slab_idx={}, sent lease with {} bytes to consumers",
 				self.slab_idx, self.offset
@@ -377,7 +335,7 @@ impl Writer {
 			// Search loop
 			loop {
 				// Next candidate
-				next_idx = (next_idx + 1) % self.ring.slabs.len();
+				next_idx = (next_idx + 1) % self.buf.slabs.len();
 				// If we looped around, break out to the wait loop
 				if next_idx == current_idx {
 					break;
@@ -385,7 +343,7 @@ impl Writer {
 
 				debug!("Trying to claim slab_idx={}", next_idx);
 				// Acquire to observe consumer's Free publication
-				let slab = &self.ring.slabs[next_idx];
+				let slab = &self.buf.slabs[next_idx];
 				if slab.state() == SlabState::Free {
 					// Transition Free -> Filling
 					let prev = slab.swap_state(SlabState::Filling);

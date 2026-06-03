@@ -11,7 +11,7 @@
 //! bottom of this file; it wires up OpenTelemetry/X-Ray tracing, an instrumented S3 client
 //! accessible via `s3()`, and the Lambda runtime invoking [`handler`].
 
-mod slabs_ring;
+mod slabs_buffer;
 mod zipper;
 
 use std::{io::Write, sync::Arc};
@@ -23,7 +23,8 @@ use aws_sdk_s3::{
 
 use awssdk_instrumentation::lambda::{LambdaError, LambdaEvent};
 use serde::Deserialize;
-use slabs_ring::{Reader, SlabRing, Writer};
+use slabs_buffer::SlabBuf;
+use slabs_buffer::{Reader, Writer};
 use tokio::{
 	sync::{OwnedSemaphorePermit, Semaphore, mpsc},
 	task::JoinSet,
@@ -428,7 +429,7 @@ async fn create_multipart_archive(files: Vec<FileInfo>, job_info: JobInfo) -> Re
 
 	// 2. Set up communication channels
 	let (zip_queue_tx, zip_queue_rx) = mpsc::unbounded_channel();
-	let (writer, reader) = SlabRing::new(CHUNK_SIZE_BYTES, BUFFER_CHUNKS_COUNT);
+	let (writer, reader) = SlabBuf::new(CHUNK_SIZE_BYTES, BUFFER_CHUNKS_COUNT);
 
 	// 3. Spawn all jobs
 	let download_handle = spawn_download_job(job_info, files, zip_queue_tx);
