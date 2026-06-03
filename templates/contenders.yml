@@ -177,7 +177,7 @@ Resources:
       # provided.al2023 is the custom runtime for compiled binaries (Rust, Go, C++).
       # The Lambda service executes the `bootstrap` binary directly.
       Runtime: provided.al2023
-      MemorySize: 256
+      MemorySize: 384
       Timeout: 600
       # For custom runtimes, Handler is technically ignored (bootstrap is always executed).
       # This value is just my convention.
@@ -189,78 +189,12 @@ Resources:
         Variables:
           # RUST_LOG configures the `tracing` crate's log filter:
           # debug for app code, info for noisy AWS SDK internals
-          RUST_LOG: info # debug,hyper=info,h2=info,tracing=info,aws_config=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,rustls=info
+          RUST_LOG: warn # debug,hyper=info,h2=info,tracing=info,aws_config=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,rustls=info
       Role: !GetAtt LambdaContenderRole.Arn
   RustFigmentEngineFunctionLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub /aws/lambda/${RustFigmentEngineFunction}
-      RetentionInDays: 90
-
-  # Rust / figment-engine @ 320 MB  (memory sweep)
-  RustFigmentEngine320Function:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub ${ProjectName}-rust-figment-engine-320
-      CodeUri: ../contenders/rust/figment-engine
-      Runtime: provided.al2023
-      MemorySize: 320
-      Timeout: 600
-      Handler: rust.handler
-      Architectures:
-        - arm64
-      Environment:
-        Variables:
-          RUST_LOG: info
-      Role: !GetAtt LambdaContenderRole.Arn
-  RustFigmentEngine320FunctionLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub /aws/lambda/${RustFigmentEngine320Function}
-      RetentionInDays: 90
-
-  # Rust / figment-engine @ 384 MB  (memory sweep)
-  RustFigmentEngine384Function:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub ${ProjectName}-rust-figment-engine-384
-      CodeUri: ../contenders/rust/figment-engine
-      Runtime: provided.al2023
-      MemorySize: 384
-      Timeout: 600
-      Handler: rust.handler
-      Architectures:
-        - arm64
-      Environment:
-        Variables:
-          RUST_LOG: info
-      Role: !GetAtt LambdaContenderRole.Arn
-  RustFigmentEngine384FunctionLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub /aws/lambda/${RustFigmentEngine384Function}
-      RetentionInDays: 90
-
-  # Rust / figment-engine @ 448 MB  (memory sweep)
-  RustFigmentEngine448Function:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub ${ProjectName}-rust-figment-engine-448
-      CodeUri: ../contenders/rust/figment-engine
-      Runtime: provided.al2023
-      MemorySize: 448
-      Timeout: 600
-      Handler: rust.handler
-      Architectures:
-        - arm64
-      Environment:
-        Variables:
-          RUST_LOG: info
-      Role: !GetAtt LambdaContenderRole.Arn
-  RustFigmentEngine448FunctionLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub /aws/lambda/${RustFigmentEngine448Function}
       RetentionInDays: 90
   # ------------------------------ END CONTENDERS --------------------------------
 
@@ -280,7 +214,4 @@ Outputs:
           - !GetAtt SwiftSebstoSotoFunction.Arn
           - !GetAtt RustJeremieRodonFunction.Arn
           - !GetAtt RustFigmentEngineFunction.Arn
-          - !GetAtt RustFigmentEngine320Function.Arn
-          - !GetAtt RustFigmentEngine384Function.Arn
-          - !GetAtt RustFigmentEngine448Function.Arn
           # ----- END CONTENDER ARN LIST -----
