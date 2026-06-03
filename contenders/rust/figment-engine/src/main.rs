@@ -40,7 +40,7 @@ const MAX_CONCURRENT_UPLOADS: usize = 3;
 /// Size of each multipart upload chunk (10MB)
 const CHUNK_SIZE_BYTES: usize = 10 * 1024 * 1024;
 /// Slab Ring Buffer size in chuncks
-const BUFFER_CHUNKS_COUNT: usize = 3; // we don't want to starve with slabs retained during uploads
+const BUFFER_CHUNKS_COUNT: usize = MAX_CONCURRENT_UPLOADS * 2; // always ensure free slabs retained during uploads
 
 /// Info switch every 50
 const TRACING_INFO_FREQUENCY: usize = 50;

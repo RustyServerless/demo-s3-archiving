@@ -150,7 +150,8 @@ impl AsRef<[u8]> for PinnedSlab {
 impl Drop for PinnedSlab {
 	fn drop(&mut self) {
 		let prev = self.ring.slabs[self.slab_idx].swap_state(SlabState::Free);
-		debug_assert_eq!(prev, SlabState::Ready, "PinnedSlab freed a non-Ready slab");
+		debug_assert_eq!(prev, SlabState::Ready);
+		tracing::info!(slab_idx = self.slab_idx, "PinnedSlab freed slab");
 	}
 }
 
