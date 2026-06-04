@@ -263,11 +263,11 @@ Resources:
       LogGroupName: !Sub /aws/lambda/${RustFigmentEngine448Function}
       RetentionInDays: 90
 
-    # Rust / figment-engine @ 448 MB  (memory sweep)
+    # Rust / figment-engine @ 1024 MB  (memory sweep)
   RustFigmentEngine1024Function:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: !Sub ${ProjectName}-rust-figment-engine-448
+      FunctionName: !Sub ${ProjectName}-rust-figment-engine-1024
       CodeUri: ../contenders/rust/figment-engine
       Runtime: provided.al2023
       MemorySize: 1024
@@ -284,7 +284,6 @@ Resources:
     Properties:
       LogGroupName: !Sub /aws/lambda/${RustFigmentEngine1024Function}
       RetentionInDays: 90
-
   # ------------------------------ END CONTENDERS --------------------------------
 
 # Outputs — the list of contender ARNs is consumed by the benching Step Function
