@@ -24,7 +24,7 @@ use crate::engine::plan::{Chain, Entry, FileId, PartSpec, Plan, Segment};
 use crate::engine::zip_format::{self, EntryMeta};
 
 /// Tunables. Stream concurrency saturates the ENI; control concurrency bounds off-ENI calls.
-const STREAM_CONCURRENCY: usize = 24;
+const STREAM_CONCURRENCY: usize = 32;
 const CHAIN_CONCURRENCY: usize = 16;
 const CRC_CONCURRENCY: usize = 64;
 /// Concurrent parts within a single chain (matters for the first chain, ~1,200 parts).
