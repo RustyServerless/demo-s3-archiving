@@ -62,12 +62,43 @@ pub enum PartSpec {
 	},
 }
 
-/// A chain = its own MPU. Normal chain: [Copy(big), Stream(small + next-header)].
-/// First chain: all Stream parts (bin-packed; bootstraps entry-0 header).
+/// A chain = its own MPU. First chain: all Stream parts (bin-packed; bootstraps entry-0 header).
 #[derive(Debug, Clone)]
 pub struct Chain {
 	pub parts: Vec<PartSpec>,
 	pub final_merge_part_number: u32,
+}
+
+/// A normal chain's layered all-copy recipe. Realised by the assembler as 1-3 sub-MPUs, each
+/// copying the previous layer plus one floor-exempt last part, so NO body crosses the ENI:
+///   layer1: [copy big][copy header(small) from H]        -> [B][hS]      (skip hS if no small)
+///   layer2: [copy layer1][copy body(small) from files/]  -> [B][hS][S]   (skip if no small)
+///   layer3: [copy prev][copy header(next_big) from H]    -> [..][hNext]  (skip if no next)
+/// The big's own header rides the PREVIOUS chain's tail (next_big_header), bootstrapped by the
+/// first chain. Archive fragment = [B][hS][S][hNext], identical bytes to the streamed layout.
+#[derive(Debug, Clone)]
+pub struct LayeredChain {
+	pub big: FileId,
+	pub small: Option<FileId>,
+	pub next_big_header: Option<FileId>,
+	pub final_merge_part_number: u32,
+}
+
+/// A chain in the plan: the first chain streams (bootstraps entry-0 header); every other chain
+/// is a layered all-copy recipe.
+#[derive(Debug, Clone)]
+pub enum ChainPlan {
+	FirstStream(Chain),
+	Layered(LayeredChain),
+}
+
+impl ChainPlan {
+	pub fn final_merge_part_number(&self) -> u32 {
+		match self {
+			ChainPlan::FirstStream(c) => c.final_merge_part_number,
+			ChainPlan::Layered(l) => l.final_merge_part_number,
+		}
+	}
 }
 
 /// The planner's complete output for the fast path.
@@ -75,7 +106,7 @@ pub struct Chain {
 pub struct Plan {
 	pub order: Vec<FileId>, // canonical ZIP order — source of truth for sequence
 	pub entries: HashMap<FileId, Entry>,
-	pub chains: Vec<Chain>,
+	pub chains: Vec<ChainPlan>,
 	pub copyable: Vec<FileId>, // need a phase-1 CRC HEAD (chain order)
 }
 
@@ -216,36 +247,23 @@ pub fn plan(files: Vec<SourceFile>) -> Routing {
 	// --- Build chains with part numbers and trailing-header handoffs ---
 	// First chain (final_merge_part_number = 1): bin-pack streamed files into >= floor parts.
 	// Its tail carries the header for normal chain 1's big.
-	let mut chains: Vec<Chain> = Vec::new();
+	let mut chains: Vec<ChainPlan> = Vec::new();
 
 	let first_big_id = normal_pairs[0].0.id;
 	let first_chain = build_first_chain(&first_chain_files, &size_of, first_big_id);
-	chains.push(first_chain);
+	chains.push(ChainPlan::FirstStream(first_chain));
 
-	// Normal chains: each its own MPU. Copy(big) + Stream(small + Header(next big)).
+	// Normal chains: layered all-copy recipe. next_big_header carries the FOLLOWING chain's
+	// big header on this chain's tail (None for the last normal chain). small=None for an
+	// unpaired big. The assembler derives the 1-3 layer sequence from these.
 	for (k, (big, small)) in normal_pairs.iter().enumerate() {
 		let next_big = normal_pairs.get(k + 1).map(|(b, _)| b.id);
-		let mut segments: Vec<Segment> = Vec::new();
-		if let Some(s) = small {
-			segments.push(Segment::StreamedFile { id: s.id });
-		}
-		if let Some(nb) = next_big {
-			segments.push(Segment::CopiedFileHeader { id: nb });
-		}
-		let parts = vec![
-			PartSpec::Copy {
-				part_number: 1,
-				id: big.id,
-			},
-			PartSpec::Stream {
-				part_number: 2,
-				segments,
-			},
-		];
-		chains.push(Chain {
-			parts,
+		chains.push(ChainPlan::Layered(LayeredChain {
+			big: big.id,
+			small: small.as_ref().map(|s| s.id),
+			next_big_header: next_big,
 			final_merge_part_number: (k as u32) + 2, // first chain is slot 1
-		});
+		}));
 	}
 
 	Routing::CopyPart(Plan {
@@ -340,14 +358,18 @@ mod tests {
 		match plan(files) {
 			Routing::CopyPart(p) => {
 				assert_eq!(
-					p.chains[0].final_merge_part_number, 1,
+					p.chains[0].final_merge_part_number(),
+					1,
 					"first chain is slot 1"
 				);
 				// every entry has an offset and appears once in order
 				assert_eq!(p.order.len(), p.entries.len());
 				// chain final-merge numbers are 1..=chains.len(), unique & contiguous
-				let mut nums: Vec<u32> =
-					p.chains.iter().map(|c| c.final_merge_part_number).collect();
+				let mut nums: Vec<u32> = p
+					.chains
+					.iter()
+					.map(|c| c.final_merge_part_number())
+					.collect();
 				nums.sort();
 				assert_eq!(nums, (1..=p.chains.len() as u32).collect::<Vec<_>>());
 			}
@@ -550,8 +572,32 @@ mod tests {
 			}
 		}
 
-		// Helper: bytes of one entry's local header (CRC from store) — copyable needs the
-		// filled CRC; streamable computes from content.
+		// ---- Build the headers blob H exactly as the assembler will (all entries) ----
+		use crate::engine::header_blob::build_header_blob;
+		let metas: Vec<(FileId, EntryMeta)> = plan
+			.order
+			.iter()
+			.map(|id| {
+				let e = &plan.entries[id];
+				let crc = e.crc.unwrap_or_else(|| crc32(&raw[id.0 as usize]));
+				(
+					*id,
+					EntryMeta {
+						name: e.name.clone(),
+						size: e.size,
+						crc,
+						local_header_offset: e.local_header_offset,
+					},
+				)
+			})
+			.collect();
+		let (h_bytes, h_blob) = build_header_blob(metas);
+		// header bytes for id, sourced from H by byte-range (what the assembler copies).
+		let h_range = |id: FileId| -> Vec<u8> {
+			let r = h_blob.ranges[&id];
+			h_bytes[r.offset as usize..r.end() as usize].to_vec()
+		};
+		// Streamed (inline) header for first-chain files — same bytes, computed locally.
 		let header_bytes = |id: FileId| -> Vec<u8> {
 			let e = &plan.entries[&id];
 			let crc = e.crc.unwrap_or_else(|| crc32(&raw[id.0 as usize]));
@@ -563,34 +609,54 @@ mod tests {
 			})
 		};
 
-		// ---- Build each chain object exactly as build_chain_object would: concat its parts ----
-		// For a Copy part: [body of id].  (Its header rides the PRECEDING stream part's tail.)
-		// For a Stream part: for each segment, StreamedFile => [header][body], CopiedFileHeader => [header].
-		// Index chains by final_merge_part_number so we can concat in merge order.
+		// ---- Build each chain object the PRODUCTION way ----
+		// FirstStream: concat its parts (StreamedFile => [header][body], CopiedFileHeader => [header]).
+		// Layered:     [B][hS][S][hNext], with hS/hNext copied as byte-ranges of H, B/S as bodies.
+		//              (skip hS/S if no small; skip hNext if last normal chain) — exactly the
+		//              1-3 layer sequence the assembler will run, but the RESULT bytes are what
+		//              we validate here.
 		let mut chain_objs: Vec<(u32, Vec<u8>)> = Vec::new();
 		for chain in &plan.chains {
 			let mut obj: Vec<u8> = Vec::new();
-			for part in &chain.parts {
-				match part {
-					PartSpec::Copy { id, .. } => {
-						obj.extend_from_slice(&raw[id.0 as usize]); // body only
-					}
-					PartSpec::Stream { segments, .. } => {
-						for seg in segments {
-							match seg {
-								Segment::StreamedFile { id } => {
-									obj.extend_from_slice(&header_bytes(*id));
-									obj.extend_from_slice(&raw[id.0 as usize]);
-								}
-								Segment::CopiedFileHeader { id } => {
-									obj.extend_from_slice(&header_bytes(*id));
+			match chain {
+				ChainPlan::FirstStream(c) => {
+					for part in &c.parts {
+						match part {
+							PartSpec::Copy { id, .. } => {
+								obj.extend_from_slice(&raw[id.0 as usize]);
+							}
+							PartSpec::Stream { segments, .. } => {
+								for seg in segments {
+									match seg {
+										Segment::StreamedFile { id } => {
+											obj.extend_from_slice(&header_bytes(*id));
+											obj.extend_from_slice(&raw[id.0 as usize]);
+										}
+										Segment::CopiedFileHeader { id } => {
+											obj.extend_from_slice(&header_bytes(*id));
+										}
+									}
 								}
 							}
 						}
 					}
+					chain_objs.push((c.final_merge_part_number, obj));
+				}
+				ChainPlan::Layered(l) => {
+					// [B]
+					obj.extend_from_slice(&raw[l.big.0 as usize]);
+					// [hS][S]
+					if let Some(s) = l.small {
+						obj.extend_from_slice(&h_range(s)); // small's header from H
+						obj.extend_from_slice(&raw[s.0 as usize]); // small body
+					}
+					// [hNext] — next chain's big header rides this tail
+					if let Some(nb) = l.next_big_header {
+						obj.extend_from_slice(&h_range(nb));
+					}
+					chain_objs.push((l.final_merge_part_number, obj));
 				}
 			}
-			chain_objs.push((chain.final_merge_part_number, obj));
 		}
 		// Concatenate chain objects in merge-part-number order (the archive's entry region).
 		chain_objs.sort_by_key(|(n, _)| *n);

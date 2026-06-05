@@ -21,12 +21,13 @@ use futures::stream::{StreamExt, TryStreamExt};
 use tokio::sync::Semaphore;
 
 use crate::engine::crc::decode_s3_crc32;
-use crate::engine::plan::{Chain, Entry, FileId, PartSpec, Plan, Segment};
+use crate::engine::header_blob::{HeaderBlob, HeaderRange, build_header_blob};
+use crate::engine::plan::{Chain, ChainPlan, Entry, FileId, LayeredChain, PartSpec, Plan, Segment};
 use crate::engine::zip_format::{self, EntryMeta};
 
 /// Tunables. Stream concurrency saturates the ENI; control concurrency bounds off-ENI calls.
 const STREAM_CONCURRENCY: usize = 24;
-const CHAIN_CONCURRENCY: usize = 64;
+const CHAIN_CONCURRENCY: usize = 16;
 const CRC_CONCURRENCY: usize = 64;
 /// Concurrent parts within a single chain (matters for the first chain, ~1,200 parts).
 const PART_CONCURRENCY: usize = 32;
@@ -72,6 +73,38 @@ pub async fn assemble(
 	);
 	let plan = Arc::new(plan);
 
+	// ---- Phase 0: build the headers blob H and PutObject it (the ONLY ENI upload of bodies) ----
+	// Layered normal chains copy each header as a byte-range of H (server-side), so no header
+	// is streamed. H is ~hundreds of KB for thousands of entries.
+	let t_h = Instant::now();
+	let metas = plan.order.iter().map(|id| {
+		let e = &plan.entries[id];
+		let crc = e.crc.unwrap_or(0);
+		(
+			*id,
+			EntryMeta {
+				name: e.name.clone(),
+				size: e.size,
+				crc,
+				local_header_offset: e.local_header_offset,
+			},
+		)
+	});
+	let (h_bytes, h_blob) = build_header_blob(metas);
+	let h_key = format!("archives/.tmp-chains/{}-H", archive_basename(archive_key));
+	s3.put_object()
+		.bucket(bucket)
+		.key(&h_key)
+		.body(ByteStream::from(h_bytes))
+		.send()
+		.await?;
+	let h_blob = Arc::new(h_blob);
+	tracing::info!(
+		ms = t_h.elapsed().as_millis(),
+		len = h_blob.bytes_len,
+		"PHASE headers_blob"
+	);
+
 	// ---- Open the final-merge (archive) MPU up front so copies can flow in as-you-go ----
 	let archive_upload_id = create_mpu(s3, bucket, archive_key).await?;
 
@@ -100,7 +133,14 @@ pub async fn assemble(
 		let files_prefix = files_prefix.to_string();
 		let archive_key = archive_key.to_string();
 		let archive_upload_id = archive_upload_id.clone();
-		let chain = plan.chains[0].clone();
+		let chain = match &plan.chains[0] {
+			ChainPlan::FirstStream(c) => c.clone(),
+			ChainPlan::Layered(_) => {
+				return Err(AssembleError::BadCrc(
+					"first chain must be FirstStream".into(),
+				));
+			}
+		};
 		let chain_key = format!("archives/.tmp-chains/{}-0", archive_basename_s);
 		tokio::spawn(async move {
 			let t = Instant::now();
@@ -125,35 +165,46 @@ pub async fn assemble(
 		})
 	};
 
-	// Normal chains (1..) in a bounded pool with their own stream budget.
-	let normal_stream_sem = Arc::new(Semaphore::new(STREAM_CONCURRENCY));
-	let chain_jobs = futures::stream::iter(plan.chains.iter().enumerate().skip(1).map(
-		|(chain_idx, chain)| {
-			let s3 = s3.clone();
-			let plan = plan.clone();
-			let bucket = bucket.to_string();
-			let files_prefix = files_prefix.to_string();
-			let archive_key = archive_key.to_string();
-			let archive_upload_id = archive_upload_id.clone();
-			let stream_sem = normal_stream_sem.clone();
-			let chain_key = format!("archives/.tmp-chains/{}-{}", archive_basename_s, chain_idx);
-			let chain = chain.clone();
-			async move {
-				process_chain(
-					&s3,
-					&bucket,
-					&files_prefix,
-					&chain_key,
-					&archive_key,
-					&archive_upload_id,
-					&plan,
-					&chain,
-					&stream_sem,
-				)
-				.await
-			}
-		},
-	))
+	// Normal chains (1..) in a bounded pool. Each is a layered all-copy recipe: no body or
+	// header crosses the ENI; every part is a server-side UploadPartCopy (bodies from files/,
+	// headers as byte-ranges of H). Only chain 0 is FirstStream, so collect the Layered recipes.
+	let layered: Vec<(usize, LayeredChain)> = plan
+		.chains
+		.iter()
+		.enumerate()
+		.skip(1)
+		.filter_map(|(i, c)| match c {
+			ChainPlan::Layered(l) => Some((i, l.clone())),
+			ChainPlan::FirstStream(_) => None,
+		})
+		.collect();
+
+	let chain_jobs = futures::stream::iter(layered.into_iter().map(|(chain_idx, layered)| {
+		let s3 = s3.clone();
+		let plan = plan.clone();
+		let h_blob = h_blob.clone();
+		let bucket = bucket.to_string();
+		let files_prefix = files_prefix.to_string();
+		let archive_key = archive_key.to_string();
+		let archive_upload_id = archive_upload_id.clone();
+		let h_key = h_key.clone();
+		let chain_key = format!("archives/.tmp-chains/{}-{}", archive_basename_s, chain_idx);
+		async move {
+			process_layered_chain(
+				&s3,
+				&bucket,
+				&files_prefix,
+				&chain_key,
+				&archive_key,
+				&archive_upload_id,
+				&h_key,
+				&h_blob,
+				&plan,
+				&layered,
+			)
+			.await
+		}
+	}))
 	.buffer_unordered(CHAIN_CONCURRENCY);
 
 	futures::pin_mut!(chain_jobs);
@@ -259,6 +310,155 @@ async fn process_chain(
 		.part_number(part_number)
 		.e_tag(etag)
 		.build())
+}
+
+/// Realise a normal chain entirely via server-side copies (no ENI bytes), then merge-copy the
+/// result into the archive. The archive fragment is [B][hS][S][hNext]:
+///   layer1: copy B (>=5MiB, non-last) + copy header(small) from H (exempt last)  -> [B][hS]
+///   layer2: copy layer1 (non-last)    + copy body(small) from files/ (exempt last) -> [B][hS][S]
+///   layer3: copy prev (non-last)      + copy header(next_big) from H (exempt last) -> [..][hNext]
+/// Layers with nothing to add are skipped (unpaired big => no hS/S; last chain => no hNext).
+#[allow(clippy::too_many_arguments)]
+async fn process_layered_chain(
+	s3: &Client,
+	bucket: &str,
+	files_prefix: &str,
+	chain_key: &str,
+	archive_key: &str,
+	archive_upload_id: &str,
+	h_key: &str,
+	h_blob: &HeaderBlob,
+	plan: &Plan,
+	chain: &LayeredChain,
+) -> Result<CompletedPart, AssembleError> {
+	let big = &plan.entries[&chain.big];
+	let big_src = format!("{bucket}/{files_prefix}/{}", big.name);
+
+	// layer1: [B] + (header(small) if any)
+	let mut prev = format!("{chain_key}.l1");
+	{
+		let mut parts: Vec<CopyPart> = vec![CopyPart::whole(big_src.clone())];
+		if let Some(sid) = chain.small {
+			parts.push(CopyPart::range(
+				h_source(bucket, h_key),
+				h_blob.ranges[&sid],
+			));
+		}
+		run_copy_mpu(s3, bucket, &prev, &parts).await?;
+	}
+
+	// layer2: [prev] + body(small)  (only if there is a small)
+	if let Some(sid) = chain.small {
+		let small = &plan.entries[&sid];
+		let small_src = format!("{bucket}/{files_prefix}/{}", small.name);
+		let l2 = format!("{chain_key}.l2");
+		let parts = vec![
+			CopyPart::whole(format!("{bucket}/{prev}")),
+			CopyPart::whole(small_src),
+		];
+		run_copy_mpu(s3, bucket, &l2, &parts).await?;
+		prev = l2;
+	}
+
+	// layer3: [prev] + header(next_big)  (only if there is a trailing header)
+	if let Some(nb) = chain.next_big_header {
+		let l3 = format!("{chain_key}.l3");
+		let parts = vec![
+			CopyPart::whole(format!("{bucket}/{prev}")),
+			CopyPart::range(h_source(bucket, h_key), h_blob.ranges[&nb]),
+		];
+		run_copy_mpu(s3, bucket, &l3, &parts).await?;
+		prev = l3;
+	}
+
+	// Merge the final chain object into the archive at its slot.
+	let part_number = chain.final_merge_part_number as i32;
+	let out = s3
+		.upload_part_copy()
+		.bucket(bucket)
+		.key(archive_key)
+		.upload_id(archive_upload_id)
+		.part_number(part_number)
+		.copy_source(format!("{bucket}/{prev}"))
+		.send()
+		.await?;
+	let etag = out
+		.copy_part_result()
+		.and_then(|r| r.e_tag())
+		.ok_or(AssembleError::NoEtag("layered merge upload_part_copy"))?
+		.to_string();
+	Ok(CompletedPart::builder()
+		.part_number(part_number)
+		.e_tag(etag)
+		.build())
+}
+
+/// A copy-source for one MPU part: a whole object, or a byte range of one.
+struct CopyPart {
+	source: String,
+	range: Option<(u64, u64)>, // (first_byte, last_byte) inclusive, for x-amz-copy-source-range
+}
+impl CopyPart {
+	fn whole(source: String) -> Self {
+		CopyPart {
+			source,
+			range: None,
+		}
+	}
+	fn range(source: String, r: HeaderRange) -> Self {
+		// S3 copy-source-range is inclusive: bytes=first-last.
+		CopyPart {
+			source,
+			range: Some((r.offset, r.end() - 1)),
+		}
+	}
+}
+
+fn h_source(bucket: &str, h_key: &str) -> String {
+	format!("{bucket}/{h_key}")
+}
+
+/// Create an MPU, upload each CopyPart via UploadPartCopy (part numbers 1..=n, last is exempt
+/// from the 5 MiB floor), and complete it. All server-side; no ENI bytes.
+async fn run_copy_mpu(
+	s3: &Client,
+	bucket: &str,
+	key: &str,
+	parts: &[CopyPart],
+) -> Result<(), AssembleError> {
+	let upload_id = create_mpu(s3, bucket, key).await?;
+	let mut completed: Vec<CompletedPart> = Vec::with_capacity(parts.len());
+	for (i, p) in parts.iter().enumerate() {
+		let pn = (i + 1) as i32;
+		let mut req = s3
+			.upload_part_copy()
+			.bucket(bucket)
+			.key(key)
+			.upload_id(&upload_id)
+			.part_number(pn)
+			.copy_source(&p.source);
+		if let Some((first, last)) = p.range {
+			req = req.copy_source_range(format!("bytes={first}-{last}"));
+		}
+		let out = req.send().await?;
+		let etag = out
+			.copy_part_result()
+			.and_then(|r| r.e_tag())
+			.ok_or(AssembleError::NoEtag("layer upload_part_copy"))?
+			.to_string();
+		completed.push(CompletedPart::builder().part_number(pn).e_tag(etag).build());
+	}
+	let mpu = CompletedMultipartUpload::builder()
+		.set_parts(Some(completed))
+		.build();
+	s3.complete_multipart_upload()
+		.bucket(bucket)
+		.key(key)
+		.upload_id(&upload_id)
+		.multipart_upload(mpu)
+		.send()
+		.await?;
+	Ok(())
 }
 
 /// Build one chain object (its own MPU) and return its ETag. Streamed parts GET their
