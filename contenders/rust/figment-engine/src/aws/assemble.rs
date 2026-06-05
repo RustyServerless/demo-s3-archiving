@@ -1,10 +1,6 @@
 //! ============================================================================
 //! STATUS — read before trusting this module.
 //!
-//! WRITTEN BUT NOT COMPILED HERE (no Rust toolchain in the authoring sandbox).
-//! The pure engine (zip_format, plan, crc) is compiled+tested on your box and green.
-//! This AWS layer needs `cargo build` + an integration run to confirm:
-//!
 //!   [ ] SDK method/field names match your pinned aws-sdk-s3 version. Used here:
 //!       create_multipart_upload().upload_id()
 //!       upload_part().body(ByteStream).part_number().e_tag()
@@ -53,9 +49,9 @@ use crate::engine::plan::{Chain, Entry, FileId, PartSpec, Plan, Segment};
 use crate::engine::zip_format::{self, EntryMeta};
 
 /// Tunables. Stream concurrency saturates the ENI; control concurrency bounds off-ENI calls.
-const STREAM_CONCURRENCY: usize = 24;
-const CHAIN_CONCURRENCY: usize = 16;
-const CRC_CONCURRENCY: usize = 64;
+const STREAM_CONCURRENCY: usize = 48;
+const CHAIN_CONCURRENCY: usize = 32;
+const CRC_CONCURRENCY: usize = 128;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssembleError {
