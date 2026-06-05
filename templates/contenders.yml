@@ -135,6 +135,10 @@ Resources:
       # timeout; stddev 41 s makes timeout-failure plausible. 1024 MB
       # is the right tier: comfortable headroom, tight stddev.
       MemorySize: 1024
+  PythonSebstoFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${PythonSebstoFunction}
   # TypeScript / sebsto  (3-stage download/zip/upload pipeline, Node 22 + AWS SDK v3, esbuild bundle)
   TypescriptSebstoFunction:
     Type: AWS::Serverless::Function
@@ -148,10 +152,6 @@ Resources:
       Architectures:
         - arm64
       Role: !GetAtt LambdaContenderRole.Arn
-  PythonSebstoFunctionLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub /aws/lambda/${PythonSebstoFunction}
   TypescriptSebstoFunctionLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
