@@ -101,69 +101,83 @@ pub async fn assemble(
 	//
 	// Intermediate chain objects are written under a temp prefix so they can be copied
 	// server-side into the archive and then abandoned (lifecycle / explicit delete).
-	let stream_sem = Arc::new(Semaphore::new(STREAM_CONCURRENCY));
-
 	// Collect final-merge completed parts (chain copies + the directory part).
 	let mut final_parts: Vec<CompletedPart> = Vec::new();
 
-	// Build chains with BOUNDED concurrency: only CHAIN_CONCURRENCY are instantiated at a
-	// time (buffer_unordered pulls lazily), which bounds open file descriptors and memory.
-	// Each completed chain immediately fires its final-merge UploadPartCopy into its slot.
 	let archive_basename_s = archive_basename(archive_key);
-	let chain_jobs =
-		futures::stream::iter(plan.chains.iter().enumerate().map(|(chain_idx, chain)| {
+
+	// The FIRST chain (index 0) streams ~all the small-file bytes — the ~90s ENI-bound long
+	// pole. Run it as its OWN task with its OWN stream budget so it streams flat-out and does
+	// NOT consume a slot in the normal-chain pool. The normal chains (mostly off-ENI copies +
+	// one tiny GET each) run concurrently in a bounded pool; total wall-clock becomes
+	// max(first chain, normal chains) rather than them contending for the same slots.
+	let first_stream_sem = Arc::new(Semaphore::new(STREAM_CONCURRENCY));
+	let first_handle = {
+		let s3 = s3.clone();
+		let plan = plan.clone();
+		let bucket = bucket.to_string();
+		let files_prefix = files_prefix.to_string();
+		let archive_key = archive_key.to_string();
+		let archive_upload_id = archive_upload_id.clone();
+		let chain = plan.chains[0].clone();
+		let chain_key = format!("archives/.tmp-chains/{}-0", archive_basename_s);
+		tokio::spawn(async move {
+			process_chain(
+				&s3,
+				&bucket,
+				&files_prefix,
+				&chain_key,
+				&archive_key,
+				&archive_upload_id,
+				&plan,
+				&chain,
+				&first_stream_sem,
+			)
+			.await
+		})
+	};
+
+	// Normal chains (1..) in a bounded pool with their own stream budget.
+	let normal_stream_sem = Arc::new(Semaphore::new(STREAM_CONCURRENCY));
+	let chain_jobs = futures::stream::iter(plan.chains.iter().enumerate().skip(1).map(
+		|(chain_idx, chain)| {
 			let s3 = s3.clone();
 			let plan = plan.clone();
 			let bucket = bucket.to_string();
 			let files_prefix = files_prefix.to_string();
 			let archive_key = archive_key.to_string();
 			let archive_upload_id = archive_upload_id.clone();
-			let stream_sem = stream_sem.clone();
+			let stream_sem = normal_stream_sem.clone();
 			let chain_key = format!("archives/.tmp-chains/{}-{}", archive_basename_s, chain_idx);
 			let chain = chain.clone();
 			async move {
-				// Build the chain object (its own MPU).
-				let _etag = build_chain_object(
+				process_chain(
 					&s3,
 					&bucket,
 					&files_prefix,
 					&chain_key,
+					&archive_key,
+					&archive_upload_id,
 					&plan,
 					&chain,
 					&stream_sem,
 				)
-				.await?;
-				// Copy it into the archive MPU at its pre-assigned slot.
-				let part_number = chain.final_merge_part_number as i32;
-				let copy_source = format!("{bucket}/{chain_key}");
-				let out = s3
-					.upload_part_copy()
-					.bucket(&bucket)
-					.key(&archive_key)
-					.upload_id(&archive_upload_id)
-					.part_number(part_number)
-					.copy_source(copy_source)
-					.send()
-					.await?;
-				let etag = out
-					.copy_part_result()
-					.and_then(|r| r.e_tag())
-					.ok_or(AssembleError::NoEtag("upload_part_copy"))?
-					.to_string();
-				Ok::<_, AssembleError>(
-					CompletedPart::builder()
-						.part_number(part_number)
-						.e_tag(etag)
-						.build(),
-				)
+				.await
 			}
-		}))
-		.buffer_unordered(CHAIN_CONCURRENCY);
+		},
+	))
+	.buffer_unordered(CHAIN_CONCURRENCY);
 
 	futures::pin_mut!(chain_jobs);
 	while let Some(res) = chain_jobs.next().await {
 		final_parts.push(res?);
 	}
+
+	// Join the first chain (its merge-copy part).
+	let first_part = first_handle
+		.await
+		.map_err(|e| AssembleError::BadCrc(format!("first-chain task join: {e}")))??;
+	final_parts.push(first_part);
 
 	// ---- Directory part: last part of the archive MPU (exempt from 5 MiB) ----
 	let dir_part_number = (plan.chains.len() as i32) + 1;
@@ -202,6 +216,45 @@ pub async fn assemble(
 		.await?;
 
 	Ok(())
+}
+
+/// Build a chain object, then copy it into the archive MPU at its pre-assigned slot.
+/// Returns the final-merge CompletedPart. Used for both the first chain (own task) and the
+/// normal chains (bounded pool).
+#[allow(clippy::too_many_arguments)]
+async fn process_chain(
+	s3: &Client,
+	bucket: &str,
+	files_prefix: &str,
+	chain_key: &str,
+	archive_key: &str,
+	archive_upload_id: &str,
+	plan: &Plan,
+	chain: &Chain,
+	stream_sem: &Arc<Semaphore>,
+) -> Result<CompletedPart, AssembleError> {
+	let _etag =
+		build_chain_object(s3, bucket, files_prefix, chain_key, plan, chain, stream_sem).await?;
+	let part_number = chain.final_merge_part_number as i32;
+	let copy_source = format!("{bucket}/{chain_key}");
+	let out = s3
+		.upload_part_copy()
+		.bucket(bucket)
+		.key(archive_key)
+		.upload_id(archive_upload_id)
+		.part_number(part_number)
+		.copy_source(copy_source)
+		.send()
+		.await?;
+	let etag = out
+		.copy_part_result()
+		.and_then(|r| r.e_tag())
+		.ok_or(AssembleError::NoEtag("upload_part_copy"))?
+		.to_string();
+	Ok(CompletedPart::builder()
+		.part_number(part_number)
+		.e_tag(etag)
+		.build())
 }
 
 /// Build one chain object (its own MPU) and return its ETag. Streamed parts GET their

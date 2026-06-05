@@ -128,7 +128,7 @@ Resources:
       FunctionName: !Sub ${ProjectName}-swift-sebsto-soto
       CodeUri: ../contenders/swift/sebsto-soto
       Runtime: provided.al2023
-      MemorySize: 640
+      MemorySize: 512
       Timeout: 600
       Handler: swift.handler
       Architectures:
