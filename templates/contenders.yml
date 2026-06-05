@@ -163,7 +163,7 @@ Resources:
       FunctionName: !Sub ${ProjectName}-c-sebsto
       CodeUri: ../contenders/c/sebsto
       Runtime: provided.al2023
-      MemorySize: 512
+      MemorySize: 640
       Timeout: 600
       Handler: c.handler
       Architectures:
