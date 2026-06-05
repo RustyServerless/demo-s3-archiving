@@ -120,6 +120,21 @@ Resources:
   # copy-paste template for new contenders. Keep it as the last block in
   # this section so newcomers always see a valid registered Lambda.
 
+  # Python / sebsto  (zipfile + boto3, multipart streaming sink, bounded concurrent downloads)
+  PythonSebstoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-python-sebsto
+      CodeUri: ../contenders/python/sebsto
+      Runtime: python3.13
+      # 1024 MB. Bench numbers (10 runs each):
+      #   1024 MB: mean 382 s, max 415 s, run_price $0.005098
+      #    768 MB: mean 488 s, max 527 s, run_price $0.004878 (-4.3%)
+      #    512 MB: OOM at 511/512 MB (boto3 + interpreter resident weight)
+      # 768 MB is marginally cheaper but max approaches the 600 s
+      # timeout; stddev 41 s makes timeout-failure plausible. 1024 MB
+      # is the right tier: comfortable headroom, tight stddev.
+      MemorySize: 1024
   # TypeScript / sebsto  (3-stage download/zip/upload pipeline, Node 22 + AWS SDK v3, esbuild bundle)
   TypescriptSebstoFunction:
     Type: AWS::Serverless::Function
@@ -133,6 +148,10 @@ Resources:
       Architectures:
         - arm64
       Role: !GetAtt LambdaContenderRole.Arn
+  PythonSebstoFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${PythonSebstoFunction}
   TypescriptSebstoFunctionLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -219,6 +238,7 @@ Outputs:
           # >>> INSERT YOUR CONTENDER ARN HERE <<<
           # Append one line per contender, mirroring the resource block you added above:
           #   - !GetAtt <Lang><DevId>Function.Arn
+          - !GetAtt PythonSebstoFunction.Arn
           - !GetAtt TypescriptSebstoFunction.Arn
           - !GetAtt CSebstoFunction.Arn
           - !GetAtt SwiftSebstoSotoFunction.Arn
