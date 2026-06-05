@@ -25,12 +25,13 @@ use crate::engine::header_blob::{HeaderBlob, HeaderRange, build_header_blob};
 use crate::engine::plan::{Chain, ChainPlan, Entry, FileId, LayeredChain, PartSpec, Plan, Segment};
 use crate::engine::zip_format::{self, EntryMeta};
 
-/// Tunables. Stream concurrency saturates the ENI; control concurrency bounds off-ENI calls.
+/// Tunables. Stream concurrency saturates the ENI; layer concurrency bounds off-ENI copies.
 const STREAM_CONCURRENCY: usize = 24;
-const CHAIN_CONCURRENCY: usize = 16;
 const CRC_CONCURRENCY: usize = 64;
 /// Concurrent parts within a single chain (matters for the first chain, ~1,200 parts).
 const PART_CONCURRENCY: usize = 32;
+/// Across-chain concurrency for each layer wave (server-side copies; bound for FD/throttle).
+const LAYER_CONCURRENCY: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssembleError {
@@ -165,50 +166,95 @@ pub async fn assemble(
 		})
 	};
 
-	// Normal chains (1..) in a bounded pool. Each is a layered all-copy recipe: no body or
-	// header crosses the ENI; every part is a server-side UploadPartCopy (bodies from files/,
-	// headers as byte-ranges of H). Only chain 0 is FirstStream, so collect the Layered recipes.
-	let layered: Vec<(usize, LayeredChain)> = plan
+	// Normal chains (1..): layered all-copy recipe, no ENI bytes. Run BY LAYER across all
+	// chains, not per-chain: layer i of every chain is independent of other chains, so each
+	// layer is one wide parallel wave. Within a chain layers are ordered (l2 copies l1, l3
+	// copies l2), so we run wave 1 (all l1s) to completion, then wave 2 (all l2s), then wave 3.
+	let layered: Vec<(u32, Vec<LayerSpec>)> = plan
 		.chains
 		.iter()
 		.enumerate()
 		.skip(1)
 		.filter_map(|(i, c)| match c {
-			ChainPlan::Layered(l) => Some((i, l.clone())),
+			ChainPlan::Layered(l) => {
+				let chain_key = format!("archives/.tmp-chains/{}-{}", archive_basename_s, i);
+				let specs =
+					build_layer_specs(bucket, files_prefix, &chain_key, &h_key, &h_blob, &plan, l);
+				Some((l.final_merge_part_number, specs))
+			}
 			ChainPlan::FirstStream(_) => None,
 		})
 		.collect();
 
-	let chain_jobs = futures::stream::iter(layered.into_iter().map(|(chain_idx, layered)| {
+	let max_layers = layered.iter().map(|(_, s)| s.len()).max().unwrap_or(0);
+	for layer_idx in 0..max_layers {
+		// Collect this layer's (key, parts) from every chain that has a layer at this depth.
+		let wave: Vec<(String, Vec<CopyPart>)> = layered
+			.iter()
+			.filter_map(|(_, specs)| {
+				specs
+					.get(layer_idx)
+					.map(|ls| (ls.key.clone(), ls.parts.iter().map(|p| p.clone()).collect()))
+			})
+			.collect();
+		let n = wave.len();
+		let jobs = futures::stream::iter(wave.into_iter().map(|(key, parts)| {
+			let s3 = s3.clone();
+			let bucket = bucket.to_string();
+			async move { run_copy_mpu(&s3, &bucket, &key, &parts).await }
+		}))
+		.buffer_unordered(LAYER_CONCURRENCY);
+		futures::pin_mut!(jobs);
+		let mut done = 0usize;
+		while let Some(res) = jobs.next().await {
+			res?;
+			done += 1;
+		}
+		tracing::info!(
+			ms = t_chains.elapsed().as_millis(),
+			layer = layer_idx + 1,
+			ops = n,
+			done,
+			"PHASE layer_wave"
+		);
+	}
+
+	// Final wave: merge each chain's final object into the archive at its slot (parallel).
+	let merges: Vec<(u32, String)> = layered
+		.iter()
+		.map(|(pn, specs)| (*pn, specs.last().expect("chain has >=1 layer").key.clone()))
+		.collect();
+	let merge_jobs = futures::stream::iter(merges.into_iter().map(|(part_number, final_key)| {
 		let s3 = s3.clone();
-		let plan = plan.clone();
-		let h_blob = h_blob.clone();
 		let bucket = bucket.to_string();
-		let files_prefix = files_prefix.to_string();
 		let archive_key = archive_key.to_string();
 		let archive_upload_id = archive_upload_id.clone();
-		let h_key = h_key.clone();
-		let chain_key = format!("archives/.tmp-chains/{}-{}", archive_basename_s, chain_idx);
 		async move {
-			process_layered_chain(
-				&s3,
-				&bucket,
-				&files_prefix,
-				&chain_key,
-				&archive_key,
-				&archive_upload_id,
-				&h_key,
-				&h_blob,
-				&plan,
-				&layered,
+			let out = s3
+				.upload_part_copy()
+				.bucket(&bucket)
+				.key(&archive_key)
+				.upload_id(&archive_upload_id)
+				.part_number(part_number as i32)
+				.copy_source(format!("{bucket}/{final_key}"))
+				.send()
+				.await?;
+			let etag = out
+				.copy_part_result()
+				.and_then(|r| r.e_tag())
+				.ok_or(AssembleError::NoEtag("layered merge upload_part_copy"))?
+				.to_string();
+			Ok::<_, AssembleError>(
+				CompletedPart::builder()
+					.part_number(part_number as i32)
+					.e_tag(etag)
+					.build(),
 			)
-			.await
 		}
 	}))
-	.buffer_unordered(CHAIN_CONCURRENCY);
-
-	futures::pin_mut!(chain_jobs);
-	while let Some(res) = chain_jobs.next().await {
+	.buffer_unordered(LAYER_CONCURRENCY);
+	futures::pin_mut!(merge_jobs);
+	while let Some(res) = merge_jobs.next().await {
 		final_parts.push(res?);
 	}
 	tracing::info!(
@@ -312,88 +358,76 @@ async fn process_chain(
 		.build())
 }
 
-/// Realise a normal chain entirely via server-side copies (no ENI bytes), then merge-copy the
-/// result into the archive. The archive fragment is [B][hS][S][hNext]:
-///   layer1: copy B (>=5MiB, non-last) + copy header(small) from H (exempt last)  -> [B][hS]
-///   layer2: copy layer1 (non-last)    + copy body(small) from files/ (exempt last) -> [B][hS][S]
-///   layer3: copy prev (non-last)      + copy header(next_big) from H (exempt last) -> [..][hNext]
-/// Layers with nothing to add are skipped (unpaired big => no hS/S; last chain => no hNext).
-#[allow(clippy::too_many_arguments)]
-async fn process_layered_chain(
-	s3: &Client,
+/// One layer of a chain's build: an output object key and the copy-parts that compose it.
+/// Later layers reference earlier layers' keys, so layers must run in order WITHIN a chain —
+/// but layer i of different chains are independent and run together in a wave.
+struct LayerSpec {
+	key: String,
+	parts: Vec<CopyPart>,
+}
+
+/// Build the ordered layer specs for one layered chain (pure: no awaits, no I/O). The final
+/// chain object is the last layer's key. Variable length: 1 layer (unpaired, last) up to 3.
+fn build_layer_specs(
 	bucket: &str,
 	files_prefix: &str,
 	chain_key: &str,
-	archive_key: &str,
-	archive_upload_id: &str,
 	h_key: &str,
 	h_blob: &HeaderBlob,
 	plan: &Plan,
 	chain: &LayeredChain,
-) -> Result<CompletedPart, AssembleError> {
+) -> Vec<LayerSpec> {
 	let big = &plan.entries[&chain.big];
 	let big_src = format!("{bucket}/{files_prefix}/{}", big.name);
+	let mut layers: Vec<LayerSpec> = Vec::new();
 
-	// layer1: [B] + (header(small) if any)
-	let mut prev = format!("{chain_key}.l1");
-	{
-		let mut parts: Vec<CopyPart> = vec![CopyPart::whole(big_src.clone())];
-		if let Some(sid) = chain.small {
-			parts.push(CopyPart::range(
-				h_source(bucket, h_key),
-				h_blob.ranges[&sid],
-			));
-		}
-		run_copy_mpu(s3, bucket, &prev, &parts).await?;
+	// L1: [B] (+ header(small) if paired)
+	let l1_key = format!("{chain_key}.l1");
+	let mut l1_parts = vec![CopyPart::whole(big_src)];
+	if let Some(sid) = chain.small {
+		l1_parts.push(CopyPart::range(
+			h_source(bucket, h_key),
+			h_blob.ranges[&sid],
+		));
 	}
+	layers.push(LayerSpec {
+		key: l1_key.clone(),
+		parts: l1_parts,
+	});
+	let mut prev_key = l1_key;
 
-	// layer2: [prev] + body(small)  (only if there is a small)
+	// L2: [prev][small body]  (only if paired)
 	if let Some(sid) = chain.small {
 		let small = &plan.entries[&sid];
 		let small_src = format!("{bucket}/{files_prefix}/{}", small.name);
-		let l2 = format!("{chain_key}.l2");
-		let parts = vec![
-			CopyPart::whole(format!("{bucket}/{prev}")),
-			CopyPart::whole(small_src),
-		];
-		run_copy_mpu(s3, bucket, &l2, &parts).await?;
-		prev = l2;
+		let l2_key = format!("{chain_key}.l2");
+		layers.push(LayerSpec {
+			key: l2_key.clone(),
+			parts: vec![
+				CopyPart::whole(format!("{bucket}/{prev_key}")),
+				CopyPart::whole(small_src),
+			],
+		});
+		prev_key = l2_key;
 	}
 
-	// layer3: [prev] + header(next_big)  (only if there is a trailing header)
+	// L3: [prev][header(next_big)]  (only if there's a trailing header)
 	if let Some(nb) = chain.next_big_header {
-		let l3 = format!("{chain_key}.l3");
-		let parts = vec![
-			CopyPart::whole(format!("{bucket}/{prev}")),
-			CopyPart::range(h_source(bucket, h_key), h_blob.ranges[&nb]),
-		];
-		run_copy_mpu(s3, bucket, &l3, &parts).await?;
-		prev = l3;
+		let l3_key = format!("{chain_key}.l3");
+		layers.push(LayerSpec {
+			key: l3_key.clone(),
+			parts: vec![
+				CopyPart::whole(format!("{bucket}/{prev_key}")),
+				CopyPart::range(h_source(bucket, h_key), h_blob.ranges[&nb]),
+			],
+		});
 	}
 
-	// Merge the final chain object into the archive at its slot.
-	let part_number = chain.final_merge_part_number as i32;
-	let out = s3
-		.upload_part_copy()
-		.bucket(bucket)
-		.key(archive_key)
-		.upload_id(archive_upload_id)
-		.part_number(part_number)
-		.copy_source(format!("{bucket}/{prev}"))
-		.send()
-		.await?;
-	let etag = out
-		.copy_part_result()
-		.and_then(|r| r.e_tag())
-		.ok_or(AssembleError::NoEtag("layered merge upload_part_copy"))?
-		.to_string();
-	Ok(CompletedPart::builder()
-		.part_number(part_number)
-		.e_tag(etag)
-		.build())
+	layers
 }
 
 /// A copy-source for one MPU part: a whole object, or a byte range of one.
+#[derive(Clone)]
 struct CopyPart {
 	source: String,
 	range: Option<(u64, u64)>, // (first_byte, last_byte) inclusive, for x-amz-copy-source-range
