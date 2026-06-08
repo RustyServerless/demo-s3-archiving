@@ -8,7 +8,7 @@
 //! directory as the final part and complete. No temp objects, no per-chain MPUs.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
@@ -27,6 +27,10 @@ use crate::engine::zip_format::{self, EntryMeta};
 const STREAM_CONCURRENCY: usize = 32;
 const COPY_CONCURRENCY: usize = 128;
 const CRC_CONCURRENCY: usize = 64;
+/// Max attempts per part/HEAD before giving up. Transient stream breaks and SlowDown/5xx are
+/// retried with exponential backoff + jitter; a re-run is safe because re-uploading a part number
+/// overwrites it and a HEAD is read-only.
+const MAX_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssembleError {
@@ -47,6 +51,57 @@ where
 {
 	fn from(err: aws_sdk_s3::error::SdkError<E, R>) -> Self {
 		AssembleError::S3(err.into())
+	}
+}
+
+/// Is this error worth retrying? Transient stream breaks (a body GET/upload that dropped
+/// mid-transfer) and S3 throttling / 5xx are retryable; missing-etag, bad-CRC and no-upload-id are
+/// deterministic logic errors that won't change on a re-run.
+fn is_retryable(e: &AssembleError) -> bool {
+	match e {
+		AssembleError::ByteStream(_) => true,
+		AssembleError::S3(_) => {
+			let s = e.to_string();
+			s.contains("SlowDown")
+                || s.contains("Throttl") // Throttling / Throttled
+                || s.contains("ServiceUnavailable")
+                || s.contains("Service Unavailable")
+                || s.contains("RequestTimeout")
+                || s.contains("InternalError")
+                || s.contains("(500)")
+                || s.contains("(503)")
+		}
+		_ => false,
+	}
+}
+
+/// Run `op` up to `MAX_ATTEMPTS` times, retrying only transient failures with exponential backoff
+/// (100ms, 200ms, 400ms, … capped at ~3.2s) plus a little jitter to de-synchronise concurrent
+/// retries within the invocation. `op` is re-invoked from scratch each attempt, so it must be
+/// self-contained (rebuild the request, re-GET the bodies); part re-uploads are idempotent.
+async fn with_retry<T, F, Fut>(mut op: F) -> Result<T, AssembleError>
+where
+	F: FnMut() -> Fut,
+	Fut: std::future::Future<Output = Result<T, AssembleError>>,
+{
+	let mut attempt: u32 = 0;
+	loop {
+		match op().await {
+			Ok(v) => return Ok(v),
+			Err(e) => {
+				attempt += 1;
+				if attempt >= MAX_ATTEMPTS || !is_retryable(&e) {
+					return Err(e);
+				}
+				let base_ms = 100u64.saturating_mul(1u64 << (attempt - 1).min(5));
+				// Cheap jitter from the system clock's sub-ms component; no extra deps.
+				let jitter_ms = (std::time::SystemTime::now()
+					.duration_since(std::time::UNIX_EPOCH)
+					.map(|d| d.subsec_micros() as u64)
+					.unwrap_or(0)) % 100;
+				tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
+			}
+		}
 	}
 }
 
@@ -119,31 +174,38 @@ pub async fn assemble(
 			let archive_key = archive_key.to_string();
 			let upload_id = upload_id.clone();
 			async move {
-				let entry = &plan.entries[&id];
-				let source = format!("{bucket}/{files_prefix}/{}", entry.name);
-				let mut req = s3
-					.upload_part_copy()
-					.bucket(&bucket)
-					.key(&archive_key)
-					.upload_id(&upload_id)
-					.part_number(part_number as i32)
-					.copy_source(source);
-				// When a prefix was streamed, copy only the remainder [copy_from, size-1] server-side.
-				if copy_from > 0 {
-					req = req.copy_source_range(format!("bytes={}-{}", copy_from, entry.size - 1));
-				}
-				let out = req.send().await?;
-				let etag = out
-					.copy_part_result()
-					.and_then(|r| r.e_tag())
-					.ok_or(AssembleError::NoEtag("upload_part_copy"))?
-					.to_string();
-				Ok::<_, AssembleError>(
-					CompletedPart::builder()
+				with_retry(|| async {
+					let entry = &plan.entries[&id];
+					let source = format!("{bucket}/{files_prefix}/{}", entry.name);
+					let mut req = s3
+						.upload_part_copy()
+						.bucket(&bucket)
+						.key(&archive_key)
+						.upload_id(&upload_id)
 						.part_number(part_number as i32)
-						.e_tag(etag)
-						.build(),
-				)
+						.copy_source(source);
+					// When a prefix was streamed, copy only the remainder [copy_from, size-1].
+					if copy_from > 0 {
+						req = req.copy_source_range(format!(
+							"bytes={}-{}",
+							copy_from,
+							entry.size - 1
+						));
+					}
+					let out = req.send().await?;
+					let etag = out
+						.copy_part_result()
+						.and_then(|r| r.e_tag())
+						.ok_or(AssembleError::NoEtag("upload_part_copy"))?
+						.to_string();
+					Ok::<_, AssembleError>(
+						CompletedPart::builder()
+							.part_number(part_number as i32)
+							.e_tag(etag)
+							.build(),
+					)
+				})
+				.await
 			}
 		}))
 		.buffer_unordered(COPY_CONCURRENCY);
@@ -156,27 +218,30 @@ pub async fn assemble(
 		let archive_key = archive_key.to_string();
 		let upload_id = upload_id.clone();
 		async move {
-			let bytes =
-				build_stream_part_bytes(&s3, &bucket, &files_prefix, &plan, &segments).await?;
-			let out = s3
-				.upload_part()
-				.bucket(&bucket)
-				.key(&archive_key)
-				.upload_id(&upload_id)
-				.part_number(part_number as i32)
-				.body(ByteStream::from(bytes))
-				.send()
-				.await?;
-			let etag = out
-				.e_tag()
-				.ok_or(AssembleError::NoEtag("upload_part"))?
-				.to_string();
-			Ok::<_, AssembleError>(
-				CompletedPart::builder()
+			with_retry(|| async {
+				let bytes =
+					build_stream_part_bytes(&s3, &bucket, &files_prefix, &plan, &segments).await?;
+				let out = s3
+					.upload_part()
+					.bucket(&bucket)
+					.key(&archive_key)
+					.upload_id(&upload_id)
 					.part_number(part_number as i32)
-					.e_tag(etag)
-					.build(),
-			)
+					.body(ByteStream::from(bytes))
+					.send()
+					.await?;
+				let etag = out
+					.e_tag()
+					.ok_or(AssembleError::NoEtag("upload_part"))?
+					.to_string();
+				Ok::<_, AssembleError>(
+					CompletedPart::builder()
+						.part_number(part_number as i32)
+						.e_tag(etag)
+						.build(),
+				)
+			})
+			.await
 		}
 	}))
 	.buffer_unordered(STREAM_CONCURRENCY);
@@ -326,15 +391,18 @@ async fn fill_crcs(
 			let s3 = s3.clone();
 			let bucket = bucket.to_string();
 			async move {
-				let out = s3
-					.head_object()
-					.bucket(&bucket)
-					.key(&key)
-					.checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
-					.send()
-					.await?;
-				let crc_b64 = out.checksum_crc32().map(ToOwned::to_owned);
-				Ok::<_, AssembleError>((id, crc_b64))
+				with_retry(|| async {
+					let out = s3
+						.head_object()
+						.bucket(&bucket)
+						.key(&key)
+						.checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+						.send()
+						.await?;
+					let crc_b64 = out.checksum_crc32().map(ToOwned::to_owned);
+					Ok::<_, AssembleError>((id, crc_b64))
+				})
+				.await
 			}
 		}))
 		.buffer_unordered(CRC_CONCURRENCY)
