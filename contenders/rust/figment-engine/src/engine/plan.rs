@@ -98,8 +98,11 @@ pub fn plan_single_mpu(files: Vec<SourceFile>) -> SingleRouting {
 	if bigs.is_empty() || total < VIABILITY_MIN_TOTAL {
 		return SingleRouting::Fallback;
 	}
-	// Deterministic order: bigs by id, smalls by id (stable, sizes alone drive structure).
-	bigs.sort_by_key(|f| f.id.0);
+	// Bigs LARGEST-FIRST: the small-byte budget can chaperone only ~N bigs over the floor as
+	// copies; the rest are forced to STREAM. By copying the biggest bigs first, the forced folds
+	// land on the SMALLEST bigs — minimising the big-bytes that cross the ENI. Ties by id for
+	// determinism. Smalls by id (their order only affects batching, not which bigs fold).
+	bigs.sort_by(|a, b| b.size.cmp(&a.size).then(a.id.0.cmp(&b.id.0)));
 	smalls.sort_by_key(|f| f.id.0);
 
 	let mut size_of: HashMap<FileId, (String, u64)> = HashMap::new();
