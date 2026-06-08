@@ -43,7 +43,6 @@ Resources:
                 Resource:
                   - !Sub arn:${AWS::Partition}:s3:::${BucketName}
                   - !Sub arn:${AWS::Partition}:s3:::${BucketName}/${FilesPrefix}/*
-                  - !Sub arn:${AWS::Partition}:s3:::${BucketName}/archives/*
               - Sid: UploadArchive
                 Effect: Allow
                 Action:

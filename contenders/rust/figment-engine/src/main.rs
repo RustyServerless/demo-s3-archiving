@@ -17,7 +17,7 @@ use awssdk_instrumentation::lambda::{LambdaError, LambdaEvent};
 use serde::Deserialize;
 use tracing::{error, info};
 
-use crate::engine::plan::{FileId, Routing, SourceFile, plan};
+use crate::engine::plan::{FileId, SingleRouting, SourceFile, plan_single_mpu};
 
 /// Lambda event payload describing one archiving job.
 #[derive(Debug, Deserialize, Clone)]
@@ -81,17 +81,17 @@ async fn handler(event: LambdaEvent<JobInfo>) -> Result<(), LambdaError> {
 	let files = list_source_files(&bucket_name, &files_prefix).await?;
 	info!(count = files.len(), "listed source files");
 
-	match plan(files) {
-		Routing::CopyPart(p) => {
-			info!(chains = p.chains.len(), "copy-part fast path");
+	match plan_single_mpu(files) {
+		SingleRouting::SingleMpu(p) => {
+			info!(parts = p.parts.len(), "single-MPU fast path");
 			if let Err(e) =
-				aws::assemble::assemble(&s3(), &bucket_name, &archive_key, &files_prefix, p).await
+				aws::assemble::assemble(&s3(), &bucket_name, &files_prefix, &archive_key, p).await
 			{
-				error!(%e, "copy-part assemble failed");
+				error!(%e, "single-MPU assemble failed");
 				return Err(Box::new(e));
 			}
 		}
-		Routing::Fallback => {
+		SingleRouting::Fallback => {
 			info!("streaming fallback path");
 			if let Err(e) =
 				aws::stream_fallback::run(&s3(), &bucket_name, &archive_key, &files_prefix).await

@@ -62,57 +62,190 @@ pub enum PartSpec {
 	},
 }
 
-/// A chain = its own MPU. First chain: all Stream parts (bin-packed; bootstraps entry-0 header).
+/// The single-MPU plan: ONE archive multipart upload whose parts alternate Copy(big) and
+/// Stream(batch-of-smalls), in `parts` order = MPU part numbers 1..=N. No temp objects, no
+/// per-chain MPUs — the entire archive is built directly. Bigs are server-side copies (off-ENI);
+/// smalls are streamed but BATCHED so each non-last stream part clears the 5 MiB floor. Each
+/// big's local header rides the tail of the preceding stream part (trailing-header trick); the
+/// first part is a stream that bootstraps entry-0's header. The final stream part + directory are
+/// floor-exempt.
 #[derive(Debug, Clone)]
-pub struct Chain {
+pub struct SinglePlan {
+	pub order: Vec<FileId>,
+	pub entries: HashMap<FileId, Entry>,
 	pub parts: Vec<PartSpec>,
-	pub final_merge_part_number: u32,
+	pub copyable: Vec<FileId>, // bigs needing a phase-1 CRC HEAD
+	pub stats: PlanStats,
 }
 
-/// A normal chain's layered all-copy recipe. Realised by the assembler as 1-3 sub-MPUs, each
-/// copying the previous layer plus one floor-exempt last part, so NO body crosses the ENI:
-///   layer1: [copy big][copy header(small) from H]        -> [B][hS]      (skip hS if no small)
-///   layer2: [copy layer1][copy body(small) from files/]  -> [B][hS][S]   (skip if no small)
-///   layer3: [copy prev][copy header(next_big) from H]    -> [..][hNext]  (skip if no next)
-/// The big's own header rides the PREVIOUS chain's tail (next_big_header), bootstrapped by the
-/// first chain. Archive fragment = [B][hS][S][hNext], identical bytes to the streamed layout.
-#[derive(Debug, Clone)]
-pub struct LayeredChain {
-	pub big: FileId,
-	pub small: Option<FileId>,
-	pub next_big_header: Option<FileId>,
-	pub final_merge_part_number: u32,
+/// Planner decision summary, for logging on the assembler side (the engine stays tracing-free).
+#[derive(Debug, Clone, Copy)]
+pub struct PlanStats {
+	pub entries: usize,
+	pub parts: usize,
+	pub copy_parts: usize,   // bigs moved server-side (off-ENI)
+	pub stream_parts: usize, // batched stream parts
+	pub folded_bigs: usize,  // bigs forced to STREAM because smalls ran out (on-ENI)
+	pub bigs: usize,
+	pub smalls: usize,
 }
 
-/// A chain in the plan: the first chain streams (bootstraps entry-0 header); every other chain
-/// is a layered all-copy recipe.
-#[derive(Debug, Clone)]
-pub enum ChainPlan {
-	FirstStream(Chain),
-	Layered(LayeredChain),
-}
+/// Build the single-MPU plan, or route to Fallback if the fast path isn't viable.
+pub fn plan_single_mpu(files: Vec<SourceFile>) -> SingleRouting {
+	let (mut bigs, mut smalls): (Vec<SourceFile>, Vec<SourceFile>) =
+		files.into_iter().partition(|f| f.size >= PART_FLOOR);
+	let total: u64 = bigs.iter().chain(smalls.iter()).map(|f| f.size).sum();
+	if bigs.is_empty() || total < VIABILITY_MIN_TOTAL {
+		return SingleRouting::Fallback;
+	}
+	// Deterministic order: bigs by id, smalls by id (stable, sizes alone drive structure).
+	bigs.sort_by_key(|f| f.id.0);
+	smalls.sort_by_key(|f| f.id.0);
 
-impl ChainPlan {
-	pub fn final_merge_part_number(&self) -> u32 {
-		match self {
-			ChainPlan::FirstStream(c) => c.final_merge_part_number,
-			ChainPlan::Layered(l) => l.final_merge_part_number,
+	let mut size_of: HashMap<FileId, (String, u64)> = HashMap::new();
+	for f in bigs.iter().chain(smalls.iter()) {
+		size_of.insert(f.id, (f.name.clone(), f.size));
+	}
+
+	// ----- Build the canonical entry ORDER and the alternating PART list together. -----
+	// Layout (entry order): [hBig0 Big0] [hS S]xK [hBig1 Big1] [hS S]xK ... then leftover smalls.
+	// Part list (MPU order):
+	//   part1 = Stream( hBig0 + first batch of smalls' [hS][S] )   -- bootstraps Big0's header
+	//   part2 = Copy(Big0)
+	//   part3 = Stream( next batch [hS][S] + hBig1 )
+	//   part4 = Copy(Big1)
+	//   ...
+	//   final = Stream( leftover smalls [hS][S] )  -- exempt last part; directory appended after
+	// Smalls are distributed across the stream parts; each non-last stream part must reach
+	// PART_FLOOR (batch ~2+ smalls). The stream part BEFORE Copy(Big_k) carries hBig_k on its tail.
+	let mut order: Vec<FileId> = Vec::new();
+	let mut parts: Vec<PartSpec> = Vec::new();
+	let mut part_number: u32 = 1;
+	let mut small_iter = smalls.iter().peekable();
+
+	// A running stream batch (segments) we flush into a Stream part when it clears the floor or
+	// when we need to hand off a big header.
+	let mut cur_segs: Vec<Segment> = Vec::new();
+	let mut cur_bytes: u64 = 0;
+	// Bigs that ended up STREAMED (folded into a stream part because smalls ran out before the
+	// batch reached the floor) rather than copied. These do NOT need a phase-1 CRC HEAD.
+	let mut streamed_bigs: std::collections::HashSet<FileId> = std::collections::HashSet::new();
+
+	for big in bigs.iter() {
+		// Fill the current stream batch with smalls until it clears the floor (or smalls run out).
+		while cur_bytes < PART_FLOOR {
+			if let Some(s) = small_iter.peek() {
+				let sid = s.id;
+				cur_segs.push(Segment::StreamedFile { id: sid });
+				order.push(sid);
+				let (ref name, sz) = size_of[&sid];
+				cur_bytes += zip_format::local_header_len(name) + sz;
+				small_iter.next();
+			} else {
+				break;
+			}
+		}
+
+		if cur_bytes >= PART_FLOOR {
+			// Normal case: the batch is a valid non-last part. Ride this big's header on its tail
+			// (trailing handoff), flush the stream part, then COPY the big body server-side.
+			cur_segs.push(Segment::CopiedFileHeader { id: big.id });
+			order.push(big.id);
+			parts.push(PartSpec::Stream {
+				part_number,
+				segments: std::mem::take(&mut cur_segs),
+			});
+			part_number += 1;
+			cur_bytes = 0;
+
+			parts.push(PartSpec::Copy {
+				part_number,
+				id: big.id,
+			});
+			part_number += 1;
+		} else {
+			// Smalls ran out before the batch reached the floor: emitting it as a non-last part
+			// would violate the 5 MiB floor. Instead FOLD this big into the batch by STREAMING it
+			// ([hBig][big-body] inline) — the big alone exceeds the floor, so the part is valid.
+			// This costs ENI for the folded big, but only happens once smalls are exhausted
+			// (the tail), so nearly all bigs are still copied off-ENI.
+			cur_segs.push(Segment::StreamedFile { id: big.id });
+			order.push(big.id);
+			streamed_bigs.insert(big.id);
+			parts.push(PartSpec::Stream {
+				part_number,
+				segments: std::mem::take(&mut cur_segs),
+			});
+			part_number += 1;
+			cur_bytes = 0;
 		}
 	}
+
+	// Any leftover smalls go into a final stream part (exempt last part; directory appended after).
+	for s in small_iter {
+		cur_segs.push(Segment::StreamedFile { id: s.id });
+		order.push(s.id);
+	}
+	if !cur_segs.is_empty() {
+		parts.push(PartSpec::Stream {
+			part_number,
+			segments: std::mem::take(&mut cur_segs),
+		});
+	}
+
+	// ----- Offsets + entries from the final order. -----
+	let offsets = compute_offsets(&order, &size_of);
+	let mut entries: HashMap<FileId, Entry> = HashMap::new();
+	let big_ids: std::collections::HashSet<FileId> = bigs.iter().map(|f| f.id).collect();
+	for (i, id) in order.iter().enumerate() {
+		let (name, size) = size_of[id].clone();
+		// Copied iff it's a big that was NOT folded into a stream part.
+		let copied = big_ids.contains(id) && !streamed_bigs.contains(id);
+		entries.insert(
+			*id,
+			Entry {
+				id: *id,
+				name,
+				size,
+				local_header_offset: offsets[i],
+				crc: None,
+				streamed: !copied,
+			},
+		);
+	}
+	// Only copied bigs need a phase-1 CRC HEAD; folded (streamed) bigs self-compute at stream time.
+	let copyable: Vec<FileId> = bigs
+		.iter()
+		.map(|f| f.id)
+		.filter(|id| !streamed_bigs.contains(id))
+		.collect();
+
+	let copy_parts = parts
+		.iter()
+		.filter(|p| matches!(p, PartSpec::Copy { .. }))
+		.count();
+	let stats = PlanStats {
+		entries: order.len(),
+		parts: parts.len(),
+		copy_parts,
+		stream_parts: parts.len() - copy_parts,
+		folded_bigs: streamed_bigs.len(),
+		bigs: bigs.len(),
+		smalls: smalls.len(),
+	};
+
+	SingleRouting::SingleMpu(SinglePlan {
+		order,
+		entries,
+		parts,
+		copyable,
+		stats,
+	})
 }
 
-/// The planner's complete output for the fast path.
 #[derive(Debug, Clone)]
-pub struct Plan {
-	pub order: Vec<FileId>, // canonical ZIP order — source of truth for sequence
-	pub entries: HashMap<FileId, Entry>,
-	pub chains: Vec<ChainPlan>,
-	pub copyable: Vec<FileId>, // need a phase-1 CRC HEAD (chain order)
-}
-
-#[derive(Debug, Clone)]
-pub enum Routing {
-	CopyPart(Plan),
+pub enum SingleRouting {
+	SingleMpu(SinglePlan),
 	Fallback,
 }
 
@@ -130,387 +263,18 @@ fn compute_offsets(order: &[FileId], size_of: &HashMap<FileId, (String, u64)>) -
 		.collect()
 }
 
-/// The planner. Pure, total: `files -> Routing`.
-pub fn plan(files: Vec<SourceFile>) -> Routing {
-	let total: u64 = files.iter().map(|f| f.size).sum();
-
-	// Split copyable (>= floor) vs streamable (< floor).
-	let mut copyable: Vec<SourceFile> = Vec::new();
-	let mut streamable: Vec<SourceFile> = Vec::new();
-	for f in files {
-		if f.size >= PART_FLOOR {
-			copyable.push(f);
-		} else {
-			streamable.push(f);
-		}
-	}
-
-	// Pair each copyable with one streamable -> normal chains. Leftover streamables -> first chain.
-	let mut normal_pairs: Vec<(SourceFile, Option<SourceFile>)> = Vec::new();
-	let mut sq = streamable.into_iter();
-	let mut leftover: Vec<SourceFile> = Vec::new();
-	for big in copyable {
-		match sq.next() {
-			Some(small) => normal_pairs.push((big, Some(small))),
-			None => normal_pairs.push((big, None)),
-		}
-	}
-	leftover.extend(sq);
-
-	// Viability: need >=2 chains (>=1 normal + a first chain), copyable mass, total big enough.
-	// If fewer than 2 normal pairs or total too small, fall back to plain streaming.
-	if normal_pairs.len() < 2 || total < VIABILITY_MIN_TOTAL {
-		return Routing::Fallback;
-	}
-
-	// First chain = leftover streamables (all streamed). If too small / empty, borrow the
-	// smallest normal pair's files (both become streamed members of the first chain).
-	let mut first_chain_files: Vec<SourceFile> = leftover;
-	let first_sum: u64 = first_chain_files.iter().map(|f| f.size).sum();
-	if first_sum < PART_FLOOR {
-		// borrow the pair with the smallest big
-		let idx = normal_pairs
-			.iter()
-			.enumerate()
-			.min_by_key(|(_, (big, _))| big.size)
-			.map(|(i, _)| i)
-			.expect("normal_pairs non-empty (checked >=2)");
-		let (big, small) = normal_pairs.remove(idx);
-		first_chain_files.push(big);
-		if let Some(s) = small {
-			first_chain_files.push(s);
-		}
-	}
-
-	// After a possible borrow we may have dropped below 2 normal pairs; if so, fall back.
-	if normal_pairs.is_empty() {
-		return Routing::Fallback;
-	}
-
-	// --- Build canonical order: first-chain files, then each normal chain's big then small ---
-	let mut order: Vec<FileId> = Vec::new();
-	for f in &first_chain_files {
-		order.push(f.id);
-	}
-	for (big, small) in &normal_pairs {
-		order.push(big.id);
-		if let Some(s) = small {
-			order.push(s.id);
-		}
-	}
-
-	// size/name lookup for offsets + entries
-	let mut size_of: HashMap<FileId, (String, u64)> = HashMap::new();
-	for f in first_chain_files.iter() {
-		size_of.insert(f.id, (f.name.clone(), f.size));
-	}
-	for (big, small) in normal_pairs.iter() {
-		size_of.insert(big.id, (big.name.clone(), big.size));
-		if let Some(s) = small {
-			size_of.insert(s.id, (s.name.clone(), s.size));
-		}
-	}
-
-	let offs = compute_offsets(&order, &size_of);
-
-	// streamed-ness: first-chain files are streamed; normal big = copied, normal small = streamed.
-	let mut streamed: HashMap<FileId, bool> = HashMap::new();
-	for f in &first_chain_files {
-		streamed.insert(f.id, true);
-	}
-	for (big, small) in &normal_pairs {
-		streamed.insert(big.id, false);
-		if let Some(s) = small {
-			streamed.insert(s.id, true);
-		}
-	}
-
-	let mut entries: HashMap<FileId, Entry> = HashMap::new();
-	for (i, id) in order.iter().enumerate() {
-		let (name, size) = size_of[id].clone();
-		entries.insert(
-			*id,
-			Entry {
-				id: *id,
-				name,
-				size,
-				local_header_offset: offs[i],
-				crc: None,
-				streamed: streamed[id],
-			},
-		);
-	}
-
-	// copyable ids needing a CRC HEAD = the normal-chain bigs (copied), in chain order.
-	let copyable_ids: Vec<FileId> = normal_pairs.iter().map(|(b, _)| b.id).collect();
-
-	// --- Build chains with part numbers and trailing-header handoffs ---
-	// First chain (final_merge_part_number = 1): bin-pack streamed files into >= floor parts.
-	// Its tail carries the header for normal chain 1's big.
-	let mut chains: Vec<ChainPlan> = Vec::new();
-
-	let first_big_id = normal_pairs[0].0.id;
-	let first_chain = build_first_chain(&first_chain_files, &size_of, first_big_id);
-	chains.push(ChainPlan::FirstStream(first_chain));
-
-	// Normal chains: layered all-copy recipe. next_big_header carries the FOLLOWING chain's
-	// big header on this chain's tail (None for the last normal chain). small=None for an
-	// unpaired big. The assembler derives the 1-3 layer sequence from these.
-	for (k, (big, small)) in normal_pairs.iter().enumerate() {
-		let next_big = normal_pairs.get(k + 1).map(|(b, _)| b.id);
-		chains.push(ChainPlan::Layered(LayeredChain {
-			big: big.id,
-			small: small.as_ref().map(|s| s.id),
-			next_big_header: next_big,
-			final_merge_part_number: (k as u32) + 2, // first chain is slot 1
-		}));
-	}
-
-	Routing::CopyPart(Plan {
-		order,
-		entries,
-		chains,
-		copyable: copyable_ids,
-	})
-}
-
-/// First chain: all streamed files, bin-packed into >= PART_FLOOR parts (last part exempt),
-/// with the trailing CopiedFileHeader(first_big) appended to the final part.
-fn build_first_chain(
-	files: &[SourceFile],
-	size_of: &HashMap<FileId, (String, u64)>,
-	first_big_id: FileId,
-) -> Chain {
-	let mut parts: Vec<PartSpec> = Vec::new();
-	let mut cur: Vec<Segment> = Vec::new();
-	let mut cur_bytes: u64 = 0;
-	let mut part_number: u32 = 1;
-
-	for f in files {
-		cur.push(Segment::StreamedFile { id: f.id });
-		let (name, size) = &size_of[&f.id];
-		cur_bytes += zip_format::entry_total_len(name, *size);
-		// close the part once it clears the floor, but keep at least one part open for the tail
-		if cur_bytes >= PART_FLOOR {
-			parts.push(PartSpec::Stream {
-				part_number,
-				segments: std::mem::take(&mut cur),
-			});
-			part_number += 1;
-			cur_bytes = 0;
-		}
-	}
-	// append the trailing handoff header to the last (open or new) part — this is the exempt last part
-	cur.push(Segment::CopiedFileHeader { id: first_big_id });
-	parts.push(PartSpec::Stream {
-		part_number,
-		segments: cur,
-	});
-
-	Chain {
-		parts,
-		final_merge_part_number: 1,
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
 
-	fn sf(id: u32, name: &str, size: u64) -> SourceFile {
-		SourceFile {
-			id: FileId(id),
-			key: format!("files/{name}"),
-			name: name.to_string(),
-			size,
-		}
-	}
-
-	#[test]
-	fn tiny_input_routes_to_fallback() {
-		let files = vec![sf(0, "a", 10), sf(1, "b", 20)];
-		assert!(matches!(plan(files), Routing::Fallback));
-	}
-
-	#[test]
-	fn no_copyable_routes_to_fallback() {
-		// all below floor
-		let files = (0..10).map(|i| sf(i, &format!("f{i}"), 1000)).collect();
-		assert!(matches!(plan(files), Routing::Fallback));
-	}
-
-	#[test]
-	fn viable_input_produces_plan_with_first_chain_slot_1() {
-		let big = PART_FLOOR + 100;
-		// 5 copyable => ~25 MiB total, clears viability.
-		let files = vec![
-			sf(0, "big0", big),
-			sf(1, "small1", 1000),
-			sf(2, "big2", big),
-			sf(3, "small3", 1000),
-			sf(4, "big4", big),
-			sf(5, "small5", 2000),
-			sf(6, "big6", big),
-			sf(7, "small7", 3000),
-			sf(8, "big8", big),
-			sf(9, "small9", 4000),
-		];
-		match plan(files) {
-			Routing::CopyPart(p) => {
-				assert_eq!(
-					p.chains[0].final_merge_part_number(),
-					1,
-					"first chain is slot 1"
-				);
-				// every entry has an offset and appears once in order
-				assert_eq!(p.order.len(), p.entries.len());
-				// chain final-merge numbers are 1..=chains.len(), unique & contiguous
-				let mut nums: Vec<u32> = p
-					.chains
-					.iter()
-					.map(|c| c.final_merge_part_number())
-					.collect();
-				nums.sort();
-				assert_eq!(nums, (1..=p.chains.len() as u32).collect::<Vec<_>>());
-			}
-			Routing::Fallback => panic!("expected fast path"),
-		}
-	}
-
-	// The real anchor: plan a set, ASSEMBLE what the plan describes in memory (resolving
-	// copy bodies and streamed bodies from a synthetic store), then run the validator
-	// round-trip (open with zip, extract, SHA256==name, CRC verified).
-	#[cfg(feature = "zip_validate")]
-	#[test]
-	fn planned_archive_passes_validator() {
-		use crate::engine::zip_format::EntryMeta;
-		use sha2::{Digest, Sha256};
-		use std::collections::HashSet;
-		use std::io::{Cursor, Read};
-
-		fn sha256_hex(b: &[u8]) -> String {
-			let mut h = Sha256::new();
-			h.update(b);
-			let d = h.finalize();
-			let mut s = String::with_capacity(64);
-			for x in d {
-				use core::fmt::Write;
-				let _ = write!(s, "{:02x}", x);
-			}
-			s
-		}
-		fn crc32(b: &[u8]) -> u32 {
-			let mut h = crc32fast::Hasher::new();
-			h.update(b);
-			h.finalize()
-		}
-
-		// Synthetic store: content per file; NAME = sha256(content) (like the real objects).
-		// 5 copyable (~5MiB each => ~25MiB total, clears viability) + streamables.
-		// With 5 pairs and zero leftover, the first chain is empty -> exercises the
-		// borrow-smallest-pair branch.
-		let mut contents: Vec<Vec<u8>> = Vec::new();
-		let big = PART_FLOOR as usize + 123;
-		contents.push(vec![1u8; big]); // copyable
-		contents.push(vec![2u8; 1000]); // streamable
-		contents.push(vec![3u8; big]); // copyable
-		contents.push(vec![4u8; 2000]); // streamable
-		contents.push(vec![5u8; big]); // copyable
-		contents.push(vec![6u8; 3000]); // streamable
-		contents.push(vec![7u8; big]); // copyable
-		contents.push(vec![8u8; 4000]); // streamable
-		contents.push(vec![9u8; big]); // copyable
-		contents.push(vec![10u8; 5000]); // streamable
-
-		let names: Vec<String> = contents.iter().map(|c| sha256_hex(c)).collect();
-		let files: Vec<SourceFile> = (0..contents.len())
-			.map(|i| SourceFile {
-				id: FileId(i as u32),
-				key: format!("files/{}", names[i]),
-				name: names[i].clone(),
-				size: contents[i].len() as u64,
-			})
-			.collect();
-
-		let plan = match plan(files) {
-			Routing::CopyPart(p) => p,
-			Routing::Fallback => panic!("expected fast path for this input"),
-		};
-
-		// Fill CRCs for copyable entries (phase 1 stand-in) from the synthetic content.
-		// Build the EntryMeta list in canonical order with offsets from the plan.
-		let by_id = |id: FileId| -> usize { id.0 as usize };
-		let metas: Vec<EntryMeta> = plan
-			.order
-			.iter()
-			.map(|id| {
-				let e = &plan.entries[id];
-				EntryMeta {
-					name: e.name.clone(),
-					size: e.size,
-					crc: crc32(&contents[by_id(*id)]),
-					local_header_offset: e.local_header_offset,
-				}
-			})
-			.collect();
-
-		// Assemble archive bytes in canonical order: [local header][body] per entry.
-		// (We assemble by ENTRY ORDER, which is what the byte layout is; the chain/part
-		//  structure governs HOW bytes get there in AWS, not the final byte sequence.)
-		let mut archive: Vec<u8> = Vec::new();
-		for (e, id) in metas.iter().zip(plan.order.iter()) {
-			archive.extend_from_slice(&zip_format::local_header(e));
-			archive.extend_from_slice(&contents[by_id(*id)]);
-		}
-		let cd_offset = archive.len() as u64;
-		let mut cd_size = 0u64;
-		for e in &metas {
-			let rec = zip_format::central_dir_entry(e);
-			cd_size += rec.len() as u64;
-			archive.extend_from_slice(&rec);
-		}
-		archive.extend_from_slice(&zip_format::end_records(
-			metas.len() as u64,
-			cd_offset,
-			cd_size,
-		));
-
-		// Validate exactly like the control Lambda.
-		let mut expected: HashSet<String> = metas.iter().map(|m| m.name.clone()).collect();
-		let mut za = zip::ZipArchive::new(Cursor::new(&archive))
-			.expect("planned archive must parse with the standard zip reader");
-		assert_eq!(za.len(), metas.len());
-		let arch_names: Vec<String> = za.file_names().map(ToOwned::to_owned).collect();
-		for n in &arch_names {
-			assert!(!n.contains('/'), "flat layout required");
-			assert!(expected.remove(n), "unknown/duplicate {n}");
-		}
-		assert!(expected.is_empty(), "missing entries: {expected:?}");
-		for n in &arch_names {
-			let mut entry = za.by_name(n).unwrap();
-			let mut buf = Vec::new();
-			entry.read_to_end(&mut buf).expect("extract (CRC verified)");
-			assert_eq!(&sha256_hex(&buf), n, "content hash == name");
-		}
-	}
-
 	// ===================================================================================
-	// PRODUCTION-LAYOUT ANCHOR — assemble the way assemble.rs does, then validate.
-	//
-	// The earlier test assembles bytes in canonical ENTRY order. Production instead builds
-	// each CHAIN as its own object (concatenating its PartSpec parts) and then concatenates
-	// the chain objects in final_merge_part_number order, finally appending the directory.
-	// The central directory's offsets are computed from plan.order. THIS TEST PROVES the two
-	// layouts produce identical bytes — i.e. concatenating chain objects in merge order
-	// reproduces the entry-order byte sequence the directory's offsets assume. If they ever
-	// diverge, the archive is invalid even though every other test passes.
-	//
-	// Pure: a synthetic in-memory store maps FileId -> content. No AWS.
-	// Run with: cargo test -p figment-engine --features zip_validate chain_layout_matches
+	// Single-MPU alternating copy/stream-batch layout: build the archive straight from the
+	// part list and validate with the real zip reader. One MPU, no chains, no H blob.
+	// Run with: cargo test -p figment-engine --features zip_validate single_mpu_layout
 	// ===================================================================================
 	#[cfg(feature = "zip_validate")]
 	#[test]
-	fn chain_layout_matches_directory_offsets() {
+	fn single_mpu_layout_matches_directory_offsets() {
 		use crate::engine::zip_format::{self, EntryMeta};
 		use sha2::{Digest, Sha256};
 		use std::collections::HashSet;
@@ -533,22 +297,22 @@ mod tests {
 			h.finalize()
 		}
 
-		// ---- synthetic store: id -> content; name = sha256(content) ----
+		// Mix of bigs (>=floor) and smalls; smalls sized so 2 per batch clears the floor.
 		let big = PART_FLOOR as usize + 77;
+		let small = (PART_FLOOR as usize / 2) + 1000; // two smalls > floor
 		let raw: Vec<Vec<u8>> = vec![
-			vec![1u8; big],   // 0 copyable
-			vec![2u8; 1500],  // 1 streamable
-			vec![3u8; big],   // 2 copyable
-			vec![4u8; 2500],  // 3 streamable
-			vec![5u8; big],   // 4 copyable
-			vec![6u8; 3500],  // 5 streamable
-			vec![7u8; big],   // 6 copyable
-			vec![8u8; 4500],  // 7 streamable
-			vec![9u8; big],   // 8 copyable
-			vec![10u8; 5500], // 9 streamable
+			vec![1u8; big],
+			vec![2u8; small],
+			vec![3u8; small],
+			vec![4u8; big],
+			vec![5u8; small],
+			vec![6u8; small],
+			vec![7u8; big],
+			vec![8u8; small],
+			vec![9u8; small],
+			vec![10u8; small], // odd leftover small -> final stream part
 		];
 		let names: Vec<String> = raw.iter().map(|c| sha256_hex(c)).collect();
-
 		let files: Vec<SourceFile> = (0..raw.len())
 			.map(|i| SourceFile {
 				id: FileId(i as u32),
@@ -558,46 +322,19 @@ mod tests {
 			})
 			.collect();
 
-		let mut plan = match plan(files) {
-			Routing::CopyPart(p) => p,
-			Routing::Fallback => panic!("expected fast path"),
+		let mut plan = match plan_single_mpu(files) {
+			SingleRouting::SingleMpu(p) => p,
+			SingleRouting::Fallback => panic!("expected single-MPU fast path"),
 		};
 
-		// Fill copyable CRCs (phase-1 stand-in) from the synthetic content.
+		// Fill bigs' CRCs (phase-1 stand-in).
 		let ids: Vec<FileId> = plan.copyable.clone();
 		for id in ids {
-			let content = &raw[id.0 as usize];
 			if let Some(e) = plan.entries.get_mut(&id) {
-				e.crc = Some(crc32(content));
+				e.crc = Some(crc32(&raw[id.0 as usize]));
 			}
 		}
 
-		// ---- Build the headers blob H exactly as the assembler will (all entries) ----
-		use crate::engine::header_blob::build_header_blob;
-		let metas: Vec<(FileId, EntryMeta)> = plan
-			.order
-			.iter()
-			.map(|id| {
-				let e = &plan.entries[id];
-				let crc = e.crc.unwrap_or_else(|| crc32(&raw[id.0 as usize]));
-				(
-					*id,
-					EntryMeta {
-						name: e.name.clone(),
-						size: e.size,
-						crc,
-						local_header_offset: e.local_header_offset,
-					},
-				)
-			})
-			.collect();
-		let (h_bytes, h_blob) = build_header_blob(metas);
-		// header bytes for id, sourced from H by byte-range (what the assembler copies).
-		let h_range = |id: FileId| -> Vec<u8> {
-			let r = h_blob.ranges[&id];
-			h_bytes[r.offset as usize..r.end() as usize].to_vec()
-		};
-		// Streamed (inline) header for first-chain files — same bytes, computed locally.
 		let header_bytes = |id: FileId| -> Vec<u8> {
 			let e = &plan.entries[&id];
 			let crc = e.crc.unwrap_or_else(|| crc32(&raw[id.0 as usize]));
@@ -609,78 +346,57 @@ mod tests {
 			})
 		};
 
-		// ---- Build each chain object the PRODUCTION way ----
-		// FirstStream: concat its parts (StreamedFile => [header][body], CopiedFileHeader => [header]).
-		// Layered:     [B][hS][S][hNext], with hS/hNext copied as byte-ranges of H, B/S as bodies.
-		//              (skip hS/S if no small; skip hNext if last normal chain) — exactly the
-		//              1-3 layer sequence the assembler will run, but the RESULT bytes are what
-		//              we validate here.
-		let mut chain_objs: Vec<(u32, Vec<u8>)> = Vec::new();
-		for chain in &plan.chains {
-			let mut obj: Vec<u8> = Vec::new();
-			match chain {
-				ChainPlan::FirstStream(c) => {
-					for part in &c.parts {
-						match part {
-							PartSpec::Copy { id, .. } => {
-								obj.extend_from_slice(&raw[id.0 as usize]);
+		// ---- Build the archive straight from the part list (MPU part order). ----
+		// Copy(id) => [body]; Stream(segments) => StreamedFile => [header][body],
+		// CopiedFileHeader => [header] (the trailing big-header handoff).
+		let mut archive: Vec<u8> = Vec::new();
+		// Verify every non-last part clears the floor (last part exempt).
+		let nparts = plan.parts.len();
+		for (pi, part) in plan.parts.iter().enumerate() {
+			let before = archive.len();
+			match part {
+				PartSpec::Copy { id, .. } => {
+					archive.extend_from_slice(&raw[id.0 as usize]);
+				}
+				PartSpec::Stream { segments, .. } => {
+					for seg in segments {
+						match seg {
+							Segment::StreamedFile { id } => {
+								archive.extend_from_slice(&header_bytes(*id));
+								archive.extend_from_slice(&raw[id.0 as usize]);
 							}
-							PartSpec::Stream { segments, .. } => {
-								for seg in segments {
-									match seg {
-										Segment::StreamedFile { id } => {
-											obj.extend_from_slice(&header_bytes(*id));
-											obj.extend_from_slice(&raw[id.0 as usize]);
-										}
-										Segment::CopiedFileHeader { id } => {
-											obj.extend_from_slice(&header_bytes(*id));
-										}
-									}
-								}
+							Segment::CopiedFileHeader { id } => {
+								archive.extend_from_slice(&header_bytes(*id));
 							}
 						}
 					}
-					chain_objs.push((c.final_merge_part_number, obj));
-				}
-				ChainPlan::Layered(l) => {
-					// [B]
-					obj.extend_from_slice(&raw[l.big.0 as usize]);
-					// [hS][S]
-					if let Some(s) = l.small {
-						obj.extend_from_slice(&h_range(s)); // small's header from H
-						obj.extend_from_slice(&raw[s.0 as usize]); // small body
-					}
-					// [hNext] — next chain's big header rides this tail
-					if let Some(nb) = l.next_big_header {
-						obj.extend_from_slice(&h_range(nb));
-					}
-					chain_objs.push((l.final_merge_part_number, obj));
 				}
 			}
-		}
-		// Concatenate chain objects in merge-part-number order (the archive's entry region).
-		chain_objs.sort_by_key(|(n, _)| *n);
-		let mut archive: Vec<u8> = Vec::new();
-		for (_, obj) in &chain_objs {
-			archive.extend_from_slice(obj);
+			let part_len = (archive.len() - before) as u64;
+			if pi + 1 < nparts {
+				assert!(
+					part_len >= PART_FLOOR,
+					"non-last part {} is {} bytes, below the 5 MiB floor",
+					pi + 1,
+					part_len
+				);
+			}
 		}
 
-		// ---- Append the central directory + end records, exactly like build_central_directory ----
+		// ---- Append central directory + end records. ----
 		let mut cd_offset = 0u64;
 		for id in &plan.order {
 			let e = &plan.entries[id];
 			cd_offset += zip_format::entry_total_len(&e.name, e.size);
 		}
-		// sanity: the entry region we built by concatenating chains must equal cd_offset
 		assert_eq!(
 			archive.len() as u64,
 			cd_offset,
-			"chain-concatenated entry region ({}) != directory's cd_offset ({}). \
-             Chain/merge layout disagrees with plan.order offsets — archive would be invalid.",
+			"single-MPU entry region ({}) != directory cd_offset ({}); part layout disagrees \
+             with plan.order offsets",
 			archive.len(),
 			cd_offset
 		);
-
 		let mut cd_size = 0u64;
 		for id in &plan.order {
 			let e = &plan.entries[id];
@@ -700,14 +416,14 @@ mod tests {
 			cd_size,
 		));
 
-		// ---- Validate exactly like the control Lambda ----
+		// ---- Validate with the standard zip reader. ----
 		let mut expected: HashSet<String> = plan
 			.order
 			.iter()
 			.map(|id| plan.entries[id].name.clone())
 			.collect();
 		let mut za = zip::ZipArchive::new(Cursor::new(&archive))
-			.expect("production-layout archive must parse with the standard zip reader");
+			.expect("single-MPU archive must parse with the standard zip reader");
 		assert_eq!(za.len(), plan.order.len());
 		let arch_names: Vec<String> = za.file_names().map(ToOwned::to_owned).collect();
 		for n in &arch_names {
@@ -723,5 +439,151 @@ mod tests {
 				.expect("extract (CRC verified by reader)");
 			assert_eq!(&sha256_hex(&buf), n, "content hash == name");
 		}
+	}
+
+	// Smalls run out while bigs remain: the remaining bigs must be FOLDED into stream parts
+	// (streamed, not copied) so no undersized non-last part is emitted. Many bigs, few smalls.
+	#[cfg(feature = "zip_validate")]
+	#[test]
+	fn single_mpu_handles_smalls_exhausted_early() {
+		use crate::engine::zip_format::{self, EntryMeta};
+		use sha2::{Digest, Sha256};
+		use std::collections::HashSet;
+		use std::io::{Cursor, Read};
+
+		fn sha256_hex(b: &[u8]) -> String {
+			let mut h = Sha256::new();
+			h.update(b);
+			let d = h.finalize();
+			let mut s = String::with_capacity(64);
+			for x in d {
+				use core::fmt::Write;
+				let _ = write!(s, "{:02x}", x);
+			}
+			s
+		}
+		fn crc32(b: &[u8]) -> u32 {
+			let mut h = crc32fast::Hasher::new();
+			h.update(b);
+			h.finalize()
+		}
+
+		let big = PART_FLOOR as usize + 77;
+		let small = (PART_FLOOR as usize / 2) + 1000;
+		// 6 bigs, only 2 smalls — smalls exhaust after the first big's batch; bigs 1..5 must fold.
+		let raw: Vec<Vec<u8>> = vec![
+			vec![1u8; big],
+			vec![2u8; small],
+			vec![3u8; small],
+			vec![4u8; big],
+			vec![5u8; big],
+			vec![6u8; big],
+			vec![7u8; big],
+			vec![8u8; big],
+		];
+		let names: Vec<String> = raw.iter().map(|c| sha256_hex(c)).collect();
+		let files: Vec<SourceFile> = (0..raw.len())
+			.map(|i| SourceFile {
+				id: FileId(i as u32),
+				key: format!("files/{}", names[i]),
+				name: names[i].clone(),
+				size: raw[i].len() as u64,
+			})
+			.collect();
+
+		let mut plan = match plan_single_mpu(files) {
+			SingleRouting::SingleMpu(p) => p,
+			SingleRouting::Fallback => panic!("expected single-MPU fast path"),
+		};
+		let ids: Vec<FileId> = plan.copyable.clone();
+		for id in ids {
+			if let Some(e) = plan.entries.get_mut(&id) {
+				e.crc = Some(crc32(&raw[id.0 as usize]));
+			}
+		}
+
+		let header_bytes = |id: FileId| -> Vec<u8> {
+			let e = &plan.entries[&id];
+			let crc = e.crc.unwrap_or_else(|| crc32(&raw[id.0 as usize]));
+			zip_format::local_header(&EntryMeta {
+				name: e.name.clone(),
+				size: e.size,
+				crc,
+				local_header_offset: e.local_header_offset,
+			})
+		};
+
+		let mut archive: Vec<u8> = Vec::new();
+		let nparts = plan.parts.len();
+		for (pi, part) in plan.parts.iter().enumerate() {
+			let before = archive.len();
+			match part {
+				PartSpec::Copy { id, .. } => archive.extend_from_slice(&raw[id.0 as usize]),
+				PartSpec::Stream { segments, .. } => {
+					for seg in segments {
+						match seg {
+							Segment::StreamedFile { id } => {
+								archive.extend_from_slice(&header_bytes(*id));
+								archive.extend_from_slice(&raw[id.0 as usize]);
+							}
+							Segment::CopiedFileHeader { id } => {
+								archive.extend_from_slice(&header_bytes(*id));
+							}
+						}
+					}
+				}
+			}
+			let part_len = (archive.len() - before) as u64;
+			if pi + 1 < nparts {
+				assert!(
+					part_len >= PART_FLOOR,
+					"non-last part {} is {} bytes, below floor (smalls-exhausted path)",
+					pi + 1,
+					part_len
+				);
+			}
+		}
+
+		let mut cd_offset = 0u64;
+		for id in &plan.order {
+			let e = &plan.entries[id];
+			cd_offset += zip_format::entry_total_len(&e.name, e.size);
+		}
+		assert_eq!(archive.len() as u64, cd_offset, "entry region != cd_offset");
+		let mut cd_size = 0u64;
+		for id in &plan.order {
+			let e = &plan.entries[id];
+			let crc = e.crc.unwrap_or_else(|| crc32(&raw[id.0 as usize]));
+			let rec = zip_format::central_dir_entry(&EntryMeta {
+				name: e.name.clone(),
+				size: e.size,
+				crc,
+				local_header_offset: e.local_header_offset,
+			});
+			cd_size += rec.len() as u64;
+			archive.extend_from_slice(&rec);
+		}
+		archive.extend_from_slice(&zip_format::end_records(
+			plan.order.len() as u64,
+			cd_offset,
+			cd_size,
+		));
+
+		let mut expected: HashSet<String> = plan
+			.order
+			.iter()
+			.map(|id| plan.entries[id].name.clone())
+			.collect();
+		let mut za = zip::ZipArchive::new(Cursor::new(&archive))
+			.expect("smalls-exhausted archive must parse");
+		assert_eq!(za.len(), plan.order.len());
+		for n in za.file_names().map(ToOwned::to_owned).collect::<Vec<_>>() {
+			assert!(expected.remove(&n), "unknown/duplicate {n}");
+			let mut entry = za.by_name(&n).unwrap();
+			let mut buf = Vec::new();
+			entry.read_to_end(&mut buf).expect("extract");
+			assert_eq!(&sha256_hex(&buf), &n, "content hash == name");
+		}
+		assert!(expected.is_empty(), "missing entries: {expected:?}");
 	}
 }
