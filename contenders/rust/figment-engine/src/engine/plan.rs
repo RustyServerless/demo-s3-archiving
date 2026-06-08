@@ -48,13 +48,30 @@ pub enum Segment {
 	StreamedFile { id: FileId },
 	/// A standalone local header for a COPIED file (the trailing-header handoff). No body here.
 	CopiedFileHeader { id: FileId },
+	/// The first `len` body bytes of a big, streamed (ranged GET) immediately after that big's
+	/// `CopiedFileHeader`, to lift this stream part over the 5 MiB floor. The remainder of the
+	/// big's body (`[len..]`) is moved server-side by a following ranged `Copy`. Physically
+	/// contiguous in part-number order, so the big reads back as one `[header][body]`.
+	StreamedBigPrefix { id: FileId, len: u64 },
+	/// The central directory + ZIP64 end records. Always the LAST segment of the LAST part, so the
+	/// directory rides inside the final MPU part rather than being a separate trailing part. This
+	/// makes that final part the genuine last part (floor-exempt), so leftover sub-floor smalls
+	/// placed alongside it need not independently clear the 5 MiB floor. Expanded by the assembler
+	/// (it needs every entry's offset + CRC), so it carries no bytes in the plan itself.
+	CentralDirectory,
 }
 
 /// One MPU part within a chain.
 #[derive(Debug, Clone)]
 pub enum PartSpec {
-	/// Big body moved server-side. Off-ENI.
-	Copy { part_number: u32, id: FileId },
+	/// Big body moved server-side. Off-ENI. `copy_from` is the byte offset into the source object
+	/// where the copy starts (0 = whole body; >0 = the `[copy_from..]` remainder after a
+	/// `StreamedBigPrefix` streamed the first `copy_from` bytes). Copies the source to its end.
+	Copy {
+		part_number: u32,
+		id: FileId,
+		copy_from: u64,
+	},
 	/// Lambda-materialised bytes. On-ENI (GETs) + upload.
 	Stream {
 		part_number: u32,
@@ -83,9 +100,10 @@ pub struct SinglePlan {
 pub struct PlanStats {
 	pub entries: usize,
 	pub parts: usize,
-	pub copy_parts: usize,   // bigs moved server-side (off-ENI)
+	pub copy_parts: usize, // bigs moved server-side (off-ENI), incl. ranged remainders
 	pub stream_parts: usize, // batched stream parts
-	pub folded_bigs: usize,  // bigs forced to STREAM because smalls ran out (on-ENI)
+	pub folded_bigs: usize, // bigs forced to STREAM whole (on-ENI) — smalls gone & too small to donate
+	pub stolen_bigs: usize, // bigs copied via ranged remainder after donating a floor-bridging prefix
 	pub bigs: usize,
 	pub smalls: usize,
 }
@@ -98,12 +116,12 @@ pub fn plan_single_mpu(files: Vec<SourceFile>) -> SingleRouting {
 	if bigs.is_empty() || total < VIABILITY_MIN_TOTAL {
 		return SingleRouting::Fallback;
 	}
-	// Bigs LARGEST-FIRST: the small-byte budget can chaperone only ~N bigs over the floor as
-	// copies; the rest are forced to STREAM. By copying the biggest bigs first, the forced folds
-	// land on the SMALLEST bigs — minimising the big-bytes that cross the ENI. Ties by id for
-	// determinism. Smalls in opposite order (smallest first) so we pair smallest with biggest.
-	bigs.sort_by(|a, b| b.size.cmp(&a.size).then(a.id.0.cmp(&b.id.0))); // descending
-	smalls.sort_by(|a, b| a.size.cmp(&b.size).then(a.id.0.cmp(&b.id.0))); // ascending
+	// Bigs LARGEST-FIRST: forced folds/floor-huggers land on the SMALLEST bigs (cheapest to
+	// stream). Smalls SMALLEST-FIRST: paired against the biggest bigs, which can donate the most
+	// toward the floor — so a single small + a small steal bridges a part, stretching the small
+	// budget across as many bigs as possible. Ties by id for determinism.
+	bigs.sort_by(|a, b| b.size.cmp(&a.size).then(a.id.0.cmp(&b.id.0)));
+	smalls.sort_by(|a, b| a.size.cmp(&b.size).then(a.id.0.cmp(&b.id.0)));
 
 	let mut size_of: HashMap<FileId, (String, u64)> = HashMap::new();
 	for f in bigs.iter().chain(smalls.iter()) {
@@ -126,33 +144,67 @@ pub fn plan_single_mpu(files: Vec<SourceFile>) -> SingleRouting {
 	let mut part_number: u32 = 1;
 	let mut small_iter = smalls.iter().peekable();
 
-	// A running stream batch (segments) we flush into a Stream part when it clears the floor or
-	// when we need to hand off a big header.
+	// A running stream batch (segments) we flush into a Stream part when it clears the floor.
 	let mut cur_segs: Vec<Segment> = Vec::new();
 	let mut cur_bytes: u64 = 0;
-	// Bigs that ended up STREAMED (folded into a stream part because smalls ran out before the
-	// batch reached the floor) rather than copied. These do NOT need a phase-1 CRC HEAD.
+	// Bigs STREAMED whole (folded) because smalls ran out AND the big was too small to self-donate
+	// a floor-bridging prefix. These do NOT need a phase-1 CRC HEAD beyond what every entry gets.
 	let mut streamed_bigs: std::collections::HashSet<FileId> = std::collections::HashSet::new();
+	let mut stolen_count: usize = 0;
 
 	for big in bigs.iter() {
-		// Fill the current stream batch with smalls until it clears the floor (or smalls run out).
-		while cur_bytes < PART_FLOOR {
-			if let Some(s) = small_iter.peek() {
-				let sid = s.id;
+		let header_big = zip_format::local_header_len(&size_of[&big.id].0);
+		let max_steal = big.size.saturating_sub(PART_FLOOR); // keep ranged remainder >= floor
+
+		// Pull smalls one at a time, but only until the remaining gap to the floor is small enough
+		// to bridge with a steal from THIS big. This spends the minimum smalls per chaperone part,
+		// stretching the small budget across as many bigs as possible. A floor-hugging big
+		// (max_steal ~0) can't bridge, so we keep pulling smalls until the batch clears outright.
+		// Smalls must cross the ENI regardless, so we consume at least one (when available) before
+		// resorting to a steal — otherwise a huge big would self-steal a full prefix while smalls
+		// sit unused and get dumped (wastefully) into the final part.
+		let mut pulled_small = false;
+		loop {
+			let with_header = cur_bytes + header_big;
+			if with_header >= PART_FLOOR {
+				break; // header alone clears the floor (K = 0, full copy)
+			}
+			let gap = PART_FLOOR - with_header;
+			let smalls_left = small_iter.peek().is_some();
+			if gap <= max_steal && pulled_small {
+				break; // gap is bridgeable by a steal AND we've already streamed a small here
+			}
+			if smalls_left {
+				let sid = small_iter.next().unwrap().id;
 				cur_segs.push(Segment::StreamedFile { id: sid });
 				order.push(sid);
 				let (ref name, sz) = size_of[&sid];
 				cur_bytes += zip_format::local_header_len(name) + sz;
-				small_iter.next();
+				pulled_small = true;
 			} else {
-				break;
+				break; // smalls exhausted; decide steal-vs-fold below
 			}
 		}
 
-		if cur_bytes >= PART_FLOOR {
-			// Normal case: the batch is a valid non-last part. Ride this big's header on its tail
-			// (trailing handoff), flush the stream part, then COPY the big body server-side.
+		let with_header = cur_bytes + header_big;
+		// Steal only to bridge a part that ALREADY contains a small. With no small pulled (smalls
+		// exhausted), k stays 0 and the big folds below — we never steal from a big without first
+		// streaming a small into its part.
+		let k = if pulled_small {
+			PART_FLOOR.saturating_sub(with_header).min(max_steal)
+		} else {
+			0
+		};
+
+		if with_header + k >= PART_FLOOR {
+			// The stream part (batch + big header + optional stolen prefix) clears the floor.
+			// Ride the big's header on the tail; if k>0, also stream its first k body bytes; then
+			// COPY the remainder server-side (ranged when k>0, full when k==0).
 			cur_segs.push(Segment::CopiedFileHeader { id: big.id });
+			if k > 0 {
+				cur_segs.push(Segment::StreamedBigPrefix { id: big.id, len: k });
+				stolen_count += 1;
+			}
 			order.push(big.id);
 			parts.push(PartSpec::Stream {
 				part_number,
@@ -164,14 +216,12 @@ pub fn plan_single_mpu(files: Vec<SourceFile>) -> SingleRouting {
 			parts.push(PartSpec::Copy {
 				part_number,
 				id: big.id,
+				copy_from: k,
 			});
 			part_number += 1;
 		} else {
-			// Smalls ran out before the batch reached the floor: emitting it as a non-last part
-			// would violate the 5 MiB floor. Instead FOLD this big into the batch by STREAMING it
-			// ([hBig][big-body] inline) — the big alone exceeds the floor, so the part is valid.
-			// This costs ENI for the folded big, but only happens once smalls are exhausted
-			// (the tail), so nearly all bigs are still copied off-ENI.
+			// Smalls exhausted and the big can't donate enough to clear the floor (floor-hugger).
+			// FOLD it: stream [hBig][big-body] inline — the big alone exceeds the floor, so valid.
 			cur_segs.push(Segment::StreamedFile { id: big.id });
 			order.push(big.id);
 			streamed_bigs.insert(big.id);
@@ -184,17 +234,19 @@ pub fn plan_single_mpu(files: Vec<SourceFile>) -> SingleRouting {
 		}
 	}
 
-	// Any leftover smalls go into a final stream part (exempt last part; directory appended after).
+	// The FINAL part: any leftover smalls, then the central directory as the last segment. Because
+	// the directory rides here, THIS is the last MPU part (floor-exempt) — so sub-floor leftover
+	// smalls need not clear the floor. (cur_segs is empty here: the loop flushes its batch into a
+	// Stream part on every big, so nothing is left mid-batch.)
 	for s in small_iter {
 		cur_segs.push(Segment::StreamedFile { id: s.id });
 		order.push(s.id);
 	}
-	if !cur_segs.is_empty() {
-		parts.push(PartSpec::Stream {
-			part_number,
-			segments: std::mem::take(&mut cur_segs),
-		});
-	}
+	cur_segs.push(Segment::CentralDirectory);
+	parts.push(PartSpec::Stream {
+		part_number,
+		segments: std::mem::take(&mut cur_segs),
+	});
 
 	// ----- Offsets + entries from the final order. -----
 	let offsets = compute_offsets(&order, &size_of);
@@ -233,6 +285,7 @@ pub fn plan_single_mpu(files: Vec<SourceFile>) -> SingleRouting {
 		copy_parts,
 		stream_parts: parts.len() - copy_parts,
 		folded_bigs: streamed_bigs.len(),
+		stolen_bigs: stolen_count,
 		bigs: bigs.len(),
 		smalls: smalls.len(),
 	};
@@ -271,105 +324,148 @@ mod tests {
 	use super::*;
 
 	// ===================================================================================
-	// Single-MPU alternating copy/stream-batch layout: build the archive straight from the
-	// part list and validate with the real zip reader. One MPU, no chains, no H blob.
-	// Run with: cargo test -p figment-engine --features zip_validate single_mpu_layout
+	// Single-MPU alternating copy / stream-batch / steal layout. Each test builds the archive
+	// straight from the part list (exactly as the assembler would) via `assemble_and_validate`,
+	// then validates with the real zip reader. One MPU, no chains, no H blob.
+	// Run with: cargo test -p figment-engine --features zip_validate single_mpu
 	// ===================================================================================
+
 	#[cfg(feature = "zip_validate")]
-	#[test]
-	fn single_mpu_layout_matches_directory_offsets() {
-		use crate::engine::zip_format::{self, EntryMeta};
+	fn crc32(b: &[u8]) -> u32 {
+		let mut h = crc32fast::Hasher::new();
+		h.update(b);
+		h.finalize()
+	}
+
+	#[cfg(feature = "zip_validate")]
+	fn sha256_hex(b: &[u8]) -> String {
 		use sha2::{Digest, Sha256};
-		use std::collections::HashSet;
-		use std::io::{Cursor, Read};
-
-		fn sha256_hex(b: &[u8]) -> String {
-			let mut h = Sha256::new();
-			h.update(b);
-			let d = h.finalize();
-			let mut s = String::with_capacity(64);
-			for x in d {
-				use core::fmt::Write;
-				let _ = write!(s, "{:02x}", x);
-			}
-			s
+		let mut h = Sha256::new();
+		h.update(b);
+		let d = h.finalize();
+		let mut s = String::with_capacity(64);
+		for x in d {
+			use core::fmt::Write;
+			let _ = write!(s, "{:02x}", x);
 		}
-		fn crc32(b: &[u8]) -> u32 {
-			let mut h = crc32fast::Hasher::new();
-			h.update(b);
-			h.finalize()
-		}
+		s
+	}
 
-		// Mix of bigs (>=floor) and smalls; smalls sized so 2 per batch clears the floor.
-		let big = PART_FLOOR as usize + 77;
-		let small = (PART_FLOOR as usize / 2) + 1000; // two smalls > floor
-		let raw: Vec<Vec<u8>> = vec![
-			vec![1u8; big],
-			vec![2u8; small],
-			vec![3u8; small],
-			vec![4u8; big],
-			vec![5u8; small],
-			vec![6u8; small],
-			vec![7u8; big],
-			vec![8u8; small],
-			vec![9u8; small],
-			vec![10u8; small], // odd leftover small -> final stream part
-		];
-		let names: Vec<String> = raw.iter().map(|c| sha256_hex(c)).collect();
-		let files: Vec<SourceFile> = (0..raw.len())
-			.map(|i| SourceFile {
-				id: FileId(i as u32),
-				key: format!("files/{}", names[i]),
-				name: names[i].clone(),
-				size: raw[i].len() as u64,
+	// Build SourceFiles from raw blobs. Each file's NAME is the sha256 of its content, so the zip
+	// reader's extracted-content hash must equal the entry name — a self-checking fixture.
+	#[cfg(feature = "zip_validate")]
+	fn files_from_raw(raw: &[Vec<u8>]) -> Vec<SourceFile> {
+		(0..raw.len())
+			.map(|i| {
+				let name = sha256_hex(&raw[i]);
+				SourceFile {
+					id: FileId(i as u32),
+					key: format!("files/{name}"),
+					name,
+					size: raw[i].len() as u64,
+				}
 			})
-			.collect();
+			.collect()
+	}
 
-		let mut plan = match plan_single_mpu(files) {
+	#[cfg(feature = "zip_validate")]
+	fn plan_or_panic(raw: &[Vec<u8>]) -> SinglePlan {
+		match plan_single_mpu(files_from_raw(raw)) {
 			SingleRouting::SingleMpu(p) => p,
 			SingleRouting::Fallback => panic!("expected single-MPU fast path"),
-		};
+		}
+	}
 
-		// Fill bigs' CRCs (phase-1 stand-in).
-		let ids: Vec<FileId> = plan.copyable.clone();
-		for id in ids {
+	// Phase-1 stand-in: fill CRCs for the copyable (server-side-copied) bigs from raw content.
+	// Streamed entries (smalls, folded bigs) self-compute their CRC in the harness below.
+	#[cfg(feature = "zip_validate")]
+	fn fill_crcs_from_raw(plan: &mut SinglePlan, raw: &[Vec<u8>]) {
+		for id in plan.copyable.clone() {
 			if let Some(e) = plan.entries.get_mut(&id) {
 				e.crc = Some(crc32(&raw[id.0 as usize]));
 			}
 		}
+	}
 
-		let header_bytes = |id: FileId| -> Vec<u8> {
+	// Realise the plan's parts into archive bytes exactly as the assembler does, expanding the
+	// CentralDirectory segment inline. Asserts: every non-last part clears the 5 MiB floor; the
+	// directory is the LAST segment of the LAST part; the entry region ends exactly at cd_offset;
+	// and the result parses + extracts cleanly under the standard zip reader (CRCs verified).
+	#[cfg(feature = "zip_validate")]
+	fn assemble_and_validate(plan: &SinglePlan, raw: &[Vec<u8>]) {
+		use crate::engine::zip_format::{self, EntryMeta};
+		use std::collections::HashSet;
+		use std::io::{Cursor, Read};
+
+		let meta = |id: FileId| -> EntryMeta {
 			let e = &plan.entries[&id];
 			let crc = e.crc.unwrap_or_else(|| crc32(&raw[id.0 as usize]));
-			zip_format::local_header(&EntryMeta {
+			EntryMeta {
 				name: e.name.clone(),
 				size: e.size,
 				crc,
 				local_header_offset: e.local_header_offset,
-			})
+			}
 		};
 
-		// ---- Build the archive straight from the part list (MPU part order). ----
-		// Copy(id) => [body]; Stream(segments) => StreamedFile => [header][body],
-		// CopiedFileHeader => [header] (the trailing big-header handoff).
+		let mut cd_offset = 0u64;
+		for id in &plan.order {
+			let e = &plan.entries[id];
+			cd_offset += zip_format::entry_total_len(&e.name, e.size);
+		}
+		let build_directory = || -> Vec<u8> {
+			let mut out = Vec::new();
+			let mut cd_size = 0u64;
+			for id in &plan.order {
+				let rec = zip_format::central_dir_entry(&meta(*id));
+				cd_size += rec.len() as u64;
+				out.extend_from_slice(&rec);
+			}
+			out.extend_from_slice(&zip_format::end_records(
+				plan.order.len() as u64,
+				cd_offset,
+				cd_size,
+			));
+			out
+		};
+
 		let mut archive: Vec<u8> = Vec::new();
-		// Verify every non-last part clears the floor (last part exempt).
+		let mut saw_directory = false;
 		let nparts = plan.parts.len();
 		for (pi, part) in plan.parts.iter().enumerate() {
 			let before = archive.len();
 			match part {
-				PartSpec::Copy { id, .. } => {
-					archive.extend_from_slice(&raw[id.0 as usize]);
+				PartSpec::Copy { id, copy_from, .. } => {
+					archive.extend_from_slice(&raw[id.0 as usize][*copy_from as usize..]);
 				}
 				PartSpec::Stream { segments, .. } => {
 					for seg in segments {
 						match seg {
 							Segment::StreamedFile { id } => {
-								archive.extend_from_slice(&header_bytes(*id));
+								archive.extend_from_slice(&zip_format::local_header(&meta(*id)));
 								archive.extend_from_slice(&raw[id.0 as usize]);
 							}
 							Segment::CopiedFileHeader { id } => {
-								archive.extend_from_slice(&header_bytes(*id));
+								archive.extend_from_slice(&zip_format::local_header(&meta(*id)));
+							}
+							Segment::StreamedBigPrefix { id, len } => {
+								archive.extend_from_slice(&raw[id.0 as usize][..*len as usize]);
+							}
+							Segment::CentralDirectory => {
+								assert!(
+									pi + 1 == nparts,
+									"CentralDirectory must be in the last part, found in part {}",
+									pi + 1
+								);
+								assert_eq!(
+									archive.len() as u64,
+									cd_offset,
+									"entry region ({}) != cd_offset ({}) at directory point",
+									archive.len(),
+									cd_offset
+								);
+								archive.extend_from_slice(&build_directory());
+								saw_directory = true;
 							}
 						}
 					}
@@ -385,41 +481,8 @@ mod tests {
 				);
 			}
 		}
+		assert!(saw_directory, "plan emitted no CentralDirectory segment");
 
-		// ---- Append central directory + end records. ----
-		let mut cd_offset = 0u64;
-		for id in &plan.order {
-			let e = &plan.entries[id];
-			cd_offset += zip_format::entry_total_len(&e.name, e.size);
-		}
-		assert_eq!(
-			archive.len() as u64,
-			cd_offset,
-			"single-MPU entry region ({}) != directory cd_offset ({}); part layout disagrees \
-             with plan.order offsets",
-			archive.len(),
-			cd_offset
-		);
-		let mut cd_size = 0u64;
-		for id in &plan.order {
-			let e = &plan.entries[id];
-			let crc = e.crc.unwrap_or_else(|| crc32(&raw[id.0 as usize]));
-			let rec = zip_format::central_dir_entry(&EntryMeta {
-				name: e.name.clone(),
-				size: e.size,
-				crc,
-				local_header_offset: e.local_header_offset,
-			});
-			cd_size += rec.len() as u64;
-			archive.extend_from_slice(&rec);
-		}
-		archive.extend_from_slice(&zip_format::end_records(
-			plan.order.len() as u64,
-			cd_offset,
-			cd_size,
-		));
-
-		// ---- Validate with the standard zip reader. ----
 		let mut expected: HashSet<String> = plan
 			.order
 			.iter()
@@ -428,165 +491,241 @@ mod tests {
 		let mut za = zip::ZipArchive::new(Cursor::new(&archive))
 			.expect("single-MPU archive must parse with the standard zip reader");
 		assert_eq!(za.len(), plan.order.len());
-		let arch_names: Vec<String> = za.file_names().map(ToOwned::to_owned).collect();
-		for n in &arch_names {
+		for n in za.file_names().map(ToOwned::to_owned).collect::<Vec<_>>() {
 			assert!(!n.contains('/'), "flat layout required");
-			assert!(expected.remove(n), "unknown/duplicate {n}");
-		}
-		assert!(expected.is_empty(), "missing entries: {expected:?}");
-		for n in &arch_names {
-			let mut entry = za.by_name(n).unwrap();
+			assert!(expected.remove(&n), "unknown/duplicate {n}");
+			let mut entry = za.by_name(&n).unwrap();
 			let mut buf = Vec::new();
 			entry
 				.read_to_end(&mut buf)
 				.expect("extract (CRC verified by reader)");
-			assert_eq!(&sha256_hex(&buf), n, "content hash == name");
+			assert_eq!(&sha256_hex(&buf), &n, "content hash == name");
 		}
+		assert!(expected.is_empty(), "missing entries: {expected:?}");
 	}
 
-	// Smalls run out while bigs remain: the remaining bigs must be FOLDED into stream parts
-	// (streamed, not copied) so no undersized non-last part is emitted. Many bigs, few smalls.
+	// Is `id` a small (sub-floor source file)? Used by the steal-invariant scan.
+	#[cfg(feature = "zip_validate")]
+	fn is_small(plan: &SinglePlan, id: FileId) -> bool {
+		plan.entries[&id].size < PART_FLOOR
+	}
+
+	// ---- Basic layout: smalls batch 2-per-part to clear the floor (no steal needed). One odd
+	// leftover small must end up in the final part WITH the directory. ----
 	#[cfg(feature = "zip_validate")]
 	#[test]
-	fn single_mpu_handles_smalls_exhausted_early() {
-		use crate::engine::zip_format::{self, EntryMeta};
-		use sha2::{Digest, Sha256};
-		use std::collections::HashSet;
-		use std::io::{Cursor, Read};
-
-		fn sha256_hex(b: &[u8]) -> String {
-			let mut h = Sha256::new();
-			h.update(b);
-			let d = h.finalize();
-			let mut s = String::with_capacity(64);
-			for x in d {
-				use core::fmt::Write;
-				let _ = write!(s, "{:02x}", x);
-			}
-			s
-		}
-		fn crc32(b: &[u8]) -> u32 {
-			let mut h = crc32fast::Hasher::new();
-			h.update(b);
-			h.finalize()
-		}
-
+	fn single_mpu_layout_matches_directory_offsets() {
 		let big = PART_FLOOR as usize + 77;
-		let small = (PART_FLOOR as usize / 2) + 1000;
-		// 6 bigs, only 2 smalls — smalls exhaust after the first big's batch; bigs 1..5 must fold.
+		let small = (PART_FLOOR as usize / 2) + 1000; // two smalls > floor; one alone < floor
 		let raw: Vec<Vec<u8>> = vec![
 			vec![1u8; big],
 			vec![2u8; small],
 			vec![3u8; small],
 			vec![4u8; big],
+			vec![5u8; small],
+			vec![6u8; small],
+			vec![7u8; big],
+			vec![8u8; small],
+			vec![9u8; small],
+			vec![10u8; small], // odd leftover small -> rides with the directory in the final part
+		];
+		let mut plan = plan_or_panic(&raw);
+		// These bigs are floor-huggers (max_steal = 77 B), so they cannot self-donate; the batch
+		// clears the floor with two smalls and the big is copied whole. No steal expected.
+		assert_eq!(
+			plan.stats.stolen_bigs, 0,
+			"floor-hugger bigs should not steal"
+		);
+		assert_eq!(
+			plan.stats.folded_bigs, 0,
+			"two smalls clear the floor; nothing folds"
+		);
+		fill_crcs_from_raw(&mut plan, &raw);
+		assemble_and_validate(&plan, &raw);
+	}
+
+	// ---- Smalls run out while bigs remain: with no small to ride, the remaining bigs FOLD
+	// (streamed whole) rather than steal — they must never produce an undersized non-last part. ----
+	#[cfg(feature = "zip_validate")]
+	#[test]
+	fn single_mpu_handles_smalls_exhausted_early() {
+		// Floor-hugger bigs (cannot donate) + a single small. The first big folds carrying the
+		// small; the rest fold bare. All folds are >= floor (big body alone exceeds the floor).
+		let big = PART_FLOOR as usize + 100;
+		let small = PART_FLOOR as usize / 2;
+		let raw: Vec<Vec<u8>> = vec![
+			vec![1u8; big],
+			vec![2u8; big],
+			vec![3u8; big],
+			vec![4u8; big],
+			vec![5u8; small],
+		];
+		let mut plan = plan_or_panic(&raw);
+		assert!(
+			plan.stats.folded_bigs > 0,
+			"expected folds when smalls are exhausted"
+		);
+		fill_crcs_from_raw(&mut plan, &raw);
+		assemble_and_validate(&plan, &raw);
+	}
+
+	// ---- Steal: a small alone is below the floor, but each big can donate a prefix to bridge it,
+	// so every big is COPIED (ranged remainder), none folded. ----
+	#[cfg(feature = "zip_validate")]
+	#[test]
+	fn single_mpu_steals_big_prefix_to_clear_floor() {
+		let big = (PART_FLOOR + PART_FLOOR / 2) as usize; // max_steal = 0.5 floor
+		let small = (PART_FLOOR * 3 / 5) as usize; // 0.6 floor: one small alone < floor
+		let raw: Vec<Vec<u8>> = vec![
+			vec![1u8; big],
+			vec![2u8; small],
+			vec![3u8; big],
+			vec![4u8; small],
+			vec![5u8; big],
+			vec![6u8; small],
+			vec![7u8; big],
+			vec![8u8; small],
+		];
+		let mut plan = plan_or_panic(&raw);
+		assert_eq!(
+			plan.stats.folded_bigs, 0,
+			"no big should fold when all can donate a prefix"
+		);
+		assert!(
+			plan.stats.stolen_bigs > 0,
+			"expected ranged-copy steals, got none"
+		);
+		assert!(
+			plan.parts
+				.iter()
+				.any(|p| matches!(p, PartSpec::Copy { copy_from, .. } if *copy_from > 0)),
+			"expected at least one ranged copy (copy_from > 0)"
+		);
+		fill_crcs_from_raw(&mut plan, &raw);
+		assemble_and_validate(&plan, &raw);
+	}
+
+	// ---- INVARIANT (requested): never steal from a big without first streaming a small into that
+	// part. We force BOTH paths in one plan: the first bigs steal (a small precedes each prefix),
+	// then smalls run out and the remaining donatable bigs FOLD rather than steal bare. ----
+	#[cfg(feature = "zip_validate")]
+	#[test]
+	fn single_mpu_never_steals_without_a_small_first() {
+		let big = (PART_FLOOR + PART_FLOOR / 2) as usize; // donatable (max_steal = 0.5 floor)
+		let small = (PART_FLOOR * 3 / 5) as usize; // 0.6 floor
+		// 4 donatable bigs, only 2 smalls: bigs 0-1 steal (with a small each), bigs 2-3 have no
+		// small left and so FOLD — even though they COULD donate — because the rule forbids a
+		// small-less steal.
+		let raw: Vec<Vec<u8>> = vec![
+			vec![1u8; big],
+			vec![2u8; small],
+			vec![3u8; big],
+			vec![4u8; small],
 			vec![5u8; big],
 			vec![6u8; big],
-			vec![7u8; big],
-			vec![8u8; big],
 		];
-		let names: Vec<String> = raw.iter().map(|c| sha256_hex(c)).collect();
-		let files: Vec<SourceFile> = (0..raw.len())
-			.map(|i| SourceFile {
-				id: FileId(i as u32),
-				key: format!("files/{}", names[i]),
-				name: names[i].clone(),
-				size: raw[i].len() as u64,
-			})
-			.collect();
+		let plan = plan_or_panic(&raw);
 
-		let mut plan = match plan_single_mpu(files) {
-			SingleRouting::SingleMpu(p) => p,
-			SingleRouting::Fallback => panic!("expected single-MPU fast path"),
-		};
-		let ids: Vec<FileId> = plan.copyable.clone();
-		for id in ids {
-			if let Some(e) = plan.entries.get_mut(&id) {
-				e.crc = Some(crc32(&raw[id.0 as usize]));
-			}
-		}
+		// Both paths exercised.
+		assert!(
+			plan.stats.stolen_bigs >= 1,
+			"expected at least one steal (with a small)"
+		);
+		assert!(
+			plan.stats.folded_bigs >= 1,
+			"expected at least one small-less fold"
+		);
 
-		let header_bytes = |id: FileId| -> Vec<u8> {
-			let e = &plan.entries[&id];
-			let crc = e.crc.unwrap_or_else(|| crc32(&raw[id.0 as usize]));
-			zip_format::local_header(&EntryMeta {
-				name: e.name.clone(),
-				size: e.size,
-				crc,
-				local_header_offset: e.local_header_offset,
-			})
-		};
-
-		let mut archive: Vec<u8> = Vec::new();
-		let nparts = plan.parts.len();
-		for (pi, part) in plan.parts.iter().enumerate() {
-			let before = archive.len();
-			match part {
-				PartSpec::Copy { id, .. } => archive.extend_from_slice(&raw[id.0 as usize]),
-				PartSpec::Stream { segments, .. } => {
-					for seg in segments {
-						match seg {
-							Segment::StreamedFile { id } => {
-								archive.extend_from_slice(&header_bytes(*id));
-								archive.extend_from_slice(&raw[id.0 as usize]);
-							}
-							Segment::CopiedFileHeader { id } => {
-								archive.extend_from_slice(&header_bytes(*id));
-							}
+		// Structural invariant: in any part, every StreamedBigPrefix is preceded by >= 1 streamed
+		// SMALL within the same part. (Equivalently: no prefix without a prior small.)
+		for part in &plan.parts {
+			if let PartSpec::Stream { segments, .. } = part {
+				let mut small_seen = false;
+				for seg in segments {
+					match seg {
+						Segment::StreamedFile { id } if is_small(&plan, *id) => small_seen = true,
+						Segment::StreamedBigPrefix { .. } => {
+							assert!(
+								small_seen,
+								"StreamedBigPrefix appeared with no preceding small in its part"
+							);
 						}
+						_ => {}
 					}
 				}
 			}
-			let part_len = (archive.len() - before) as u64;
-			if pi + 1 < nparts {
-				assert!(
-					part_len >= PART_FLOOR,
-					"non-last part {} is {} bytes, below floor (smalls-exhausted path)",
-					pi + 1,
-					part_len
-				);
-			}
 		}
 
-		let mut cd_offset = 0u64;
-		for id in &plan.order {
-			let e = &plan.entries[id];
-			cd_offset += zip_format::entry_total_len(&e.name, e.size);
-		}
-		assert_eq!(archive.len() as u64, cd_offset, "entry region != cd_offset");
-		let mut cd_size = 0u64;
-		for id in &plan.order {
-			let e = &plan.entries[id];
-			let crc = e.crc.unwrap_or_else(|| crc32(&raw[id.0 as usize]));
-			let rec = zip_format::central_dir_entry(&EntryMeta {
-				name: e.name.clone(),
-				size: e.size,
-				crc,
-				local_header_offset: e.local_header_offset,
-			});
-			cd_size += rec.len() as u64;
-			archive.extend_from_slice(&rec);
-		}
-		archive.extend_from_slice(&zip_format::end_records(
-			plan.order.len() as u64,
-			cd_offset,
-			cd_size,
-		));
+		let mut plan = plan;
+		fill_crcs_from_raw(&mut plan, &raw);
+		assemble_and_validate(&plan, &raw);
+	}
 
-		let mut expected: HashSet<String> = plan
-			.order
+	// ---- INVARIANT (requested): trailing leftovers ride WITH the directory. A sub-floor odd
+	// leftover small must not form a standalone (undersized, non-last) part — it must sit in the
+	// final part alongside the CentralDirectory, which is the genuine last (floor-exempt) part. ----
+	#[cfg(feature = "zip_validate")]
+	#[test]
+	fn single_mpu_trailing_leftovers_ride_with_directory() {
+		let big = PART_FLOOR as usize + 77; // floor-hugger: cleared by two smalls, copied whole
+		let small = (PART_FLOOR as usize / 2) + 1000; // two > floor, one < floor
+		// Sized past the viability floor (4 x PART_FLOOR). Three bigs each consume two smalls; the
+		// 7th small (id 9) is the odd leftover that must ride with the directory.
+		let raw: Vec<Vec<u8>> = vec![
+			vec![1u8; big],
+			vec![2u8; small],
+			vec![3u8; small],
+			vec![4u8; big],
+			vec![5u8; small],
+			vec![6u8; small],
+			vec![7u8; big],
+			vec![8u8; small],
+			vec![9u8; small],
+			vec![10u8; small], // odd leftover small -> must ride with the directory
+		];
+		let plan = plan_or_panic(&raw);
+
+		// Exactly one CentralDirectory, and it is the LAST segment of the LAST part.
+		let dir_count: usize = plan
+			.parts
 			.iter()
-			.map(|id| plan.entries[id].name.clone())
-			.collect();
-		let mut za = zip::ZipArchive::new(Cursor::new(&archive))
-			.expect("smalls-exhausted archive must parse");
-		assert_eq!(za.len(), plan.order.len());
-		for n in za.file_names().map(ToOwned::to_owned).collect::<Vec<_>>() {
-			assert!(expected.remove(&n), "unknown/duplicate {n}");
-			let mut entry = za.by_name(&n).unwrap();
-			let mut buf = Vec::new();
-			entry.read_to_end(&mut buf).expect("extract");
-			assert_eq!(&sha256_hex(&buf), &n, "content hash == name");
-		}
-		assert!(expected.is_empty(), "missing entries: {expected:?}");
+			.map(|p| match p {
+				PartSpec::Stream { segments, .. } => segments
+					.iter()
+					.filter(|s| matches!(s, Segment::CentralDirectory))
+					.count(),
+				_ => 0,
+			})
+			.sum();
+		assert_eq!(
+			dir_count, 1,
+			"exactly one CentralDirectory segment expected"
+		);
+
+		let last = plan.parts.last().expect("at least one part");
+		let last_segs = match last {
+			PartSpec::Stream { segments, .. } => segments,
+			_ => panic!("final part must be a Stream part carrying the directory"),
+		};
+		assert!(
+			matches!(last_segs.last(), Some(Segment::CentralDirectory)),
+			"directory must be the final segment of the final part"
+		);
+
+		// The odd leftover small (id 9) must live in that final part, not in a standalone part.
+		let leftover = FileId(9);
+		let in_final = last_segs
+			.iter()
+			.any(|s| matches!(s, Segment::StreamedFile { id } if *id == leftover));
+		assert!(
+			in_final,
+			"leftover small must ride in the final (directory) part"
+		);
+
+		let mut plan = plan;
+		fill_crcs_from_raw(&mut plan, &raw);
+		// assemble_and_validate also asserts every non-last part >= floor, so a mis-placed
+		// sub-floor leftover would fail here.
+		assemble_and_validate(&plan, &raw);
 	}
 }

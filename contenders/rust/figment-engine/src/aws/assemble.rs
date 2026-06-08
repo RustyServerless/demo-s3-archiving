@@ -67,6 +67,7 @@ pub async fn assemble(
 		copy_parts = st.copy_parts,
 		stream_parts = st.stream_parts,
 		folded_bigs = st.folded_bigs,
+		stolen_bigs = st.stolen_bigs,
 		bigs = st.bigs,
 		smalls = st.smalls,
 		"PHASE plan"
@@ -91,11 +92,15 @@ pub async fn assemble(
 	// order — copies and streams just race to finish. Splitting them means the stream pool keeps
 	// the ENI saturated (concurrent transfers hide each GET's latency) while the copy pool churns
 	// the bigs server-side in the background, neither starving the other.
-	let mut copy_parts: Vec<(u32, FileId)> = Vec::new();
+	let mut copy_parts: Vec<(u32, FileId, u64)> = Vec::new();
 	let mut stream_parts: Vec<(u32, Vec<Segment>)> = Vec::new();
 	for part in &plan.parts {
 		match part {
-			PartSpec::Copy { part_number, id } => copy_parts.push((*part_number, *id)),
+			PartSpec::Copy {
+				part_number,
+				id,
+				copy_from,
+			} => copy_parts.push((*part_number, *id, *copy_from)),
 			PartSpec::Stream {
 				part_number,
 				segments,
@@ -105,39 +110,43 @@ pub async fn assemble(
 
 	let t_parts = Instant::now();
 
-	let copies = futures::stream::iter(copy_parts.into_iter().map(|(part_number, id)| {
-		let s3 = s3.clone();
-		let plan = plan.clone();
-		let bucket = bucket.to_string();
-		let files_prefix = files_prefix.to_string();
-		let archive_key = archive_key.to_string();
-		let upload_id = upload_id.clone();
-		async move {
-			let name = &plan.entries[&id].name;
-			let source = format!("{bucket}/{files_prefix}/{name}");
-			let out = s3
-				.upload_part_copy()
-				.bucket(&bucket)
-				.key(&archive_key)
-				.upload_id(&upload_id)
-				.part_number(part_number as i32)
-				.copy_source(source)
-				.send()
-				.await?;
-			let etag = out
-				.copy_part_result()
-				.and_then(|r| r.e_tag())
-				.ok_or(AssembleError::NoEtag("upload_part_copy"))?
-				.to_string();
-			Ok::<_, AssembleError>(
-				CompletedPart::builder()
+	let copies =
+		futures::stream::iter(copy_parts.into_iter().map(|(part_number, id, copy_from)| {
+			let s3 = s3.clone();
+			let plan = plan.clone();
+			let bucket = bucket.to_string();
+			let files_prefix = files_prefix.to_string();
+			let archive_key = archive_key.to_string();
+			let upload_id = upload_id.clone();
+			async move {
+				let entry = &plan.entries[&id];
+				let source = format!("{bucket}/{files_prefix}/{}", entry.name);
+				let mut req = s3
+					.upload_part_copy()
+					.bucket(&bucket)
+					.key(&archive_key)
+					.upload_id(&upload_id)
 					.part_number(part_number as i32)
-					.e_tag(etag)
-					.build(),
-			)
-		}
-	}))
-	.buffer_unordered(COPY_CONCURRENCY);
+					.copy_source(source);
+				// When a prefix was streamed, copy only the remainder [copy_from, size-1] server-side.
+				if copy_from > 0 {
+					req = req.copy_source_range(format!("bytes={}-{}", copy_from, entry.size - 1));
+				}
+				let out = req.send().await?;
+				let etag = out
+					.copy_part_result()
+					.and_then(|r| r.e_tag())
+					.ok_or(AssembleError::NoEtag("upload_part_copy"))?
+					.to_string();
+				Ok::<_, AssembleError>(
+					CompletedPart::builder()
+						.part_number(part_number as i32)
+						.e_tag(etag)
+						.build(),
+				)
+			}
+		}))
+		.buffer_unordered(COPY_CONCURRENCY);
 
 	let streams = futures::stream::iter(stream_parts.into_iter().map(|(part_number, segments)| {
 		let s3 = s3.clone();
@@ -173,9 +182,11 @@ pub async fn assemble(
 	.buffer_unordered(STREAM_CONCURRENCY);
 
 	// Drain both pools concurrently into one collection. (Box::pin: buffer_unordered adapters
-	// aren't Unpin, which select requires.)
+	// aren't Unpin, which select requires.) The central directory is NOT a separate part — the
+	// planner places it as the CentralDirectory segment in the final Stream part, so it is
+	// realised by the stream pool like any other part (and rides in the genuine last MPU part).
 	let mut merged = futures::stream::select(Box::pin(copies), Box::pin(streams));
-	let mut completed: Vec<CompletedPart> = Vec::with_capacity(plan.parts.len() + 1);
+	let mut completed: Vec<CompletedPart> = Vec::with_capacity(plan.parts.len());
 	while let Some(res) = merged.next().await {
 		completed.push(res?);
 	}
@@ -184,31 +195,6 @@ pub async fn assemble(
 		parts = plan.parts.len(),
 		"PHASE parts"
 	);
-
-	// ---- Final part: the central directory + ZIP64 end records. ----
-	let dir_part_number = (plan.parts.len() + 1) as i32;
-	let t_dir = Instant::now();
-	let dir = build_central_directory(&plan)?;
-	let out = s3
-		.upload_part()
-		.bucket(bucket)
-		.key(archive_key)
-		.upload_id(&upload_id)
-		.part_number(dir_part_number)
-		.body(ByteStream::from(dir))
-		.send()
-		.await?;
-	let dir_etag = out
-		.e_tag()
-		.ok_or(AssembleError::NoEtag("directory upload_part"))?
-		.to_string();
-	completed.push(
-		CompletedPart::builder()
-			.part_number(dir_part_number)
-			.e_tag(dir_etag)
-			.build(),
-	);
-	tracing::info!(ms = t_dir.elapsed().as_millis(), "PHASE directory_part");
 
 	// ---- Complete the MPU (parts must be ascending by number). ----
 	completed.sort_by_key(|p| p.part_number().unwrap_or_default());
@@ -231,7 +217,9 @@ pub async fn assemble(
 
 /// Assemble one Stream part's bytes: a streamed file contributes [local header][body] (GET the
 /// body); a copied-file header contributes just [local header] (the trailing-header handoff for
-/// the big copied in the following part).
+/// the big copied in the following part); a streamed big-prefix contributes the big's first `len`
+/// body bytes (ranged GET, no header — its header is the preceding CopiedFileHeader), which the
+/// following ranged Copy continues from `len` to the end.
 async fn build_stream_part_bytes(
 	s3: &Client,
 	bucket: &str,
@@ -260,6 +248,18 @@ async fn build_stream_part_bytes(
 					.ok_or_else(|| AssembleError::BadCrc(entry.name.clone()))?;
 				let meta = entry_meta(entry, crc);
 				buf.extend_from_slice(&zip_format::local_header(&meta));
+			}
+			Segment::StreamedBigPrefix { id, len } => {
+				let entry = &plan.entries[id];
+				let key = format!("{files_prefix}/{}", entry.name);
+				let prefix = get_object_range_bytes(s3, bucket, &key, 0, *len).await?;
+				buf.extend_from_slice(&prefix);
+			}
+			Segment::CentralDirectory => {
+				// Always the last segment of the last part: append the directory + end records,
+				// so the directory rides inside the final MPU part (the genuine, floor-exempt last
+				// part) rather than as a separate trailing part.
+				buf.extend_from_slice(&build_central_directory(plan)?);
 			}
 		}
 	}
@@ -374,6 +374,29 @@ async fn get_object_bytes(
 ) -> Result<Vec<u8>, AssembleError> {
 	let mut resp = s3.get_object().bucket(bucket).key(key).send().await?;
 	let mut data = Vec::with_capacity(expected);
+	while let Some(chunk) = resp.body.next().await {
+		data.extend_from_slice(&chunk?);
+	}
+	Ok(data)
+}
+
+/// GET the first `len` bytes of an object (range `[start, start+len-1]`), for a stolen big-prefix.
+async fn get_object_range_bytes(
+	s3: &Client,
+	bucket: &str,
+	key: &str,
+	start: u64,
+	len: u64,
+) -> Result<Vec<u8>, AssembleError> {
+	let range = format!("bytes={}-{}", start, start + len - 1);
+	let mut resp = s3
+		.get_object()
+		.bucket(bucket)
+		.key(key)
+		.range(range)
+		.send()
+		.await?;
+	let mut data = Vec::with_capacity(len as usize);
 	while let Some(chunk) = resp.body.next().await {
 		data.extend_from_slice(&chunk?);
 	}
