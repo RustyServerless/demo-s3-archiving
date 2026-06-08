@@ -101,7 +101,7 @@ pub fn plan_single_mpu(files: Vec<SourceFile>) -> SingleRouting {
 	// Bigs LARGEST-FIRST: the small-byte budget can chaperone only ~N bigs over the floor as
 	// copies; the rest are forced to STREAM. By copying the biggest bigs first, the forced folds
 	// land on the SMALLEST bigs — minimising the big-bytes that cross the ENI. Ties by id for
-	// determinism. Smalls by id (their order only affects batching, not which bigs fold).
+	// determinism. Smalls in opposite order (smallest first) so we pair smallest with biggest.
 	bigs.sort_by(|a, b| b.size.cmp(&a.size).then(a.id.0.cmp(&b.id.0))); // descending
 	smalls.sort_by(|a, b| a.size.cmp(&b.size).then(a.id.0.cmp(&b.id.0))); // ascending
 
