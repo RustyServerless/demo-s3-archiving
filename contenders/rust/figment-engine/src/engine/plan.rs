@@ -171,8 +171,8 @@ pub fn plan_single_mpu(files: Vec<SourceFile>) -> SingleRouting {
 			}
 			let gap = PART_FLOOR - with_header;
 			let smalls_left = small_iter.peek().is_some();
-			if gap <= max_steal && pulled_small {
-				break; // gap is bridgeable by a steal AND we've already streamed a small here
+			if gap <= max_steal && (pulled_small || !smalls_left) {
+				break; // bridgeable by a steal: use an available small first, else steal bare
 			}
 			if smalls_left {
 				let sid = small_iter.next().unwrap().id;
@@ -187,10 +187,11 @@ pub fn plan_single_mpu(files: Vec<SourceFile>) -> SingleRouting {
 		}
 
 		let with_header = cur_bytes + header_big;
-		// Steal only to bridge a part that ALREADY contains a small. With no small pulled (smalls
-		// exhausted), k stays 0 and the big folds below — we never steal from a big without first
-		// streaming a small into its part.
-		let k = if pulled_small {
+		// A small that must cross the ENI anyway is never wasted: when one is available we consume
+		// it into this part first and steal only the RESIDUAL gap. Once smalls are exhausted we
+		// steal bare to keep a donatable big off the ENI; a big too small to bridge then folds.
+		let smalls_left = small_iter.peek().is_some();
+		let k = if pulled_small || !smalls_left {
 			PART_FLOOR.saturating_sub(with_header).min(max_steal)
 		} else {
 			0
@@ -605,53 +606,57 @@ mod tests {
 		assemble_and_validate(&plan, &raw);
 	}
 
-	// ---- INVARIANT (requested): never steal from a big without first streaming a small into that
-	// part. We force BOTH paths in one plan: the first bigs steal (a small precedes each prefix),
-	// then smalls run out and the remaining donatable bigs FOLD rather than steal bare. ----
+	// ---- INVARIANT (clarified): an AVAILABLE small is never wasted by stealing in its place. A
+	// small must cross the ENI regardless, so while smalls remain, the bridging part consumes one
+	// and the steal covers only the residual gap — never a bare `[hBig][prefix]` that strands a
+	// usable small. (Bare steals are allowed only once smalls are exhausted; the steal and
+	// smalls-exhausted tests cover that.) Here smalls outnumber bigs, so none run out mid-loop and
+	// every steal part must carry a small; a greedy bare-steal would fail the scan. ----
 	#[cfg(feature = "zip_validate")]
 	#[test]
-	fn single_mpu_never_steals_without_a_small_first() {
+	fn single_mpu_uses_available_small_before_stealing() {
 		let big = (PART_FLOOR + PART_FLOOR / 2) as usize; // donatable (max_steal = 0.5 floor)
-		let small = (PART_FLOOR * 3 / 5) as usize; // 0.6 floor
-		// 4 donatable bigs, only 2 smalls: bigs 0-1 steal (with a small each), bigs 2-3 have no
-		// small left and so FOLD — even though they COULD donate — because the rule forbids a
-		// small-less steal.
+		let small = (PART_FLOOR * 3 / 5) as usize; // 0.6 floor: one alone < floor
 		let raw: Vec<Vec<u8>> = vec![
 			vec![1u8; big],
 			vec![2u8; small],
-			vec![3u8; big],
-			vec![4u8; small],
-			vec![5u8; big],
-			vec![6u8; big],
+			vec![3u8; small],
+			vec![4u8; big],
+			vec![5u8; small],
+			vec![6u8; small],
+			vec![7u8; big],
+			vec![8u8; small],
+			vec![9u8; small],
+			vec![10u8; big],
+			vec![11u8; small],
+			vec![12u8; small],
 		];
 		let plan = plan_or_panic(&raw);
 
-		// Both paths exercised.
 		assert!(
 			plan.stats.stolen_bigs >= 1,
-			"expected at least one steal (with a small)"
+			"expected steals on donatable bigs"
 		);
-		assert!(
-			plan.stats.folded_bigs >= 1,
-			"expected at least one small-less fold"
+		assert_eq!(
+			plan.stats.folded_bigs, 0,
+			"donatable bigs must not fold while smalls are available"
 		);
 
-		// Structural invariant: in any part, every StreamedBigPrefix is preceded by >= 1 streamed
-		// SMALL within the same part. (Equivalently: no prefix without a prior small.)
+		// Every steal part must also stream a small (consumed before the steal). With smalls
+		// plentiful none run out, so a bare steal here would mean a wasted available small.
 		for part in &plan.parts {
 			if let PartSpec::Stream { segments, .. } = part {
-				let mut small_seen = false;
-				for seg in segments {
-					match seg {
-						Segment::StreamedFile { id } if is_small(&plan, *id) => small_seen = true,
-						Segment::StreamedBigPrefix { .. } => {
-							assert!(
-								small_seen,
-								"StreamedBigPrefix appeared with no preceding small in its part"
-							);
-						}
-						_ => {}
-					}
+				let has_prefix = segments
+					.iter()
+					.any(|s| matches!(s, Segment::StreamedBigPrefix { .. }));
+				if has_prefix {
+					let has_small = segments
+						.iter()
+						.any(|s| matches!(s, Segment::StreamedFile { id } if is_small(&plan, *id)));
+					assert!(
+						has_small,
+						"a steal part carries no small, but smalls were available — wasted small"
+					);
 				}
 			}
 		}
