@@ -148,7 +148,7 @@ Resources:
       # provided.al2023 is the custom runtime for compiled binaries (Rust, Go, C++).
       # The Lambda service executes the `bootstrap` binary directly.
       Runtime: provided.al2023
-      MemorySize: 512
+      MemorySize: 640
       Timeout: 600
       # For custom runtimes, Handler is technically ignored (bootstrap is always executed).
       # This value is just my convention.
