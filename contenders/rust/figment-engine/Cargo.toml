@@ -1,0 +1,39 @@
+[package]
+# IMPORTANT: the package name MUST match the directory name (<dev_id>).
+# The CI build pipeline derives the cargo-lambda output path from this name
+# and copies `target/lambda/<name>/bootstrap` into this directory.
+name = "figment-engine"
+version = "0.1.0"
+rust-version = "1.85.0"
+edition = "2024"
+authors = ["fitz <fitz@figmentengine.com>"]
+license = "GPL-3.0-only"
+
+[dependencies]
+awssdk-instrumentation = { version = "0.2", default-features = false, features = ["tracing-backend", "env-lambda", "extract-s3"] }
+tracing = { version = "0.1"}
+
+# AWS SDK dependencies
+aws-sdk-s3 = "1"
+
+# Core dependencies
+tokio = { version = "1", features = ["macros", "signal"] }
+serde = { version = "1", features = ["derive"] }
+
+# ZIP generation
+zip = { version = "5.1", default-features = false }
+
+thiserror = "2"
+bytes = "1"
+
+# assemble
+crc32fast = "1"
+futures = "0.3"
+
+[dev-dependencies]
+zip = { workspace = true }      # reader, for the validator-mirroring test
+sha2 = { workspace = true }     # content hashing, mirrors control-lambda
+crc32fast = "1"                 # compute the true CRC to embed (CRC MUST be right)
+
+[features]
+zip_validate = []
