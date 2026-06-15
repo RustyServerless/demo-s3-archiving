@@ -1,0 +1,24 @@
+[package]
+# IMPORTANT: the package name MUST match the directory name (<dev_id>).
+# The CI build pipeline derives the cargo-lambda output path from this name
+# and copies `target/lambda/<name>/bootstrap` into this directory.
+name = "jrodon-v2"
+version = "0.1.0"
+rust-version = "1.85.0"
+edition = "2024"
+authors = ["Jérémie RODON <jeremie.rodon@gmail.com>"]
+license = "GPL-3.0-only"
+
+[dependencies]
+awssdk-instrumentation = { version = "0.2", default-features = false, features = ["tracing-backend", "env-lambda", "extract-s3"] }
+tracing = { version = "0.1"}
+
+# AWS SDK dependencies
+aws-sdk-s3 = "1"
+
+# Core dependencies
+tokio = { version = "1", features = ["macros", "signal"] }
+serde = { version = "1", features = ["derive"] }
+
+thiserror = "2"
+base64 = "0.22"
