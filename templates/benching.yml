@@ -123,7 +123,7 @@ Resources:
       FunctionName: !Sub ${ProjectName}-fill-bucket
       CodeUri: ../benching/fill-bucket
       Runtime: provided.al2023
-      MemorySize: 384
+      MemorySize: 768
       Timeout: 600
       Handler: rust.handler
       Architectures:
