@@ -66,7 +66,7 @@ impl ZipLayout {
             && file_entry.file_size() >= MIN_PART_SIZE
         {
             // Pop the largest remaining file — this will be the UploadPartCopy half.
-            let Some(file_entry) = file_entries.pop_back() else {
+            let Some(big_file_entry) = file_entries.pop_back() else {
                 break;
             };
 
@@ -76,24 +76,13 @@ impl ZipLayout {
             // regular_min = MIN_PART_SIZE
             //             - loc_size          (LOC header goes in the regular part)
             //             - (file_size - MIN_PART_SIZE)  (bytes the copy can "donate" to regular)
-            let min_missing_regular_part_size =
-                MIN_PART_SIZE - file_entry.loc_size() - (file_entry.file_size() - MIN_PART_SIZE);
+            let min_missing_regular_part_size = MIN_PART_SIZE
+                - big_file_entry.loc_size()
+                - (big_file_entry.file_size() - MIN_PART_SIZE);
 
             let mut regular = RegularZipPart::new();
 
             let zip_layout_part = loop {
-                if let Some(small_file_entry) = file_entries.pop_front() {
-                    regular.push_entry(small_file_entry);
-                } else {
-                    // Ran out of small files before the regular part was large enough.
-                    // Fold the large file into a Single instead of creating an invalid Duo.
-                    regular.push_entry(file_entry);
-                    debug!(
-                        regular_entry_count = regular.0.len(),
-                        "Creating Single part"
-                    );
-                    break ZipLayoutPart::Single(regular);
-                };
                 let regular_zip_part_size = regular.part_size();
                 if regular_zip_part_size >= min_missing_regular_part_size {
                     // The regular part is large enough — we have a valid Duo.
@@ -103,15 +92,15 @@ impl ZipLayout {
                     // download the first `copy_start_byte` bytes into the regular part.
                     let copy_start_byte = MIN_PART_SIZE
                         .saturating_sub(regular_zip_part_size)
-                        .saturating_sub(file_entry.loc_size());
+                        .saturating_sub(big_file_entry.loc_size());
 
                     let copy = if copy_start_byte > 0 {
                         CopyZipPart::PartialCopy {
-                            file_entry,
+                            file_entry: big_file_entry,
                             copy_start_byte,
                         }
                     } else {
-                        CopyZipPart::FullCopy(file_entry)
+                        CopyZipPart::FullCopy(big_file_entry)
                     };
                     debug!(
                         regular_entry_count = regular.0.len(),
@@ -120,10 +109,29 @@ impl ZipLayout {
                     );
                     break ZipLayoutPart::Duo { regular, copy };
                 }
+
+                if let Some(small_file_entry) = file_entries.pop_front() {
+                    regular.push_entry(small_file_entry);
+                } else {
+                    // Ran out of small files before the regular part was large enough.
+                    // Add the large file into a Single instead of creating an invalid Duo.
+                    regular.push_entry(big_file_entry);
+                    debug!(
+                        regular_entry_count = regular.0.len(),
+                        "Creating Single part"
+                    );
+                    break ZipLayoutPart::Single(regular);
+                };
             };
 
             parts.push(zip_layout_part);
         }
+
+        info!(
+            layout_part_count = parts.len(),
+            file_entries_count = file_entries.len(),
+            "Layout state - Post P1"
+        );
 
         // --- Pass 2: PartialCopy → FullCopy promotion ---
         // A PartialCopy means we had to download the first N bytes of the large file to pad
@@ -154,6 +162,12 @@ impl ZipLayout {
             }
         }
 
+        info!(
+            layout_part_count = parts.len(),
+            file_entries_count = file_entries.len(),
+            "Layout state - Post P2"
+        );
+
         // --- Pass 3: Pad Duo regular parts toward TARGET_PART_SIZE ---
         'outer: for zip_layout_part in parts.iter_mut() {
             match zip_layout_part {
@@ -171,6 +185,12 @@ impl ZipLayout {
             }
         }
 
+        info!(
+            layout_part_count = parts.len(),
+            file_entries_count = file_entries.len(),
+            "Layout state - Post P3"
+        );
+
         // --- Pass 4: Pack remaining small files into Single parts ---
         while !file_entries.is_empty() {
             let mut new_single = RegularZipPart::new();
@@ -186,14 +206,46 @@ impl ZipLayout {
         }
 
         // Break the part count down by kind so the logs surface the strategy chosen.
-        let single_count = parts
-            .iter()
-            .filter(|p| matches!(p, ZipLayoutPart::Single(_)))
-            .count();
-        let duo_count = parts.len() - single_count;
+        let (single_count, duo_count, s3_part_count, full_duo_count, partial_duo_count) =
+            parts.iter().fold(
+                (0usize, 0usize, 0usize, 0usize, 0usize),
+                |mut counters, part| {
+                    match part {
+                        ZipLayoutPart::Single(_) => {
+                            // single_count
+                            counters.0 += 1;
+                            // s3_part_count
+                            counters.2 += 1;
+                        }
+                        ZipLayoutPart::Duo { copy, .. } => {
+                            // duo_count
+                            counters.1 += 1;
+                            // s3_part_count
+                            counters.2 += 2;
+                            match copy {
+                                CopyZipPart::FullCopy(_) => {
+                                    // full_duo_count
+                                    counters.3 += 1;
+                                }
+                                CopyZipPart::PartialCopy { .. } => {
+                                    // partial_duo_count
+                                    counters.4 += 1;
+                                }
+                            }
+                        }
+                    }
+                    counters
+                },
+            );
+
         info!(
-            part_count = parts.len(),
-            single_count, duo_count, "Layout done"
+            s3_part_count,
+            layout_part_count = parts.len(),
+            single_count,
+            duo_count,
+            full_duo_count,
+            partial_duo_count,
+            "Layout done"
         );
 
         Self { parts }
