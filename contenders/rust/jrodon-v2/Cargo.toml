@@ -2,7 +2,7 @@
 # IMPORTANT: the package name MUST match the directory name (<dev_id>).
 # The CI build pipeline derives the cargo-lambda output path from this name
 # and copies `target/lambda/<name>/bootstrap` into this directory.
-name = "jeremie-rodon"
+name = "jrodon-v2"
 version = "0.1.0"
 rust-version = "1.85.0"
 edition = "2024"
@@ -20,7 +20,5 @@ aws-sdk-s3 = "1"
 tokio = { version = "1", features = ["macros", "signal"] }
 serde = { version = "1", features = ["derive"] }
 
-# ZIP generation
-zip = { version = "5.1", default-features = false }
-
 thiserror = "2"
+base64 = "0.22"

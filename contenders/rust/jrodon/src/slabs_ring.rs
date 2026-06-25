@@ -83,17 +83,13 @@ impl SlabRing {
     /// The backing `Vec<u8>` is allocated at full capacity with `set_len` (contents are
     /// uninitialised but never read before being written). The first slab is pre-marked
     /// `Filling` so the [`Writer`] can begin immediately without claiming a free slab.
-    pub fn new(slab_size: usize, slab_count: usize) -> (Writer, Reader) {
+    pub fn create(slab_size: usize, slab_count: usize) -> (Writer, Reader) {
         info!(
             "Creating SlabRing with slab_size={}, slab_count={}",
             slab_size, slab_count
         );
         // pre-allocate
-        let mut buf = Vec::with_capacity(slab_size * slab_count);
-        // safety: set_len to capacity; we manage initialization manually by writing bytes
-        unsafe {
-            buf.set_len(buf.capacity());
-        }
+        let buf = vec![0; slab_size * slab_count];
 
         let (tx, rx) = mpsc::unbounded_channel::<SlabLease>(); // capacity == #slabs: never blocks producer when a slab is sealed if a free exists
         let ring = Arc::new(Self {
@@ -147,7 +143,7 @@ pub struct SlabLease {
 
 impl SlabLease {
     /// Borrows the sealed slab data in place.
-    pub fn as_slice<'a>(&'a self) -> &'a [u8] {
+    pub fn as_slice(&self) -> &[u8] {
         &self.ring.buf[self.data.clone()]
     }
     /// Copies the slab data into an owned `Vec<u8>`.
@@ -219,7 +215,7 @@ impl Default for Writer {
     /// Required because [`zipper::Zipper`] has a `W: Default` bound (the `zip` crate's
     /// `StreamWriter` swaps the inner writer out on `finish`).
     fn default() -> Self {
-        SlabRing::new(0, 0).0
+        SlabRing::create(0, 0).0
     }
 }
 impl std::io::Write for Writer {
@@ -240,7 +236,7 @@ impl std::io::Write for Writer {
             ));
         }
         let mut total_written = 0usize;
-        while buf.len() > 0 {
+        while !buf.is_empty() {
             // space left in the current slab
             let room = self.ring.slab_size - self.offset;
             if room == 0 {

@@ -140,7 +140,7 @@ not the pinned build toolchain — do not downgrade.
 
 ## Reference implementation
 
-`contenders/rust/jeremie-rodon/` is both a working contender and the
+`contenders/rust/jrodon/` is both a working contender and the
 copy-paste template. Keep its CFN block as the last entry in
 `templates/contenders.yml` so newcomers always see a registered example.
 

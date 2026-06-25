@@ -1,5 +1,5 @@
 {
-  "Comment": "Benchmark the contender Lambdas: for each ARN run the lambda RunsPerContender times in parallel (timed), validate run-0's archive with the control Lambda, aggregate mean/stddev/min/max, then delete all archives. Outputs ordered success / failure lists.",
+  "Comment": "Benchmark the contender Lambdas: for each ARN run the lambda RunsPerContender times in parallel (timed), validate run-0's archive with the control Lambda, aggregate mean/stddev/min/max, apply a performance gate (mean+stddev < MaxRunTimeMs), then delete all archives. Outputs ordered success / failure lists.",
   "QueryLanguage": "JSONata",
   "StartAt": "BenchOverContenders",
   "States": {
@@ -216,7 +216,30 @@
               "duration_ms_max": "{% $max($durations) %}",
               "runs_count": "{% $count($durations) %}"
             },
-            "Next": "BuildSuccessResult"
+            "Next": "CheckPerformance"
+          },
+          "CheckPerformance": {
+            "Type": "Choice",
+            "Comment": "Performance gate: mean + stddev must be strictly below MaxRunTimeMs. A fast-but-jittery contender that could exceed the budget under normal variance is rejected.",
+            "Choices": [
+              {
+                "Condition": "{% $duration_ms_mean + $duration_ms_stddev < ${MaxRunTimeMs} %}",
+                "Next": "BuildSuccessResult"
+              }
+            ],
+            "Default": "RecordContenderTooSlow"
+          },
+          "RecordContenderTooSlow": {
+            "Type": "Pass",
+            "Comment": "Correct but too slow: mean + stddev breaches the budget. Report as failure and clean up archives.",
+            "Assign": {
+              "contender_result": {
+                "kind": "failure",
+                "arn": "{% $arn %}",
+                "reason": "{% 'too slow: mean ' & $round($duration_ms_mean) & 'ms + stddev ' & $round($duration_ms_stddev) & 'ms = ' & $round($duration_ms_mean + $duration_ms_stddev) & 'ms exceeds ' & ${MaxRunTimeMs} & 'ms budget' %}"
+              }
+            },
+            "Next": "DeleteAllArchives"
           },
           "BuildSuccessResult": {
             "Type": "Pass",

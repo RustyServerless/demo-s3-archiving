@@ -110,7 +110,7 @@ struct FileInfo {
 /// All three fields are `Arc<str>` so they can be cheaply cloned into every spawned task.
 /// - `bucket_name` — source and destination bucket.
 /// - `files_prefix` — S3 key prefix (without trailing slash) for the source objects.
-/// - `archive_key` — destination S3 key for the produced ZIP (e.g. `archives/rust-jeremie-rodon.zip`).
+/// - `archive_key` — destination S3 key for the produced ZIP (e.g. `archives/rust-jrodon.zip`).
 #[derive(Debug, Deserialize, Clone)]
 struct JobInfo {
     bucket_name: Arc<str>,
@@ -298,7 +298,7 @@ fn spawn_upload_jobs(
                     }
                     Err(e) => {
                         error!("Failed to upload part {}: {}", part_number, e);
-                        return Err(e);
+                        Err(e)
                     }
                 }
             });
@@ -428,7 +428,7 @@ async fn create_multipart_archive(files: Vec<FileInfo>, job_info: JobInfo) -> Re
 
     // 2. Set up communication channels
     let (zip_queue_tx, zip_queue_rx) = mpsc::unbounded_channel();
-    let (writer, reader) = SlabRing::new(CHUNK_SIZE_BYTES, BUFFER_CHUNKS_COUNT);
+    let (writer, reader) = SlabRing::create(CHUNK_SIZE_BYTES, BUFFER_CHUNKS_COUNT);
 
     // 3. Spawn all jobs
     let download_handle = spawn_download_job(job_info, files, zip_queue_tx);

@@ -25,6 +25,10 @@ Parameters:
     Type: Number
     Default: 10
     Description: Number of times each contender Lambda is invoked in parallel per benchmark run; the reported duration_ms is the mean across all runs
+  MaxRunTimeMs:
+    Type: Number
+    Default: 300000
+    Description: Performance budget in milliseconds. A contender fails if mean(duration_ms) + stddev(duration_ms) >= this value (it must archive consistently under this budget).
 
 Resources:
   #############
@@ -119,7 +123,7 @@ Resources:
       FunctionName: !Sub ${ProjectName}-fill-bucket
       CodeUri: ../benching/fill-bucket
       Runtime: provided.al2023
-      MemorySize: 384
+      MemorySize: 768
       Timeout: 600
       Handler: rust.handler
       Architectures:
@@ -267,6 +271,7 @@ Resources:
         FilesPrefix: !Ref FilesPrefix
         TestFileCount: !Ref TestFileCount
         RunsPerContender: !Ref RunsPerContender
+        MaxRunTimeMs: !Ref MaxRunTimeMs
       Role: !GetAtt BenchingStateMachineRole.Arn
       Logging:
         Level: ALL

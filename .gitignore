@@ -22,3 +22,8 @@ target/
 # Swift
 .build/
 contenders/swift/*/scripts/out/
+.crt-cache-local/
+contenders/c/sebsto/bootstrap
+contenders/c/sebsto/src/*.o
+.crt-cache/
+/cmake

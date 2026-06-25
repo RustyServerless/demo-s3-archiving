@@ -67,7 +67,7 @@ The execution output is a single JSON document with two lists:
 {
   "success": [
     {
-      "arn": "arn:aws:lambda:...:function:demo-s3-archiving-rust-jeremie-rodon",
+      "arn": "arn:aws:lambda:...:function:demo-s3-archiving-rust-jrodon",
       "runtime": "provided.al2023",
       "architecture": "arm64",
       "memory_mb": 512,
@@ -187,7 +187,7 @@ Deleting them in parallel will fail and is annoying to unwind.
 ## Writing a contender
 
 The repository ships with one reference contender:
-[`contenders/rust/jeremie-rodon/`](contenders/rust/jeremie-rodon/). It is also
+[`contenders/rust/jrodon/`](contenders/rust/jrodon/). It is also
 the copy-paste template for new ones in Rust. If you want to beat it (or just write
 one in another language), the contract below is everything you need to know.
 
@@ -261,9 +261,9 @@ Lambda function name, and (for Rust) the cargo package name. Pick:
 
 | Where | Value | Example |
 |---|---|---|
-| Source directory | `contenders/<lang>/<dev_id>/` | `contenders/rust/jeremie-rodon/` |
-| Cargo package name (Rust only) | `<dev_id>` (must equal directory name) | `jeremie-rodon` |
-| Lambda function name | `${ProjectName}-<lang>-<dev_id>` | `demo-s3-archiving-rust-jeremie-rodon` |
+| Source directory | `contenders/<lang>/<dev_id>/` | `contenders/rust/jrodon/` |
+| Cargo package name (Rust only) | `<dev_id>` (must equal directory name) | `jrodon` |
+| Lambda function name | `${ProjectName}-<lang>-<dev_id>` | `demo-s3-archiving-rust-jrodon` |
 | CFN logical ID prefix | `<Lang><DevId>` (PascalCase, no hyphens) | `RustJeremieRodon` |
 
 Adding a contender is **three edits**:
