@@ -23,7 +23,7 @@ use aws_sdk_s3::Client;
 use futures::stream::StreamExt;
 
 use figment_engine::engine::crc::decode_s3_crc32;
-use figment_engine::engine::plan::{FileId, PART_FLOOR};
+use figment_engine::engine::plan::FileId;
 use figment_engine::engine::zip_format::{self, EntryMeta};
 
 use crate::plan_chain::{ChainPlan, Entry, Link, Piece, Segment};
@@ -137,47 +137,112 @@ pub async fn run(
 
 	let plan = Arc::new(plan);
 
-	// ---- Phase 2: build each segment object via its link chain. ----
-	// Segments are independent → concurrent. Links within a segment are serial.
-	// Each segment lands at `{archive_key}.seg/{index}`.
-	let t_seg = Instant::now();
-	let seg_results: Vec<Result<(usize, String, u64), ChainError>> =
+	// ---- Open the final stitch MPU up front. ----
+	// Stitch part numbers are POSITIONAL and known from the plan before any
+	// segment exists (segment k -> stitch part k+1; the CD is the exempt last
+	// part). So the MPU can be created now, and each segment's stitch copy can
+	// fire the instant that segment's object is complete — no end-of-run barrier.
+	let stitch_upload_id = create_mpu(s3, bucket, archive_key).await?;
+	let n_segments = plan.segments.len();
+
+	// ---- Build the central directory eagerly. ----
+	// Inputs are ready: offsets at plan time, CRCs after fill_crcs. In the
+	// copy-only design there is no body IO to contend with, so nothing forces the
+	// CD to wait for the stitch (that deferral was a streaming-design habit).
+	// Build it now and upload it as the exempt last part immediately.
+	let t_cd = Instant::now();
+	let cd_bytes = build_central_directory(&plan)?;
+	let cd_part_number = (n_segments + 1) as i32;
+	let cd_part = {
+		let s3 = s3.clone();
+		let bucket = bucket.to_string();
+		let archive_key = archive_key.to_string();
+		let upload_id = stitch_upload_id.clone();
+		with_retry(move || {
+			let s3 = s3.clone();
+			let bucket = bucket.clone();
+			let archive_key = archive_key.clone();
+			let upload_id = upload_id.clone();
+			let cd_bytes = cd_bytes.clone();
+			async move {
+				upload_part(
+					&s3,
+					&bucket,
+					&archive_key,
+					&upload_id,
+					cd_part_number,
+					cd_bytes,
+				)
+				.await
+			}
+		})
+		.await?
+	};
+	tracing::info!(ms = t_cd.elapsed().as_millis(), "PHASE cd_eager");
+
+	// ---- Build each segment object AND fire its stitch copy, completion-driven. ----
+	// Each segment task: build the segment object via its link chain, then
+	// immediately UploadPartCopy it as stitch part (index+1). The stitch copies
+	// thus overlap segment-building entirely — each fires the moment its own
+	// segment finishes, riding the same pool, rather than waiting for all
+	// segments. (SPEED: a future two-tier rate limiter would prioritise segment
+	// links over stitch copies under one global cap; here they share the pool.)
+	let t_build = Instant::now();
+	let results: Vec<Result<CompletedPart, ChainError>> =
 		futures::stream::iter(plan.segments.iter().map(|seg| {
 			let s3 = s3.clone();
 			let plan = plan.clone();
 			let bucket = bucket.to_string();
 			let files_prefix = files_prefix.to_string();
-			let seg_key = segment_key(archive_key, seg.index);
+			let archive_key = archive_key.to_string();
+			let upload_id = stitch_upload_id.clone();
+			let seg_key = segment_key(&archive_key, seg.index);
+			let stitch_part = (seg.index + 1) as i32;
 			async move {
+				// 1) Assemble the segment object (serial link chain).
 				build_segment_object(&s3, &bucket, &files_prefix, &plan, seg, &seg_key).await?;
-				Ok::<_, ChainError>((seg.index, seg_key, seg.object_len))
+				// 2) Immediately copy it into the stitch MPU as its positional part.
+				let src = format!("{bucket}/{seg_key}");
+				let part = with_retry(|| async {
+					upload_part_copy(
+						&s3,
+						&bucket,
+						&archive_key,
+						&upload_id,
+						stitch_part,
+						&src,
+						None,
+					)
+					.await
+				})
+				.await?;
+				Ok::<_, ChainError>(part)
 			}
 		}))
 		.buffer_unordered(SEGMENT_CONCURRENCY)
 		.collect()
 		.await;
 
-	let mut seg_objects: Vec<(usize, String, u64)> = Vec::with_capacity(plan.segments.len());
-	for r in seg_results {
-		seg_objects.push(r?);
+	let mut parts: Vec<CompletedPart> = Vec::with_capacity(n_segments + 1);
+	parts.push(cd_part);
+	for r in results {
+		parts.push(r?);
 	}
-	seg_objects.sort_by_key(|(i, _, _)| *i);
 	tracing::info!(
-		ms = t_seg.elapsed().as_millis(),
-		segments = seg_objects.len(),
-		"PHASE segments"
+		ms = t_build.elapsed().as_millis(),
+		segments = n_segments,
+		"PHASE build_and_stitch"
 	);
 
-	// ---- Phase 3: stitch the segment objects + central directory into the archive. ----
-	// SPEED: this is the simple end-of-run stitch. The overlapped version fires
-	// each stitch copy when its segment finishes (see segment-chain-wiring.md).
-	let t_stitch = Instant::now();
-	stitch(s3, bucket, archive_key, &plan, &seg_objects).await?;
-	tracing::info!(ms = t_stitch.elapsed().as_millis(), "PHASE stitch");
+	// ---- The one irreducible tail: complete the stitch MPU. ----
+	let t_done = Instant::now();
+	complete_mpu(s3, bucket, archive_key, &stitch_upload_id, parts).await?;
+	tracing::info!(ms = t_done.elapsed().as_millis(), "PHASE terminal_complete");
 
-	// ---- Phase 4: clean up the intermediate segment objects. ----
-	// Best-effort; failures here don't invalidate the archive.
-	cleanup(s3, bucket, &seg_objects).await;
+	// ---- Best-effort cleanup of the intermediate segment objects. ----
+	// SPEED: deferred to after the archive is complete so these DeleteObject
+	// calls never compete for call budget with the work that must succeed.
+	cleanup(s3, bucket, n_segments, archive_key).await;
 
 	Ok(())
 }
@@ -352,60 +417,6 @@ async fn build_piece_part(
 			upload_part_copy(s3, bucket, out_key, upload_id, part_number, &src, None).await
 		}
 	}
-}
-
-/// Stitch: one MPU over the (ordered) segment objects as copy-parts, then the
-/// central directory + ZIP64 trailer as the exempt last part.
-async fn stitch(
-	s3: &Client,
-	bucket: &str,
-	archive_key: &str,
-	plan: &ChainPlan,
-	seg_objects: &[(usize, String, u64)],
-) -> Result<(), ChainError> {
-	let upload_id = create_mpu(s3, bucket, archive_key).await?;
-	let n = seg_objects.len();
-
-	// Segment objects → copy-parts 1..=n (each >= 5 MiB, non-last). Concurrent.
-	let copies: Vec<Result<CompletedPart, ChainError>> =
-		futures::stream::iter(seg_objects.iter().enumerate().map(|(i, (_, key, _))| {
-			let s3 = s3.clone();
-			let bucket = bucket.to_string();
-			let archive_key = archive_key.to_string();
-			let upload_id = upload_id.clone();
-			let src = format!("{bucket}/{key}");
-			let part_number = (i + 1) as i32;
-			async move {
-				with_retry(|| async {
-					upload_part_copy(
-						&s3,
-						&bucket,
-						&archive_key,
-						&upload_id,
-						part_number,
-						&src,
-						None,
-					)
-					.await
-				})
-				.await
-			}
-		}))
-		.buffer_unordered(STITCH_CONCURRENCY)
-		.collect()
-		.await;
-
-	let mut parts: Vec<CompletedPart> = Vec::with_capacity(n + 1);
-	for c in copies {
-		parts.push(c?);
-	}
-
-	// Central directory + trailer = exempt last part (n+1).
-	let cd = build_central_directory(plan)?;
-	parts.push(upload_part(s3, bucket, archive_key, &upload_id, (n + 1) as i32, cd).await?);
-
-	parts.sort_by_key(|p| p.part_number().unwrap_or_default());
-	complete_mpu(s3, bucket, archive_key, &upload_id, parts).await
 }
 
 /// Central directory + ZIP64 end records from the realised plan (all CRCs known).
@@ -613,12 +624,13 @@ async fn fill_crcs(
 }
 
 /// Best-effort delete of the intermediate segment objects after the stitch.
-async fn cleanup(s3: &Client, bucket: &str, seg_objects: &[(usize, String, u64)]) {
-	let _ = PART_FLOOR; // (kept in scope for future floor asserts)
-	futures::stream::iter(seg_objects.iter().map(|(_, key, _)| {
+/// Deferred until the archive is complete so these DeleteObject calls never
+/// compete for call budget with the assembly that must succeed.
+async fn cleanup(s3: &Client, bucket: &str, n_segments: usize, archive_key: &str) {
+	futures::stream::iter((0..n_segments).map(|i| {
 		let s3 = s3.clone();
 		let bucket = bucket.to_string();
-		let key = key.clone();
+		let key = segment_key(archive_key, i);
 		async move {
 			let _ = s3.delete_object().bucket(&bucket).key(&key).send().await;
 		}
