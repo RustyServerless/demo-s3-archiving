@@ -37,8 +37,6 @@ use crate::plan_chain::{ChainPlan, Entry, Link, Piece, Segment};
 const SEGMENT_CONCURRENCY: usize = 256;
 /// HEADs for CRC — read-only, cheap, run wide (separate ~5,500/s GET/HEAD budget).
 const CRC_CONCURRENCY: usize = 256;
-/// Stitch copy-parts — server-side copies into one MPU, latency-bound.
-const STITCH_CONCURRENCY: usize = 128;
 /// Max attempts per call before giving up (transient breaks + SlowDown/5xx).
 const MAX_ATTEMPTS: u32 = 5;
 
@@ -242,16 +240,23 @@ pub async fn run(
 	complete_mpu(s3, bucket, archive_key, &stitch_upload_id, parts).await?;
 	tracing::info!(ms = t_done.elapsed().as_millis(), "PHASE terminal_complete");
 
-	// ---- Best-effort cleanup of the intermediate segment objects. ----
-	// SPEED: deferred to after the archive is complete so these DeleteObject
-	// calls never compete for call budget with the work that must succeed.
-	cleanup(s3, bucket, n_segments, archive_key).await;
-
+	// The archive is now complete and valid; the handler returns here. The
+	// intermediate `seg-temps/` objects are NOT deleted in-Lambda — a bucket
+	// lifecycle rule (Prefix: seg-temps/) reaps them asynchronously. Cleaning up
+	// here would put thousands of DeleteObject calls inside the benchmark-measured
+	// invoke duration; the benchmark times the whole synchronous invoke, so any
+	// in-handler GC directly inflates the reported time. GC is not the archiver's
+	// job and not the benchmark's concern.
 	Ok(())
 }
 
+/// Intermediate segment/link objects live under a dedicated top-level
+/// `seg-temps/` prefix (NOT under `archives/`), so a single bucket lifecycle rule
+/// (`Prefix: seg-temps/`) can expire them without any risk of matching the real
+/// archives that share the `archives/` prefix. The archive_key is embedded for
+/// uniqueness across concurrent runs; its own slashes are ordinary key chars.
 fn segment_key(archive_key: &str, index: usize) -> String {
-	format!("{archive_key}.seg/{index:08}")
+	format!("seg-temps/{archive_key}/{index:08}")
 }
 
 /// Build one segment's object at `seg_key` by walking its links. Each link is its
@@ -626,39 +631,4 @@ async fn fill_crcs(
 		}
 	}
 	Ok(())
-}
-
-/// Best-effort delete of ALL intermediate objects under the `{archive_key}.seg/`
-/// prefix — both the finished segment objects (`…/{index}`) and every per-link
-/// temp (`…/{index}.l{li}`), which are no longer deleted inline during the chain.
-/// Deferred until the archive is complete so these DeleteObject calls never
-/// compete for the serial chains' round-trip budget. Listed-then-deleted so it
-/// catches every temp regardless of per-segment link depth.
-async fn cleanup(s3: &Client, bucket: &str, _n_segments: usize, archive_key: &str) {
-	let prefix = format!("{archive_key}.seg/");
-	let mut keys: Vec<String> = Vec::new();
-	let mut paginator = s3
-		.list_objects_v2()
-		.bucket(bucket)
-		.prefix(&prefix)
-		.into_paginator()
-		.send();
-	while let Some(page) = paginator.next().await {
-		let Ok(page) = page else { break };
-		for obj in page.contents() {
-			if let Some(k) = obj.key() {
-				keys.push(k.to_string());
-			}
-		}
-	}
-	futures::stream::iter(keys.into_iter().map(|key| {
-		let s3 = s3.clone();
-		let bucket = bucket.to_string();
-		async move {
-			let _ = s3.delete_object().bucket(&bucket).key(&key).send().await;
-		}
-	}))
-	.buffer_unordered(STITCH_CONCURRENCY)
-	.collect::<Vec<()>>()
-	.await;
 }

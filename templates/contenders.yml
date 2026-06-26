@@ -53,21 +53,23 @@ Resources:
                 Resource: !Sub arn:${AWS::Partition}:s3:::${BucketName}/archives/*
               # ---------------------------------------------------------------
               # ChainIntermediates — required ONLY by the figment-engine-chain
-              # contender. Its copy-only design builds intermediate segment
-              # objects under archives/<key>.seg/... and then uses
-              # UploadPartCopy with THOSE objects as the copy source (and the
-              # previous link's object for each forward link). UploadPartCopy
-              # requires s3:GetObject on the copy source, and the design deletes
-              # its own intermediates after stitching — neither of which the
-              # UploadArchive statement above grants (other contenders only ever
-              # copy from files/*, which they can already read). Scoped to
-              # archives/* so it cannot read or delete the source objects.
+              # contender. Its copy-only design builds intermediate segment/link
+              # objects under the dedicated seg-temps/ prefix (NOT archives/), then
+              # uses UploadPartCopy with THOSE objects as the copy source (each
+              # forward link copies the previous link's object). That needs full
+              # MPU write perms AND s3:GetObject on seg-temps/* as the copy source —
+              # none of which the UploadArchive statement (scoped to archives/*)
+              # grants. The intermediates are reaped by a bucket lifecycle rule
+              # (Prefix: seg-temps/), so the chain does NOT need DeleteObject.
+              # Scoped to seg-temps/* so it cannot touch source objects or archives.
               - Sid: ChainIntermediates
                 Effect: Allow
                 Action:
+                  - s3:PutObject
                   - s3:GetObject
-                  - s3:DeleteObject
-                Resource: !Sub arn:${AWS::Partition}:s3:::${BucketName}/archives/*
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource: !Sub arn:${AWS::Partition}:s3:::${BucketName}/seg-temps/*
               - Sid: Logs
                 Effect: Allow
                 Action:

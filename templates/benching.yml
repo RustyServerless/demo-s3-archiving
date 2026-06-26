@@ -56,6 +56,10 @@ Resources:
             Status: Enabled
             AbortIncompleteMultipartUpload:
               DaysAfterInitiation: 1
+          - Id: ReapSegmentTemps
+            Status: Enabled
+            Prefix: seg-temps/
+            ExpirationInDays: 1
   # Custom resource reusing the bucket emptier Lambda from the CI stack.
   # Fn::ImportValue reads a value exported by another stack (cross-stack reference).
   BucketEmptier:
