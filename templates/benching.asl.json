@@ -9,7 +9,7 @@
       "ItemSelector": {
         "arn": "{% $states.context.Map.Item.Value %}"
       },
-      "MaxConcurrency": 0,
+      "MaxConcurrency": 1,
       "ItemProcessor": {
         "ProcessorConfig": {
           "Mode": "INLINE"
@@ -66,7 +66,7 @@
               "archive_key": "{% $archive_key_base & '-' & $string($states.context.Map.Item.Value) & '.zip' %}",
               "archive_key_base": "{% $archive_key_base %}"
             },
-            "MaxConcurrency": 0,
+            "MaxConcurrency": 1,
             "ItemProcessor": {
               "ProcessorConfig": {
                 "Mode": "INLINE"
