@@ -34,7 +34,7 @@ use crate::plan_chain::{ChainPlan, Entry, Link, Piece, Segment};
 /// SlowDown at 64-wide and only ~690 calls/s achieved (a fifth of the knee), so
 /// the bottleneck is under-concurrency, not throttling — push this high and let
 /// the rate limiter (added later) cap it for the contended benchmark.
-const SEGMENT_CONCURRENCY: usize = 256;
+const SEGMENT_CONCURRENCY: usize = 512;
 /// HEADs for CRC — read-only, cheap, run wide (separate ~5,500/s GET/HEAD budget).
 const CRC_CONCURRENCY: usize = 256;
 /// Stitch copy-parts — server-side copies into one MPU, latency-bound.
