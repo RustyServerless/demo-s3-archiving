@@ -51,6 +51,23 @@ Resources:
                   - s3:ListMultipartUploadParts
                   - s3:ListBucketMultipartUploads
                 Resource: !Sub arn:${AWS::Partition}:s3:::${BucketName}/archives/*
+              # ---------------------------------------------------------------
+              # ChainIntermediates — required ONLY by the figment-engine-chain
+              # contender. Its copy-only design builds intermediate segment
+              # objects under archives/<key>.seg/... and then uses
+              # UploadPartCopy with THOSE objects as the copy source (and the
+              # previous link's object for each forward link). UploadPartCopy
+              # requires s3:GetObject on the copy source, and the design deletes
+              # its own intermediates after stitching — neither of which the
+              # UploadArchive statement above grants (other contenders only ever
+              # copy from files/*, which they can already read). Scoped to
+              # archives/* so it cannot read or delete the source objects.
+              - Sid: ChainIntermediates
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${BucketName}/archives/*
               - Sid: Logs
                 Effect: Allow
                 Action:
@@ -293,6 +310,7 @@ Resources:
   # S3 control-plane call rate. Memory here is a vCPU dial, not a RAM need: start
   # HIGH (1024 MB) so vCPU never limits the issue rate while finding the 503 knee,
   # then lower in a second sweep. (Carries no body buffers — RAM use is trivial.)
+  # Needs the ChainIntermediates IAM statement (copy-from + delete on archives/*).
   RustFigmentEngineChainFunction:
     Type: AWS::Serverless::Function
     Properties:

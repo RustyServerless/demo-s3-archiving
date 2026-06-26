@@ -5,11 +5,9 @@
 //! design escapes the ENI bandwidth floor and is bound only by S3 control-plane
 //! call rate.
 //!
-//! This file is the wiring skeleton: it lists the source objects and reuses the
-//! shipped contender's shared modules via the `figment_engine` lib (ZIP layout,
-//! CRC decode, planner vocabulary). The planner (`plan_chain`) and executor
-//! (`assemble_chain`) are stubbed until implemented — the binary builds and runs,
-//! but currently returns `unimplemented` at invoke time.
+//! Wiring: lists the source objects, builds the shared `SourceFile` vocabulary,
+//! plans the segment chain, and runs the executor. Planner is implemented;
+//! `assemble_chain` is still a stub (returns Unimplemented) until built.
 
 mod assemble_chain;
 mod plan_chain;
@@ -18,14 +16,10 @@ mod rate_limit;
 use std::sync::Arc;
 
 use awssdk_instrumentation::lambda::{LambdaError, LambdaEvent};
+use figment_engine::engine::plan::{FileId, SourceFile};
 use serde::Deserialize;
 use tracing::info;
 
-// Shared from the shipped contender's lib target — no duplication.
-use figment_engine::{FileId, SourceFile};
-
-/// Lambda event payload describing one archiving job (same shape as the shipped
-/// contender, so the benchmark harness invokes it identically).
 #[derive(Debug, Deserialize, Clone)]
 struct JobInfo {
 	bucket_name: Arc<str>,
@@ -33,9 +27,9 @@ struct JobInfo {
 	archive_key: Arc<str>,
 }
 
-/// List every object under `{files_prefix}/`, returning a `SourceFile` per object.
-/// (The shipped contender's lister lives in its `main.rs`/bin, not its lib, so the
-/// chain carries its own — it's the only non-shared piece, ~20 lines.)
+/// List every object under `{files_prefix}/`, returning the shared `SourceFile`
+/// per object. (The shipped contender's lister lives in its bin, not its lib, so
+/// the chain carries its own — the only non-shared piece.)
 async fn list_source_files(
 	bucket: &str,
 	files_prefix: &str,
@@ -55,21 +49,19 @@ async fn list_source_files(
 		for obj in page.contents() {
 			let Some(key) = obj.key() else { continue };
 			let Some(size) = obj.size() else { continue };
-			if key == s3_prefix {
+			let Some(name) = key.strip_prefix(&s3_prefix) else {
+				continue;
+			};
+			if name.is_empty() {
 				continue;
 			}
-			if let Some(name) = key.strip_prefix(&s3_prefix) {
-				if name.is_empty() {
-					continue;
-				}
-				out.push(SourceFile {
-					id: FileId(next_id),
-					key: key.to_string(),
-					name: name.to_string(),
-					size: size as u64,
-				});
-				next_id += 1;
-			}
+			out.push(SourceFile {
+				id: FileId(next_id),
+				key: key.to_string(),
+				name: name.to_string(),
+				size: size as u64,
+			});
+			next_id += 1;
 		}
 	}
 	Ok(out)
@@ -87,8 +79,17 @@ async fn handler(event: LambdaEvent<JobInfo>) -> Result<(), LambdaError> {
 	let files = list_source_files(&bucket_name, &files_prefix).await?;
 	info!(count = files.len(), "listed source files");
 
-	// ---- planner + executor: stubbed until implemented ----
-	let plan = plan_chain::plan_segment_chain(files);
+	let plan = plan_chain::plan_segment_chain(files)?;
+	info!(
+		entries = plan.stats.entries,
+		segments = plan.stats.segments,
+		bigs = plan.stats.bigs,
+		smalls = plan.stats.smalls,
+		links = plan.stats.links,
+		max_chain_depth = plan.stats.max_chain_depth,
+		"planned segment chain"
+	);
+
 	assemble_chain::run(&s3(), &bucket_name, &files_prefix, &archive_key, plan).await?;
 
 	info!("archive complete");
