@@ -63,8 +63,7 @@
             "ItemSelector": {
               "run_index": "{% $states.context.Map.Item.Value %}",
               "arn": "{% $arn %}",
-              "archive_key": "{% $archive_key_base & '-' & $string($states.context.Map.Item.Value) & '.zip' %}",
-              "archive_key_base": "{% $archive_key_base %}"
+              "archive_key": "{% $archive_key_base & '-' & $string($states.context.Map.Item.Value) & '.zip' %}"
             },
             "MaxConcurrency": 0,
             "ItemProcessor": {
@@ -146,8 +145,8 @@
               "contender_failed": "{% $boolean($states.input[kind='run_failure']) ? true : false %}",
               "failure_reason": "{% ($res := $states.input[kind='run_failure'][0].reason ; $boolean($res) ? $res : null) %}",
               "durations": "{% ($res := $states.input[kind='run_success'].duration_ms ; $boolean($res) ? [$res] : [] ) %}",
-              "archive_key_run0": "{% $archive_key_base & '-0.zip' %}",
-              "all_archive_keys": "{% $states.input.archive_key %}"
+              "archive_key_run0": "{% [$states.input.archive_key][0] %}",
+              "all_archive_keys": "{% [$states.input.archive_key] %}"
             },
             "Next": "CheckRunsSucceeded"
           },
