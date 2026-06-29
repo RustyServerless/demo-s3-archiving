@@ -519,22 +519,21 @@ async fn build_segment_object(
 			format!("{seg_key}.l{li}")
 		};
 
-		// Each link is governed at High priority (the critical path). The
-		// governor paces at link granularity; AIMD adapts the link-rate to
-		// whatever keeps SlowDowns away regardless of the calls-per-link factor.
-		with_retry_governed(rl, Priority::High, || async {
-			build_one_link(
-				s3,
-				bucket,
-				files_prefix,
-				plan,
-				link,
-				prev_object.as_deref(),
-				&out_key,
-				crcs,
-			)
-			.await
-		})
+		// Build the link. Each individual S3 call inside is governed (acquires a
+		// token, retries, signals throttle) so the governor paces REAL calls, not
+		// links — a link is ~4 calls, and pacing links let the true call rate
+		// overshoot ~4x under contention. Priority High: the critical path.
+		build_one_link(
+			s3,
+			bucket,
+			files_prefix,
+			plan,
+			link,
+			prev_object.as_deref(),
+			&out_key,
+			rl,
+			crcs,
+		)
 		.await?;
 
 		// NOTE: the previous link's temp object is NOT deleted here. The inline
@@ -550,7 +549,11 @@ async fn build_segment_object(
 	Ok(())
 }
 
-/// Realise one link as a complete MPU producing `out_key`.
+/// Realise one link as a complete MPU producing `out_key`. Every individual S3
+/// call is governed (acquire a token, retry, signal throttle), so the governor's
+/// rate reflects the TRUE call rate — a link is ~4 calls, and governing the link
+/// as a unit let the real call rate overshoot ~4x the governed rate, which is what
+/// collapsed the contended case.
 async fn build_one_link(
 	s3: &Client,
 	bucket: &str,
@@ -559,9 +562,16 @@ async fn build_one_link(
 	link: &Link,
 	prev_object: Option<&str>,
 	out_key: &str,
+	rl: &RateLimiter,
 	crcs: &CrcStore,
 ) -> Result<(), ChainError> {
-	let upload_id = create_mpu(s3, bucket, out_key).await?;
+	let upload_id = with_retry_governed(rl, Priority::High, || async {
+		create_mpu(s3, bucket, out_key).await
+	})
+	.await?;
+	// Borrow once as a Copy &str so the per-call `async move` closures each capture
+	// the reference (Copy) rather than trying to move the String.
+	let uid: &str = &upload_id;
 	let mut parts: Vec<CompletedPart> = Vec::with_capacity(2);
 
 	match link {
@@ -569,37 +579,61 @@ async fn build_one_link(
 			// part1 = UploadPart( LFH_big0 ++ GET big0[..steal_len] )  (== 5 MiB)
 			let entry = &plan.entries[anchor];
 			let header = zip_format::local_header(&meta_of(entry, crcs)?);
-			let prefix = get_object_range_bytes(
-				s3,
-				bucket,
-				&source_key(files_prefix, &entry.name),
-				0,
-				*steal_len,
-			)
+			let prefix = with_retry_governed(rl, Priority::High, || async {
+				get_object_range_bytes(
+					s3,
+					bucket,
+					&source_key(files_prefix, &entry.name),
+					0,
+					*steal_len,
+				)
+				.await
+			})
 			.await?;
 			let mut p1 = Vec::with_capacity(header.len() + prefix.len());
 			p1.extend_from_slice(&header);
 			p1.extend_from_slice(&prefix);
-			parts.push(upload_part(s3, bucket, out_key, &upload_id, 1, p1).await?);
+			let p1_part = with_retry_governed(rl, Priority::High, || {
+				let p1 = p1.clone();
+				async move { upload_part(s3, bucket, out_key, uid, 1, p1).await }
+			})
+			.await?;
+			parts.push(p1_part);
 
 			// part2 = UploadPartCopy( big0[steal_len..] )  (exempt last)
 			let src = copy_source(bucket, files_prefix, &entry.name);
 			let range = Some(format!("bytes={}-{}", steal_len, entry.size - 1));
-			parts.push(upload_part_copy(s3, bucket, out_key, &upload_id, 2, &src, range).await?);
+			let p2 = with_retry_governed(rl, Priority::High, || {
+				let src = src.clone();
+				let range = range.clone();
+				async move { upload_part_copy(s3, bucket, out_key, uid, 2, &src, range).await }
+			})
+			.await?;
+			parts.push(p2);
 		}
 
 		Link::AnchorOnly { anchor } => {
 			// Single part = UploadPartCopy(anchor) (the only/last part, exempt).
 			let entry = &plan.entries[anchor];
 			let src = copy_source(bucket, files_prefix, &entry.name);
-			parts.push(upload_part_copy(s3, bucket, out_key, &upload_id, 1, &src, None).await?);
+			let p = with_retry_governed(rl, Priority::High, || {
+				let src = src.clone();
+				async move { upload_part_copy(s3, bucket, out_key, uid, 1, &src, None).await }
+			})
+			.await?;
+			parts.push(p);
 		}
 
 		Link::AnchorThenAppend { anchor, piece } => {
 			// part1 = UploadPartCopy(anchor) (>=5 MiB, non-last)
 			let entry = &plan.entries[anchor];
 			let src = copy_source(bucket, files_prefix, &entry.name);
-			parts.push(upload_part_copy(s3, bucket, out_key, &upload_id, 1, &src, None).await?);
+			let p1 = with_retry_governed(rl, Priority::High, || {
+				let src = src.clone();
+				async move { upload_part_copy(s3, bucket, out_key, uid, 1, &src, None).await }
+			})
+			.await?;
+			parts.push(p1);
 			// part2 = the piece (exempt last)
 			parts.push(
 				build_piece_part(
@@ -609,8 +643,9 @@ async fn build_one_link(
 					plan,
 					piece,
 					out_key,
-					&upload_id,
+					uid,
 					2,
+					rl,
 					crcs,
 				)
 				.await?,
@@ -621,7 +656,12 @@ async fn build_one_link(
 			// part1 = UploadPartCopy(prev segment object) (>=5 MiB, non-last)
 			let prev = prev_object.expect("forward link must have a previous object");
 			let src = format!("{bucket}/{prev}");
-			parts.push(upload_part_copy(s3, bucket, out_key, &upload_id, 1, &src, None).await?);
+			let p1 = with_retry_governed(rl, Priority::High, || {
+				let src = src.clone();
+				async move { upload_part_copy(s3, bucket, out_key, uid, 1, &src, None).await }
+			})
+			.await?;
+			parts.push(p1);
 			// part2 = the piece (exempt last)
 			parts.push(
 				build_piece_part(
@@ -631,8 +671,9 @@ async fn build_one_link(
 					plan,
 					piece,
 					out_key,
-					&upload_id,
+					uid,
 					2,
+					rl,
 					crcs,
 				)
 				.await?,
@@ -640,7 +681,11 @@ async fn build_one_link(
 		}
 	}
 
-	complete_mpu(s3, bucket, out_key, &upload_id, parts).await
+	with_retry_governed(rl, Priority::High, || {
+		let parts = parts.clone();
+		async move { complete_mpu(s3, bucket, out_key, uid, parts).await }
+	})
+	.await
 }
 
 /// Build the appended last part for a piece: a generated header (UploadPart) or a
@@ -654,18 +699,29 @@ async fn build_piece_part(
 	out_key: &str,
 	upload_id: &str,
 	part_number: i32,
+	rl: &RateLimiter,
 	crcs: &CrcStore,
 ) -> Result<CompletedPart, ChainError> {
 	match piece {
 		Piece::Header(id) => {
 			let entry = &plan.entries[id];
 			let bytes = zip_format::local_header(&meta_of(entry, crcs)?);
-			upload_part(s3, bucket, out_key, upload_id, part_number, bytes).await
+			with_retry_governed(rl, Priority::High, || {
+				let bytes = bytes.clone();
+				async move { upload_part(s3, bucket, out_key, upload_id, part_number, bytes).await }
+			})
+			.await
 		}
 		Piece::Body(id) => {
 			let entry = &plan.entries[id];
 			let src = copy_source(bucket, files_prefix, &entry.name);
-			upload_part_copy(s3, bucket, out_key, upload_id, part_number, &src, None).await
+			with_retry_governed(rl, Priority::High, || {
+				let src = src.clone();
+				async move {
+					upload_part_copy(s3, bucket, out_key, upload_id, part_number, &src, None).await
+				}
+			})
+			.await
 		}
 	}
 }
