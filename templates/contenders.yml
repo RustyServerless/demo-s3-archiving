@@ -321,6 +321,36 @@ Resources:
     Properties:
       LogGroupName: !Sub /aws/lambda/${RustFigmentEngineFunction}
       RetentionInDays: 90
+
+  # Python / j-nicholson98  (free-threaded CPython 3.14 on provided.al2023; stdlib-only
+  # raw-S3 + SigV4 client, no boto3; streaming ZIP64 with a recycled-slab buffer pool --
+  # archives 15 GB within 512 MB. Reads tuning from the environment below.)
+  PythonJNicholson98Function:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-python-j-nicholson98
+      CodeUri: ../contenders/python/j-nicholson98
+      Runtime: provided.al2023
+      MemorySize: 512
+      Timeout: 600
+      Handler: index.handler            # ignored by provided.al2023; bootstrap runs index.py
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          S3_CLIENT: raw                # use the stdlib raw client (the bundle ships no boto3)
+          N_DOWNLOAD: "4"
+          N_UPLOAD: "4"
+          SLAB_MB: "8"
+          PART_SIZE: "5242880"
+          QUEUE_DEPTH: "4"
+          GC_DISABLE: "1"
+      Role: !GetAtt LambdaContenderRole.Arn
+  PythonJNicholson98FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${PythonJNicholson98Function}
+      RetentionInDays: 90
   # ------------------------------ END CONTENDERS --------------------------------
 
 # Outputs — the list of contender ARNs is consumed by the benching Step Function
@@ -336,6 +366,7 @@ Outputs:
           # >>> INSERT YOUR CONTENDER ARN HERE <<<
           # Append one line per contender, mirroring the resource block you added above:
           #   - !GetAtt <Lang><DevId>Function.Arn
+          - !GetAtt PythonJNicholson98Function.Arn
           - !GetAtt PythonSebstoFunction.Arn
           - !GetAtt TypescriptSebstoFunction.Arn
           - !GetAtt CSebstoFunction.Arn
