@@ -1,5 +1,5 @@
 {
-  "Comment": "Benchmark the contender Lambdas: for each ARN (sequentially) run the lambda RunsPerContender times (up to 3 concurrent, timed), validate run-0's archive with the control Lambda, aggregate mean/stddev/min/max, apply a performance gate (mean+stddev < MaxRunTimeMs), then delete all archives. Outputs ordered success / failure lists.",
+  "Comment": "Benchmark the contender Lambdas: for each ARN run the lambda RunsPerContender times (timed, bounded concurrency), validate run-0's archive with the control Lambda, aggregate mean/stddev/min/max, apply a performance gate (mean+stddev < MaxRunTimeMs), then delete all archives. Outputs ordered success / failure lists. Both contenders and their repeat-runs execute sequentially (MaxConcurrency 1) so each invocation faces the bucket alone.",
   "QueryLanguage": "JSONata",
   "StartAt": "BenchOverContenders",
   "States": {
@@ -58,7 +58,7 @@
           },
           "RunContenderTimes": {
             "Type": "Map",
-            "Comment": "Run the contender RunsPerContender times, up to 3 concurrent (MaxConcurrency 3). Bounding repeat-run concurrency keeps a single contender's call rate under the S3 SlowDown knee while avoiding the RunsPerContender-x-sequential wall-clock blowup. Cross-contender concurrency is 1 (outer Map). Each run writes its own archive key (archive_key_base-<runIndex>.zip).",
+            "Comment": "Run the contender RunsPerContender times SEQUENTIALLY (MaxConcurrency 1). Each invocation faces the bucket alone — the condition every contender is designed for. Concurrent repeat-runs were found to push call-heavy designs past the S3 SlowDown knee: one design issuing ~22k calls run 3-wide against an already-hot shared bucket saturates it at any achievable rate (thousands of 503s even when self-throttled to the floor). Sequential repeats measure true single-invocation cost without self-inflicted contention. Each run writes its own archive key (archive_key_base-<runIndex>.zip).",
             "Items": "{% $run_indices %}",
             "ItemSelector": {
               "run_index": "{% $states.context.Map.Item.Value %}",
@@ -66,7 +66,7 @@
               "archive_key": "{% $archive_key_base & '-' & $string($states.context.Map.Item.Value) & '.zip' %}",
               "archive_key_base": "{% $archive_key_base %}"
             },
-            "MaxConcurrency": 3,
+            "MaxConcurrency": 1,
             "ItemProcessor": {
               "ProcessorConfig": {
                 "Mode": "INLINE"
