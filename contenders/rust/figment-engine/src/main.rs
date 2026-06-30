@@ -22,92 +22,92 @@ use crate::engine::plan::{FileId, SingleRouting, SourceFile, plan_single_mpu};
 /// Lambda event payload describing one archiving job.
 #[derive(Debug, Deserialize, Clone)]
 struct JobInfo {
-	bucket_name: Arc<str>,
-	files_prefix: Arc<str>,
-	archive_key: Arc<str>,
+    bucket_name: Arc<str>,
+    files_prefix: Arc<str>,
+    archive_key: Arc<str>,
 }
 
 /// List every object under `{files_prefix}/`, returning a `SourceFile` per object with a
 /// stable id, full key, bare name (key minus prefix), and size.
 async fn list_source_files(
-	bucket: &str,
-	files_prefix: &str,
+    bucket: &str,
+    files_prefix: &str,
 ) -> Result<Vec<SourceFile>, LambdaError> {
-	let s3_prefix = format!("{files_prefix}/");
-	let mut paginator = s3()
-		.list_objects_v2()
-		.bucket(bucket)
-		.prefix(&s3_prefix)
-		.into_paginator()
-		.send();
+    let s3_prefix = format!("{files_prefix}/");
+    let mut paginator = s3()
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(&s3_prefix)
+        .into_paginator()
+        .send();
 
-	let mut out = Vec::new();
-	let mut next_id: u32 = 0;
-	while let Some(page) = paginator.next().await {
-		let page = page?;
-		for obj in page.contents() {
-			let Some(key) = obj.key() else { continue };
-			let Some(size) = obj.size() else { continue };
-			if key == s3_prefix {
-				continue;
-			}
-			if let Some(name) = key.strip_prefix(&s3_prefix) {
-				if name.is_empty() {
-					continue;
-				}
-				out.push(SourceFile {
-					id: FileId(next_id),
-					key: key.to_string(),
-					name: name.to_string(),
-					size: size as u64,
-				});
-				next_id += 1;
-			}
-		}
-	}
-	Ok(out)
+    let mut out = Vec::new();
+    let mut next_id: u32 = 0;
+    while let Some(page) = paginator.next().await {
+        let page = page?;
+        for obj in page.contents() {
+            let Some(key) = obj.key() else { continue };
+            let Some(size) = obj.size() else { continue };
+            if key == s3_prefix {
+                continue;
+            }
+            if let Some(name) = key.strip_prefix(&s3_prefix) {
+                if name.is_empty() {
+                    continue;
+                }
+                out.push(SourceFile {
+                    id: FileId(next_id),
+                    key: key.to_string(),
+                    name: name.to_string(),
+                    size: size as u64,
+                });
+                next_id += 1;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Lambda handler: list -> plan -> assemble (fast path) | stream_fallback.
 async fn handler(event: LambdaEvent<JobInfo>) -> Result<(), LambdaError> {
-	let JobInfo {
-		bucket_name,
-		files_prefix,
-		archive_key,
-	} = event.payload;
+    let JobInfo {
+        bucket_name,
+        files_prefix,
+        archive_key,
+    } = event.payload;
 
-	info!(%bucket_name, %files_prefix, %archive_key, "contender invoked");
+    info!(%bucket_name, %files_prefix, %archive_key, "contender invoked");
 
-	let files = list_source_files(&bucket_name, &files_prefix).await?;
-	info!(count = files.len(), "listed source files");
+    let files = list_source_files(&bucket_name, &files_prefix).await?;
+    info!(count = files.len(), "listed source files");
 
-	match plan_single_mpu(files) {
-		SingleRouting::SingleMpu(p) => {
-			info!(parts = p.parts.len(), "single-MPU fast path");
-			if let Err(e) =
-				aws::assemble::assemble(&s3(), &bucket_name, &files_prefix, &archive_key, p).await
-			{
-				error!(%e, "single-MPU assemble failed");
-				return Err(Box::new(e));
-			}
-		}
-		SingleRouting::Fallback => {
-			info!("streaming fallback path");
-			if let Err(e) =
-				aws::stream_fallback::run(&s3(), &bucket_name, &archive_key, &files_prefix).await
-			{
-				error!(%e, "stream fallback failed");
-				return Err(Box::new(e));
-			}
-		}
-	}
+    match plan_single_mpu(files) {
+        SingleRouting::SingleMpu(p) => {
+            info!(parts = p.parts.len(), "single-MPU fast path");
+            if let Err(e) =
+                aws::assemble::assemble(&s3(), &bucket_name, &files_prefix, &archive_key, p).await
+            {
+                error!(%e, "single-MPU assemble failed");
+                return Err(Box::new(e));
+            }
+        }
+        SingleRouting::Fallback => {
+            info!("streaming fallback path");
+            if let Err(e) =
+                aws::stream_fallback::run(&s3(), &bucket_name, &archive_key, &files_prefix).await
+            {
+                error!(%e, "stream fallback failed");
+                return Err(Box::new(e));
+            }
+        }
+    }
 
-	info!("archive complete");
-	Ok(())
+    info!("archive complete");
+    Ok(())
 }
 
 awssdk_instrumentation::make_lambda_runtime!(
-	handler,
-	trigger = awssdk_instrumentation::lambda::layer::OTelFaasTrigger::Other,
-	s3() -> aws_sdk_s3::Client
+    handler,
+    trigger = awssdk_instrumentation::lambda::layer::OTelFaasTrigger::Other,
+    s3() -> aws_sdk_s3::Client
 );

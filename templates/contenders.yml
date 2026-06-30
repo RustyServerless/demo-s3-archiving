@@ -445,8 +445,8 @@ Outputs:
           - !GetAtt RustJrodonFunction.Arn
           - !GetAtt RustJrodonV2Function.Arn
           - !GetAtt RustFigmentEngineFunction.Arn
-          - !GetAtt RustFigmentEngineChainFunction.Arn
           # COMMENTED OUT BECAUSE IT CAUSES S3 SlowDown errors
           # You can still test it but it is advised to reduce the RunsPerContender parameter to 1 or 2
           # - !GetAtt RustJrodonV3Function.Arn
+          # - !GetAtt RustFigmentEngineChainFunction.Arn
           # ----- END CONTENDER ARN LIST -----
