@@ -22,82 +22,82 @@ use tracing::info;
 
 #[derive(Debug, Deserialize, Clone)]
 struct JobInfo {
-	bucket_name: Arc<str>,
-	files_prefix: Arc<str>,
-	archive_key: Arc<str>,
+    bucket_name: Arc<str>,
+    files_prefix: Arc<str>,
+    archive_key: Arc<str>,
 }
 
 /// List every object under `{files_prefix}/`, returning the shared `SourceFile`
 /// per object. (The shipped contender's lister lives in its bin, not its lib, so
 /// the chain carries its own — the only non-shared piece.)
 async fn list_source_files(
-	bucket: &str,
-	files_prefix: &str,
+    bucket: &str,
+    files_prefix: &str,
 ) -> Result<Vec<SourceFile>, LambdaError> {
-	let s3_prefix = format!("{files_prefix}/");
-	let mut paginator = s3()
-		.list_objects_v2()
-		.bucket(bucket)
-		.prefix(&s3_prefix)
-		.into_paginator()
-		.send();
+    let s3_prefix = format!("{files_prefix}/");
+    let mut paginator = s3()
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(&s3_prefix)
+        .into_paginator()
+        .send();
 
-	let mut out = Vec::new();
-	let mut next_id: u32 = 0;
-	while let Some(page) = paginator.next().await {
-		let page = page?;
-		for obj in page.contents() {
-			let Some(key) = obj.key() else { continue };
-			let Some(size) = obj.size() else { continue };
-			let Some(name) = key.strip_prefix(&s3_prefix) else {
-				continue;
-			};
-			if name.is_empty() {
-				continue;
-			}
-			out.push(SourceFile {
-				id: FileId(next_id),
-				key: key.to_string(),
-				name: name.to_string(),
-				size: size as u64,
-			});
-			next_id += 1;
-		}
-	}
-	Ok(out)
+    let mut out = Vec::new();
+    let mut next_id: u32 = 0;
+    while let Some(page) = paginator.next().await {
+        let page = page?;
+        for obj in page.contents() {
+            let Some(key) = obj.key() else { continue };
+            let Some(size) = obj.size() else { continue };
+            let Some(name) = key.strip_prefix(&s3_prefix) else {
+                continue;
+            };
+            if name.is_empty() {
+                continue;
+            }
+            out.push(SourceFile {
+                id: FileId(next_id),
+                key: key.to_string(),
+                name: name.to_string(),
+                size: size as u64,
+            });
+            next_id += 1;
+        }
+    }
+    Ok(out)
 }
 
 async fn handler(event: LambdaEvent<JobInfo>) -> Result<(), LambdaError> {
-	let JobInfo {
-		bucket_name,
-		files_prefix,
-		archive_key,
-	} = event.payload;
+    let JobInfo {
+        bucket_name,
+        files_prefix,
+        archive_key,
+    } = event.payload;
 
-	info!(%bucket_name, %files_prefix, %archive_key, "figment-engine-chain invoked");
+    info!(%bucket_name, %files_prefix, %archive_key, "figment-engine-chain invoked");
 
-	let files = list_source_files(&bucket_name, &files_prefix).await?;
-	info!(count = files.len(), "listed source files");
+    let files = list_source_files(&bucket_name, &files_prefix).await?;
+    info!(count = files.len(), "listed source files");
 
-	let plan = plan_chain::plan_segment_chain(files)?;
-	info!(
-		entries = plan.stats.entries,
-		segments = plan.stats.segments,
-		bigs = plan.stats.bigs,
-		smalls = plan.stats.smalls,
-		links = plan.stats.links,
-		max_chain_depth = plan.stats.max_chain_depth,
-		"planned segment chain"
-	);
+    let plan = plan_chain::plan_segment_chain(files)?;
+    info!(
+        entries = plan.stats.entries,
+        segments = plan.stats.segments,
+        bigs = plan.stats.bigs,
+        smalls = plan.stats.smalls,
+        links = plan.stats.links,
+        max_chain_depth = plan.stats.max_chain_depth,
+        "planned segment chain"
+    );
 
-	assemble_chain::run(&s3(), &bucket_name, &files_prefix, &archive_key, plan).await?;
+    assemble_chain::run(&s3(), &bucket_name, &files_prefix, &archive_key, plan).await?;
 
-	info!("archive complete");
-	Ok(())
+    info!("archive complete");
+    Ok(())
 }
 
 awssdk_instrumentation::make_lambda_runtime!(
-	handler,
-	trigger = awssdk_instrumentation::lambda::layer::OTelFaasTrigger::Other,
-	s3() -> aws_sdk_s3::Client
+    handler,
+    trigger = awssdk_instrumentation::lambda::layer::OTelFaasTrigger::Other,
+    s3() -> aws_sdk_s3::Client
 );
