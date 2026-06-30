@@ -781,9 +781,7 @@ async fn create_mpu(s3: &Client, bucket: &str, key: &str) -> Result<String, Chai
         .key(key)
         .send()
         .await?;
-    out.upload_id()
-        .map(ToOwned::to_owned)
-        .ok_or(ChainError::NoUploadId)
+    out.upload_id.ok_or(ChainError::NoUploadId)
 }
 
 async fn upload_part(
