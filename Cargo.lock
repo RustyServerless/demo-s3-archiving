@@ -994,6 +994,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "figment-engine-chain"
+version = "0.1.0"
+dependencies = [
+ "aws-sdk-s3",
+ "awssdk-instrumentation",
+ "figment-engine",
+ "futures",
+ "serde",
+ "sha2 0.10.9",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "zip",
+]
+
+[[package]]
 name = "fill-bucket"
 version = "0.1.0"
 dependencies = [

@@ -26,7 +26,7 @@ echo "any failures?"
 echo "$OUT" | jq '.failure'
 
 echo "check for OOM and peak memory"
-for m in figment-engine ; do
+for m in figment-engine figment-engine-chain ; do
   echo "=== $m ==="
   aws logs filter-log-events \
     --log-group-name "/aws/lambda/demo-s3-archiving-rust-$m" \

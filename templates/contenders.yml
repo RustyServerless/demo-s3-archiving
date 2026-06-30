@@ -51,6 +51,29 @@ Resources:
                   - s3:ListMultipartUploadParts
                   - s3:ListBucketMultipartUploads
                 Resource: !Sub arn:${AWS::Partition}:s3:::${BucketName}/archives/*
+              # ---------------------------------------------------------------
+              # ChainIntermediates — required ONLY by the figment-engine-chain
+              # contender. Its copy-only design builds intermediate segment/link
+              # objects under the dedicated seg-temps/ prefix (NOT archives/), then
+              # uses UploadPartCopy with THOSE objects as the copy source (each
+              # forward link copies the previous link's object). That needs full
+              # MPU write perms AND s3:GetObject on seg-temps/* as the copy source —
+              # none of which the UploadArchive statement (scoped to archives/*)
+              # grants. The intermediates are reaped by a bucket lifecycle rule
+              # (Prefix: seg-temps/), so the chain does NOT need DeleteObject.
+              # Scoped to seg-temps/* so it cannot touch source objects or archives.
+              - Sid: ChainIntermediates
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                Resource: !Sub arn:${AWS::Partition}:s3:::${BucketName}/seg-temps/*
+              # ---------------------------------------------------------------
+              # Execute — required by the jrodon-v3 contender, which re-invokes
+              # itself hundreds of times (sub-workers) to break the single-Lambda
+              # bandwidth ceiling. Scoped to this project's functions.
               - Sid: Execute
                 Effect: Allow
                 Action: lambda:InvokeFunction
@@ -322,6 +345,54 @@ Resources:
       LogGroupName: !Sub /aws/lambda/${RustFigmentEngineFunction}
       RetentionInDays: 90
 
+  # Rust / figment-engine-chain  (copy-only segment-chain — speed entry)
+  # Every image body reaches the archive by server-side UploadPartCopy (bar one
+  # 5 MiB bootstrap read), so it escapes the ENI bandwidth floor and is bound only
+  # by S3 control-plane call rate. An adaptive AIAD governor (additive-increase /
+  # additive-decrease, windowed) paces the ~22k calls under the S3 503 knee; solo
+  # it never throttles. Each invocation is run alone by the harness (sequential
+  # repeats), which is the only condition any contender is designed for.
+  #
+  # Memory is a vCPU dial, NOT a RAM need — the design does no real compute (no
+  # compression, no body buffers, CRCs come from HEAD metadata), so peak RAM is
+  # ~60-75 MB at every tier. vCPU drives the 256-wide async concurrency; build
+  # throughput scales near-linearly with memory until it meets the serial-chain
+  # latency floor (~10.5 s build / ~11 s total). Solo memory sweep (total duration):
+  #    256 MB -> 65 s    vCPU-starved: reactor can't drive the concurrency
+  #    512 MB -> 31 s
+  #    768 MB -> 20 s    run_price (memory x duration) minimum
+  #   1024 MB -> 17 s
+  #   1536 MB -> 12 s    build ~11.1 s, ~0.5 s above floor
+  #   1792 MB -> 11 s    build ~10.5 s  <-- lowest memory at the latency floor
+  #   2048 MB -> 11 s    build ~10.5 s, no gain over 1792
+  #   4096 MB -> 11 s    no gain; pure waste
+  # 1792 MB is the SPEED choice: the lowest memory that reaches the ~10.5 s build
+  # floor, so no vCPU is paid for above what cuts duration. (768 MB is the cheaper
+  # run_price if cost is the priority; this entry optimises for speed.)
+  # Needs the ChainIntermediates IAM statement (GetObject copy-source + MPU writes
+  # on seg-temps/*); intermediates are reaped by the seg-temps/ lifecycle rule, so
+  # no DeleteObject is required.
+  RustFigmentEngineChainFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-rust-figment-engine-chain
+      CodeUri: ../contenders/rust/figment-engine-chain
+      Runtime: provided.al2023
+      MemorySize: 1792
+      Timeout: 600
+      Handler: rust.handler
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          RUST_LOG: info
+      Role: !GetAtt LambdaContenderRole.Arn
+  RustFigmentEngineChainFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${RustFigmentEngineChainFunction}
+      RetentionInDays: 90
+
   # Python / j-nicholson98  (free-threaded CPython 3.14 on provided.al2023; stdlib-only
   # raw-S3 + SigV4 client, no boto3; streaming ZIP64 with a recycled-slab buffer pool --
   # archives 15 GB within 512 MB. Reads tuning from the environment below.)
@@ -333,12 +404,12 @@ Resources:
       Runtime: provided.al2023
       MemorySize: 512
       Timeout: 600
-      Handler: index.handler            # ignored by provided.al2023; bootstrap runs index.py
+      Handler: index.handler # ignored by provided.al2023; bootstrap runs index.py
       Architectures:
         - arm64
       Environment:
         Variables:
-          S3_CLIENT: raw                # use the stdlib raw client (the bundle ships no boto3)
+          S3_CLIENT: raw # use the stdlib raw client (the bundle ships no boto3)
           N_DOWNLOAD: "4"
           N_UPLOAD: "4"
           SLAB_MB: "8"
@@ -374,6 +445,7 @@ Outputs:
           - !GetAtt RustJrodonFunction.Arn
           - !GetAtt RustJrodonV2Function.Arn
           - !GetAtt RustFigmentEngineFunction.Arn
+          - !GetAtt RustFigmentEngineChainFunction.Arn
           # COMMENTED OUT BECAUSE IT CAUSES S3 SlowDown errors
           # You can still test it but it is advised to reduce the RunsPerContender parameter to 1 or 2
           # - !GetAtt RustJrodonV3Function.Arn

@@ -24,6 +24,7 @@ pub struct FileId(pub u32);
 #[derive(Debug, Clone)]
 pub struct SourceFile {
 	pub id: FileId,
+	#[allow(dead_code)] // used in tests
 	pub key: String,
 	pub name: String, // ZIP entry name (key minus prefix)
 	pub size: u64,
@@ -33,11 +34,13 @@ pub struct SourceFile {
 /// filled later (None until then).
 #[derive(Debug, Clone)]
 pub struct Entry {
+	#[allow(dead_code)] // used in tests
 	pub id: FileId,
 	pub name: String,
 	pub size: u64,
 	pub local_header_offset: u64,
 	pub crc: Option<u32>,
+	#[allow(dead_code)] // used in tests
 	pub streamed: bool, // true: header written inline by a Stream part; false: COPIED body
 }
 
@@ -91,6 +94,7 @@ pub struct SinglePlan {
 	pub order: Vec<FileId>,
 	pub entries: HashMap<FileId, Entry>,
 	pub parts: Vec<PartSpec>,
+	#[allow(dead_code)] // used in tests
 	pub copyable: Vec<FileId>, // bigs needing a phase-1 CRC HEAD
 	pub stats: PlanStats,
 }

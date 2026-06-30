@@ -1,0 +1,38 @@
+[package]
+name = "figment-engine-chain"
+version = "0.1.0"
+edition = "2021"
+
+# NOTE: by buildspec convention the crate name MUST equal the directory name,
+# so this crate lives at contenders/rust/figment-engine-chain/ and is named
+# figment-engine-chain. The workspace `members = ["contenders/rust/*"]` glob in
+# the root Cargo.toml already captures it — no root edit needed.
+
+[dependencies]
+# Share ALL generic machinery from the shipped contender by path: the ZIP
+# byte-layout (zip_format), CRC base64->u32 decoding (crc), the planner
+# vocabulary (SourceFile / FileId), and the S3 helpers under `aws`. The chain
+# design adds only its own planner + executor; everything else is reused.
+figment-engine = { path = "../figment-engine" }
+
+# Lambda runtime + S3 SDK — same workspace-pinned versions as the shipped
+# contender, so the two entries never drift apart.
+awssdk-instrumentation = { workspace = true }
+aws-sdk-s3            = { workspace = true }
+tokio                = { workspace = true }
+tracing              = { workspace = true }
+serde                = { workspace = true }
+thiserror            = { workspace = true }
+
+# Concurrency for the executor (buffer_unordered over segment/stitch/CRC pools).
+futures = "0.3"
+
+[features]
+# Mirrors figment-engine: gates the assemble-and-validate round-trip test that
+# parses our bytes with the same `zip` reader the benchmark's control Lambda uses.
+zip_validate = []
+
+[dev-dependencies]
+# Test-only, reusing workspace deps already present for the shipped contender.
+zip   = { workspace = true }
+sha2  = { workspace = true }
