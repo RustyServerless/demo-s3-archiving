@@ -34,6 +34,7 @@ pub struct Entry {
 	pub name: String,
 	pub size: u64,
 	pub local_header_offset: u64,
+	#[allow(dead_code)] // used in tests
 	pub crc: Option<u32>,
 }
 
@@ -76,6 +77,7 @@ pub enum Link {
 #[derive(Debug, Clone)]
 pub struct Segment {
 	/// The big that anchors this segment's floor.
+	#[allow(dead_code)] // used in tests
 	pub anchor: FileId,
 	/// Position in the final stitch.
 	pub index: usize,
@@ -88,6 +90,7 @@ pub struct Segment {
 
 /// The assembled plan.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // used in tests
 pub struct ChainPlan {
 	/// Entries in final archive order.
 	pub order: Vec<FileId>,
@@ -98,8 +101,6 @@ pub struct ChainPlan {
 	pub cd_offset: u64,
 	/// Central-directory byte length (computable without CRC).
 	pub cd_size: u64,
-	/// Every entry needs a phase-1 CRC HEAD (all bodies are copied).
-	pub crc_heads: Vec<FileId>,
 	pub stats: ChainStats,
 }
 
@@ -115,6 +116,7 @@ pub struct ChainStats {
 	pub max_chain_depth: usize,
 }
 
+#[allow(dead_code)] // used in tests
 impl ChainPlan {
 	pub fn segment_count(&self) -> usize {
 		self.segments.len()
@@ -147,7 +149,7 @@ pub fn plan_segment_chain(files: Vec<SourceFile>) -> Result<ChainPlan, PlanError
 	// Bigs largest-first (ties by id) — deterministic. Smalls by id for a stable
 	// round-robin spread.
 	bigs.sort_by(|a, b| b.size.cmp(&a.size).then(a.id.0.cmp(&b.id.0)));
-	smalls.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+	smalls.sort_by_key(|a| a.id.0);
 
 	let mut size_of: HashMap<FileId, (String, u64)> = HashMap::new();
 	for f in bigs.iter().chain(smalls.iter()) {
@@ -293,15 +295,12 @@ pub fn plan_segment_chain(files: Vec<SourceFile>) -> Result<ChainPlan, PlanError
 		max_chain_depth: max_depth,
 	};
 
-	let crc_heads: Vec<FileId> = order.clone();
-
 	Ok(ChainPlan {
 		order,
 		entries,
 		segments,
 		cd_offset,
 		cd_size,
-		crc_heads,
 		stats,
 	})
 }

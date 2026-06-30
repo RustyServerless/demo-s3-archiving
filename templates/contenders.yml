@@ -306,22 +306,40 @@ Resources:
       LogGroupName: !Sub /aws/lambda/${RustFigmentEngineFunction}
       RetentionInDays: 90
 
-  # Rust / figment-engine-chain  (copy-only segment-chain — SPEED entry, ignores cost ranking)
+  # Rust / figment-engine-chain  (copy-only segment-chain — speed entry)
   # Every image body reaches the archive by server-side UploadPartCopy (bar one
-  # 5 MiB bootstrap read), so it escapes the ENI bandwidth floor and is bound by
-  # S3 control-plane call rate. An adaptive AIMD rate governor keeps the call
-  # rate under the S3 503 knee under concurrent contention. Memory here is a vCPU
-  # dial, not a RAM need (no body buffers — RAM use is ~70 MB); 1024 MB keeps vCPU
-  # off the critical path. Needs the ChainIntermediates IAM statement (GetObject
-  # copy-source + MPU writes on seg-temps/*); intermediates are reaped by the
-  # seg-temps/ lifecycle rule, so no DeleteObject is required.
+  # 5 MiB bootstrap read), so it escapes the ENI bandwidth floor and is bound only
+  # by S3 control-plane call rate. An adaptive AIAD governor (additive-increase /
+  # additive-decrease, windowed) paces the ~22k calls under the S3 503 knee; solo
+  # it never throttles. Each invocation is run alone by the harness (sequential
+  # repeats), which is the only condition any contender is designed for.
+  #
+  # Memory is a vCPU dial, NOT a RAM need — the design does no real compute (no
+  # compression, no body buffers, CRCs come from HEAD metadata), so peak RAM is
+  # ~60-75 MB at every tier. vCPU drives the 256-wide async concurrency; build
+  # throughput scales near-linearly with memory until it meets the serial-chain
+  # latency floor (~10.5 s build / ~11 s total). Solo memory sweep (total duration):
+  #    256 MB -> 65 s    vCPU-starved: reactor can't drive the concurrency
+  #    512 MB -> 31 s
+  #    768 MB -> 20 s    run_price (memory x duration) minimum
+  #   1024 MB -> 17 s
+  #   1536 MB -> 12 s    build ~11.1 s, ~0.5 s above floor
+  #   1792 MB -> 11 s    build ~10.5 s  <-- lowest memory at the latency floor
+  #   2048 MB -> 11 s    build ~10.5 s, no gain over 1792
+  #   4096 MB -> 11 s    no gain; pure waste
+  # 1792 MB is the SPEED choice: the lowest memory that reaches the ~10.5 s build
+  # floor, so no vCPU is paid for above what cuts duration. (768 MB is the cheaper
+  # run_price if cost is the priority; this entry optimises for speed.)
+  # Needs the ChainIntermediates IAM statement (GetObject copy-source + MPU writes
+  # on seg-temps/*); intermediates are reaped by the seg-temps/ lifecycle rule, so
+  # no DeleteObject is required.
   RustFigmentEngineChainFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub ${ProjectName}-rust-figment-engine-chain
       CodeUri: ../contenders/rust/figment-engine-chain
       Runtime: provided.al2023
-      MemorySize: 256
+      MemorySize: 1792
       Timeout: 600
       Handler: rust.handler
       Architectures:

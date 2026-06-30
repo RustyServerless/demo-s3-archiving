@@ -332,6 +332,7 @@ async fn build_stream_part_bytes(
 }
 
 /// Central directory + ZIP64 end records, built from the realised plan (all CRCs known).
+#[allow(clippy::result_large_err)] // S3 error struct is large, but ok for 22k calls with network
 fn build_central_directory(plan: &SinglePlan) -> Result<Vec<u8>, AssembleError> {
 	let mut cd_offset = 0u64;
 	for id in &plan.order {

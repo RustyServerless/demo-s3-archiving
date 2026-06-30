@@ -17,7 +17,8 @@
 //! floor used ~1/8th of the bucket's capacity → ~150s builds when the true
 //! 3-wide floor is ~30-60s. The fix:
 //!
-//!   - **Start at fair share:** KNEE/ASSUMED_INSTANCES ≈ 1,170/s. Not a low
+//!   - **Start near the solo rate:** sequential repeats face the bucket alone,
+//!     so START_RATE begins close to solo's natural issue rate. Not a low
 //!     slow-start, not an optimistic ceiling — the rate one of three instances
 //!     should sustain. Solo, this is below the natural ~1,830/s, so recovery
 //!     climbs it up; 3-wide, it's right at the shared knee from the first call.
@@ -44,19 +45,13 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
-/// S3 per-bucket general SlowDown knee (calls/s), approximate.
-const KNEE: f64 = 3_500.0;
-/// Instances we assume may share the bucket (benchmark repeat-runs are 3-wide).
-/// Only used to pick the START rate at fair share; the AIAD then adapts to the
-/// actual observed capacity regardless of whether this guess is exact.
-const ASSUMED_INSTANCES: f64 = 3.0;
-// Start rate: begin near solo's natural rate so there's little ramp tax.
-//    Under sequential repeats each invocation is alone, so a high start is safe;
-//    the additive down-step still handles any incidental 503.
+/// Start rate: begin near solo's natural rate so there's little ramp tax.
+/// Under sequential repeats each invocation is alone, so a high start is safe;
+/// the additive down-step still handles any incidental 503.
 const START_RATE: f64 = 1_800.0; // was KNEE / ASSUMED_INSTANCES (≈1170)
-								 // Ceiling: was capping solo at 1830; raise so the governor isn't a solo brake.
-								 //    Chain is latency-bound at ~1316/s solo so it won't actually hit this — the
-								 //    point is to stop the ceiling acting as a throttle on a run that never 503s.
+/// Ceiling: was capping solo at 1830; raise so the governor isn't a solo brake.
+/// Chain is latency-bound at ~1316/s solo so it won't actually hit this — the
+/// point is to stop the ceiling acting as a throttle on a run that never 503s.
 const CEIL_RATE: f64 = 3_200.0; // was 1_830.0
 /// Safety floor. Additive-decrease-from-fair-share should rarely approach this;
 /// if it does, contention is extreme and we crawl rather than crash.
@@ -202,18 +197,16 @@ impl RateLimiter {
 		let interval_ms = RECOVER_INTERVAL.as_millis() as u64;
 		if now_ms.saturating_sub(last_up) >= interval_ms
 			&& now_ms.saturating_sub(last_thr) >= interval_ms
-		{
-			if self
+			&& self
 				.inner
 				.last_up_ms
 				.compare_exchange(last_up, now_ms, Ordering::Relaxed, Ordering::Relaxed)
 				.is_ok()
-			{
-				let r = self.rate();
-				if r < CEIL_RATE {
-					self.set_rate(r + STEP_UP);
-					self.inner.up_steps.fetch_add(1, Ordering::Relaxed);
-				}
+		{
+			let r = self.rate();
+			if r < CEIL_RATE {
+				self.set_rate(r + STEP_UP);
+				self.inner.up_steps.fetch_add(1, Ordering::Relaxed);
 			}
 		}
 	}
@@ -262,11 +255,6 @@ impl RateLimiter {
 		}
 	}
 
-	/// Producer acquire = High (feeding CRCs unblocks segments).
-	pub async fn acquire_producer(&self) {
-		self.acquire(Priority::High).await;
-	}
-
 	/// Signal a throttle (503). Records it, and applies an additive DOWN-step at
 	/// most once per DOWN_WINDOW so a wave of concurrent 503s steps once, not
 	/// once-per-call. NO token drain — the instance keeps issuing at the (slightly
@@ -294,10 +282,6 @@ impl RateLimiter {
 	/// Count a retry attempt (for diagnostics).
 	pub fn note_retry(&self) {
 		self.inner.retries.fetch_add(1, Ordering::Relaxed);
-	}
-
-	pub fn current_rate(&self) -> f64 {
-		self.rate()
 	}
 
 	/// Snapshot of the diagnostic counters for logging at a phase boundary.

@@ -494,6 +494,7 @@ fn segment_key(archive_key: &str, index: usize) -> String {
 /// own MPU: a non-last part (bootstrap upload / anchor copy / forward copy) that
 /// clears the floor, then the floor-exempt appended last part. The link's output
 /// object becomes the copy-forward source for the next link.
+#[allow(clippy::too_many_arguments)] // its a benchmark not production
 async fn build_segment_object(
 	s3: &Client,
 	bucket: &str,
@@ -554,6 +555,7 @@ async fn build_segment_object(
 /// rate reflects the TRUE call rate — a link is ~4 calls, and governing the link
 /// as a unit let the real call rate overshoot ~4x the governed rate, which is what
 /// collapsed the contended case.
+#[allow(clippy::too_many_arguments)] // its a benchmark not production
 async fn build_one_link(
 	s3: &Client,
 	bucket: &str,
@@ -690,6 +692,7 @@ async fn build_one_link(
 
 /// Build the appended last part for a piece: a generated header (UploadPart) or a
 /// copied body (UploadPartCopy).
+#[allow(clippy::too_many_arguments)] // its a benchmark not production
 async fn build_piece_part(
 	s3: &Client,
 	bucket: &str,
@@ -727,6 +730,7 @@ async fn build_piece_part(
 }
 
 /// Central directory + ZIP64 end records from the realised plan (all CRCs known).
+#[allow(clippy::result_large_err)] // S3 error struct is large, but ok for 22k calls with network
 fn build_central_directory(plan: &ChainPlan, crcs: &CrcStore) -> Result<Vec<u8>, ChainError> {
 	let mut out = Vec::new();
 	let mut cd_size = 0u64;
@@ -744,6 +748,7 @@ fn build_central_directory(plan: &ChainPlan, crcs: &CrcStore) -> Result<Vec<u8>,
 	Ok(out)
 }
 
+#[allow(clippy::result_large_err)] // S3 error struct is large, but ok for 22k calls with network
 fn meta_of(e: &Entry, crcs: &CrcStore) -> Result<EntryMeta, ChainError> {
 	let crc = crcs
 		.get(e.id)

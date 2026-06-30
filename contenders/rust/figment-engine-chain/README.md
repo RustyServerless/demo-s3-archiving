@@ -16,7 +16,7 @@ CRC decoding, and S3 plumbing; it adds only its own planner and executor.
 
 | | Duration | Memory | Peak RAM | Bodies over the ENI |
 |---|---|---|---|---|
-| **figment-engine-chain** | **~TODO_CHAIN_DURATION** | 1024 MB | ~75 MB | **one 5 MiB read, total** |
+| **figment-engine-chain** | **~11 s** | 1792 MB | ~75 MB | **one 5 MiB read, total** |
 | figment-engine (single-MPU) | ~TODO_FE_DURATION | 640 MB | ~460 MB | ~7.5 GB |
 | reference jrodon-v2 | ~106 s | 640 MB | — | ~14.65 GB |
 
@@ -163,6 +163,32 @@ and the AWS SDK's HTTP layer exposes no connection-pool knob that would
 (connections are already effectively unbounded). The floor is the round-trip
 latency of the serial chains, which is structural.
 
+### Memory is a vCPU dial, not a RAM need
+
+The design does no real compute — no compression (STORE), no body buffering
+(copy-only), no hashing (CRC32 comes from S3 HEAD metadata). Peak RAM is
+~60–75 MB at *every* memory size. So Lambda memory matters only as the vCPU
+lever that drives the 256-wide async reactor. A solo sweep (each tier deployed,
+invoked warm, archive re-validated) shows throughput scaling near-linearly with
+memory until it hits the ~10.5 s serial-chain build floor:
+
+| Memory | `build_and_stitch` | Total | calls/s | Note |
+|---|---|---|---|---|
+| 256 MB | ~64 s | ~65 s | ~351 | vCPU-starved — reactor can't service the concurrency |
+| 512 MB | ~30 s | ~31 s | ~747 | |
+| 768 MB | ~16 s | ~20 s | ~1173 | `memory × duration` (run_price) minimum |
+| 1024 MB | ~16.5 s | ~17 s | ~1365 | |
+| 1536 MB | ~11.1 s | ~12 s | ~2030 | ~0.5 s above the floor |
+| **1792 MB** | **~10.5 s** | **~11 s** | **~2150** | **lowest memory at the latency floor** |
+| 2048 MB | ~10.5 s | ~11 s | ~2150 | no gain over 1792 |
+| 4096 MB | ~10.4 s | ~11 s | ~2150 | no gain — pure waste |
+
+Two operating points fall out. **1792 MB** is the *speed* choice used here: the
+lowest memory that reaches the ~10.5 s build floor, so nothing is paid for vCPU
+that no longer cuts duration. **768 MB** is the *price* choice — it minimises
+`memory × duration` while still finishing in ~20 s (well under the field), so it
+would win a cost-ranked board. This entry optimises for speed.
+
 ## How it got here (the optimisation sweep)
 
 Each step was deployed, solo-invoked, and the resulting archive re-validated by
@@ -230,7 +256,7 @@ const MAX_ATTEMPTS:        u32   = 5;    // bounded retry on transient/SlowDown
 | Central directory | Built eagerly after CRCs, uploaded as exempt last part | No body IO to contend with, so nothing needs deferring |
 | Throttle-safety | None needed in isolation | Serial chains self-limit to ~1.6 k calls/s, under the knee |
 | Cleanup | S3 lifecycle rule on `seg-temps/` | Keeps GC out of the benchmark-measured invoke |
-| Memory | 1024 MB / arm64 | Bandwidth-irrelevant (no bodies); buys vCPU; ~75 MB peak |
+| Memory | 1792 MB / arm64 | No bodies/compute; pure vCPU dial. Lowest tier at the ~10.5 s build floor (see sweep); ~75 MB peak |
 
 ## Verification
 
