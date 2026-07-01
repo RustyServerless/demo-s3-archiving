@@ -50,8 +50,8 @@ fn p64(buf: &mut Vec<u8>, v: u64) {
 /// == uncompressed). `crc` is the CRC-32 over the file's (plaintext) bytes, as a host
 /// `u32` (callers decode S3's base64 big-endian checksum into this before calling).
 #[derive(Debug, Clone)]
-pub struct EntryMeta {
-    pub name: String,
+pub struct EntryMeta<'a> {
+    pub name: &'a str,
     pub size: u64,
     pub crc: u32,
     /// Offset of this entry's local header within the archive. Only consulted by the
@@ -287,9 +287,9 @@ pub fn end_records(entry_count: u64, cd_offset: u64, cd_size: u64) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    fn meta(name: &str, size: u64, crc: u32, off: u64) -> EntryMeta {
+    fn meta(name: &str, size: u64, crc: u32, off: u64) -> EntryMeta<'_> {
         EntryMeta {
-            name: name.to_string(),
+            name,
             size,
             crc,
             local_header_offset: off,

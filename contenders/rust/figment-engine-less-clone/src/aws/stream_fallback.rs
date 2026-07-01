@@ -6,7 +6,6 @@
 //! No slab ring, no zero-copy: the fallback case is small by definition, so plain owned
 //! buffers are fine. Shares the pure `engine::zip_format` byte layout with the fast path.
 
-use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use bytes::Bytes;
@@ -17,34 +16,34 @@ use crate::engine::zip_format::{self, EntryMeta};
 const PART_FLOOR: usize = 5 * 1024 * 1024;
 
 pub use crate::aws::assemble::AssembleError;
+use crate::s3;
 
 /// Stream every object under `files_prefix` into the archive at `archive_key`.
 ///
 /// Re-lists the prefix itself (the fast path's plan isn't reused here — the fallback owns
 /// its own simple traversal). Computes each entry's CRC from the bytes it reads.
 pub async fn run(
-    s3: &Client,
     bucket: String,
     archive_key: String,
     files_prefix: String,
 ) -> Result<(), AssembleError> {
     // List source files.
-    let files = list(s3, bucket.clone(), &files_prefix).await?;
+    let files = list(bucket.clone(), &files_prefix).await?;
 
     // Build the whole archive in memory. Fallback inputs are small by definition.
     let mut archive: Vec<u8> = Vec::new();
     let mut metas: Vec<EntryMeta> = Vec::new();
     let mut offset: u64 = 0;
-    for f in files {
+    for f in files.iter() {
         let key = format!("{files_prefix}/{}", f.name);
-        let body = get_bytes(s3, bucket.clone(), key, f.size as usize).await?;
+        let body = get_bytes(bucket.clone(), key, f.size as usize).await?;
         let crc = {
             let mut h = crc32fast::Hasher::new();
             h.update(&body);
             h.finalize()
         };
         let meta = EntryMeta {
-            name: f.name,
+            name: &f.name,
             size: f.size,
             crc,
             local_header_offset: offset,
@@ -72,7 +71,7 @@ pub async fn run(
 
     // Emit: single PutObject if small, else a simple multipart upload.
     if archive.len() < PART_FLOOR {
-        s3.put_object()
+        s3().put_object()
             .bucket(bucket)
             .key(archive_key)
             .body(ByteStream::from(archive))
@@ -83,7 +82,7 @@ pub async fn run(
     }
 
     // Multipart: 5 MiB parts, last part takes the remainder (exempt).
-    let upload_id = s3
+    let upload_id = s3()
         .create_multipart_upload()
         .bucket(bucket.clone())
         .key(archive_key.clone())
@@ -100,7 +99,7 @@ pub async fn run(
     while pos < archive_bytes.len() {
         let end = (pos + PART_FLOOR).min(archive_bytes.len());
         let chunk = archive_bytes.slice(pos..end);
-        let out = s3
+        let out = s3()
             .upload_part()
             .bucket(bucket.clone())
             .key(archive_key.clone())
@@ -126,7 +125,7 @@ pub async fn run(
     let completed = CompletedMultipartUpload::builder()
         .set_parts(Some(parts))
         .build();
-    s3.complete_multipart_upload()
+    s3().complete_multipart_upload()
         .bucket(bucket)
         .key(archive_key)
         .upload_id(&upload_id)
@@ -136,13 +135,9 @@ pub async fn run(
     Ok(())
 }
 
-async fn list(
-    s3: &Client,
-    bucket: String,
-    files_prefix: &str,
-) -> Result<Vec<SourceFile>, AssembleError> {
+async fn list(bucket: String, files_prefix: &str) -> Result<Vec<SourceFile>, AssembleError> {
     let s3_prefix = format!("{files_prefix}/");
-    let mut paginator = s3
+    let mut paginator = s3()
         .list_objects_v2()
         .bucket(bucket)
         .prefix(s3_prefix.clone())
@@ -174,13 +169,8 @@ async fn list(
     Ok(out)
 }
 
-async fn get_bytes(
-    s3: &Client,
-    bucket: String,
-    key: String,
-    expected: usize,
-) -> Result<Vec<u8>, AssembleError> {
-    let mut resp = s3.get_object().bucket(bucket).key(key).send().await?;
+async fn get_bytes(bucket: String, key: String, expected: usize) -> Result<Vec<u8>, AssembleError> {
+    let mut resp = s3().get_object().bucket(bucket).key(key).send().await?;
     let mut data = Vec::with_capacity(expected);
     while let Some(chunk) = resp.body.next().await {
         data.extend_from_slice(&chunk?);
