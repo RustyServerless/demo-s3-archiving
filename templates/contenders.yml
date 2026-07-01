@@ -147,87 +147,6 @@ Resources:
   # copy-paste template for new contenders. Keep it as the last block in
   # this section so newcomers always see a valid registered Lambda.
 
-  # Python / sebsto  (zipfile + boto3, multipart streaming sink, bounded concurrent downloads)
-  PythonSebstoFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub ${ProjectName}-python-sebsto
-      CodeUri: ../contenders/python/sebsto
-      Runtime: python3.13
-      # 1024 MB. Bench numbers (10 runs each):
-      #   1024 MB: mean 382 s, max 415 s, run_price $0.005098
-      #    768 MB: mean 488 s, max 527 s, run_price $0.004878 (-4.3%)
-      #    512 MB: OOM at 511/512 MB (boto3 + interpreter resident weight)
-      # 768 MB is marginally cheaper but max approaches the 600 s
-      # timeout; stddev 41 s makes timeout-failure plausible. 1024 MB
-      # is the right tier: comfortable headroom, tight stddev.
-      MemorySize: 1024
-      Timeout: 600
-      Handler: index.handler
-      Architectures:
-        - arm64
-      Role: !GetAtt LambdaContenderRole.Arn
-  PythonSebstoFunctionLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub /aws/lambda/${PythonSebstoFunction}
-      RetentionInDays: 90
-  # TypeScript / sebsto  (3-stage download/zip/upload pipeline, Node 22 + AWS SDK v3, esbuild bundle)
-  TypescriptSebstoFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub ${ProjectName}-typescript-sebsto
-      CodeUri: ../contenders/typescript/sebsto
-      Runtime: nodejs22.x
-      MemorySize: 1280
-      Timeout: 600
-      Handler: index.handler
-      Architectures:
-        - arm64
-      Role: !GetAtt LambdaContenderRole.Arn
-  TypescriptSebstoFunctionLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub /aws/lambda/${TypescriptSebstoFunction}
-      RetentionInDays: 90
-  # C / sebsto  (3-stage download/zip/upload pipeline on the AWS Common Runtime — aws-c-s3)
-  CSebstoFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub ${ProjectName}-c-sebsto
-      CodeUri: ../contenders/c/sebsto
-      Runtime: provided.al2023
-      MemorySize: 640
-      Timeout: 600
-      Handler: c.handler
-      Architectures:
-        - arm64
-      Role: !GetAtt LambdaContenderRole.Arn
-  CSebstoFunctionLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub /aws/lambda/${CSebstoFunction}
-      RetentionInDays: 90
-
-  # Swift / sebsto-soto  (3-stage download/zip/upload pipeline, Soto + swift-aws-lambda-runtime)
-  SwiftSebstoSotoFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub ${ProjectName}-swift-sebsto-soto
-      CodeUri: ../contenders/swift/sebsto-soto
-      Runtime: provided.al2023
-      MemorySize: 512
-      Timeout: 600
-      Handler: swift.handler
-      Architectures:
-        - arm64
-      Role: !GetAtt LambdaContenderRole.Arn
-  SwiftSebstoSotoFunctionLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub /aws/lambda/${SwiftSebstoSotoFunction}
-      RetentionInDays: 90
-
   # Rust / jrodon  (reference implementation)
   RustJrodonFunction:
     Type: AWS::Serverless::Function
@@ -257,6 +176,7 @@ Resources:
     Properties:
       LogGroupName: !Sub /aws/lambda/${RustJrodonFunction}
       RetentionInDays: 90
+
   # Rust / jrodon  (reference implementation)
   RustJrodonV2Function:
     Type: AWS::Serverless::Function
@@ -286,6 +206,7 @@ Resources:
     Properties:
       LogGroupName: !Sub /aws/lambda/${RustJrodonV2Function}
       RetentionInDays: 90
+
   RustJrodonV3Function:
     Type: AWS::Serverless::Function
     Properties:
@@ -345,6 +266,35 @@ Resources:
       LogGroupName: !Sub /aws/lambda/${RustFigmentEngineFunction}
       RetentionInDays: 90
 
+  # Rust / figment-engine-less-clone  (optimised reference implementation)
+  RustFigmentEngineLessCloneFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-rust-figment-engine-less-clone
+      CodeUri: ../contenders/rust/figment-engine-less-clone
+      # provided.al2023 is the custom runtime for compiled binaries (Rust, Go, C++).
+      # The Lambda service executes the `bootstrap` binary directly.
+      Runtime: provided.al2023
+      MemorySize: 640
+      Timeout: 600
+      # For custom runtimes, Handler is technically ignored (bootstrap is always executed).
+      # This value is just my convention.
+      Handler: rust.handler
+      Architectures:
+        # ARM64 (Graviton2): ~20% cheaper and often faster than x86_64 for Rust Lambda workloads
+        - arm64
+      Environment:
+        Variables:
+          # RUST_LOG configures the `tracing` crate's log filter:
+          # debug for app code, info for noisy AWS SDK internals
+          RUST_LOG: info # debug,hyper=info,h2=info,tracing=info,aws_config=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,rustls=info
+      Role: !GetAtt LambdaContenderRole.Arn
+  RustFigmentEngineLessCloneFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${RustFigmentEngineLessCloneFunction}
+      RetentionInDays: 90
+
   # Rust / figment-engine-chain  (copy-only segment-chain — speed entry)
   # Every image body reaches the archive by server-side UploadPartCopy (bar one
   # 5 MiB bootstrap read), so it escapes the ENI bandwidth floor and is bound only
@@ -393,35 +343,6 @@ Resources:
       LogGroupName: !Sub /aws/lambda/${RustFigmentEngineChainFunction}
       RetentionInDays: 90
 
-  # Python / j-nicholson98  (free-threaded CPython 3.14 on provided.al2023; stdlib-only
-  # raw-S3 + SigV4 client, no boto3; streaming ZIP64 with a recycled-slab buffer pool --
-  # archives 15 GB within 512 MB. Reads tuning from the environment below.)
-  PythonJNicholson98Function:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub ${ProjectName}-python-j-nicholson98
-      CodeUri: ../contenders/python/j-nicholson98
-      Runtime: provided.al2023
-      MemorySize: 512
-      Timeout: 600
-      Handler: index.handler # ignored by provided.al2023; bootstrap runs index.py
-      Architectures:
-        - arm64
-      Environment:
-        Variables:
-          S3_CLIENT: raw # use the stdlib raw client (the bundle ships no boto3)
-          N_DOWNLOAD: "4"
-          N_UPLOAD: "4"
-          SLAB_MB: "8"
-          PART_SIZE: "5242880"
-          QUEUE_DEPTH: "4"
-          GC_DISABLE: "1"
-      Role: !GetAtt LambdaContenderRole.Arn
-  PythonJNicholson98FunctionLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub /aws/lambda/${PythonJNicholson98Function}
-      RetentionInDays: 90
   # ------------------------------ END CONTENDERS --------------------------------
 
 # Outputs — the list of contender ARNs is consumed by the benching Step Function
@@ -437,14 +358,9 @@ Outputs:
           # >>> INSERT YOUR CONTENDER ARN HERE <<<
           # Append one line per contender, mirroring the resource block you added above:
           #   - !GetAtt <Lang><DevId>Function.Arn
-          - !GetAtt PythonJNicholson98Function.Arn
-          - !GetAtt PythonSebstoFunction.Arn
-          - !GetAtt TypescriptSebstoFunction.Arn
-          - !GetAtt CSebstoFunction.Arn
-          - !GetAtt SwiftSebstoSotoFunction.Arn
-          - !GetAtt RustJrodonFunction.Arn
           - !GetAtt RustJrodonV2Function.Arn
           - !GetAtt RustFigmentEngineFunction.Arn
+          - !GetAtt RustFigmentEngineLessCloneFunction.Arn
           # COMMENTED OUT BECAUSE IT CAUSES S3 SlowDown errors
           # You can still test it but it is advised to reduce the RunsPerContender parameter to 1 or 2
           # - !GetAtt RustJrodonV3Function.Arn
