@@ -30,8 +30,6 @@ bytes = "1"
 crc32fast = "1"
 futures = "0.3"
 
-dhat = "0.3"
-
 [dev-dependencies]
 zip = { workspace = true }      # reader, for the validator-mirroring test
 sha2 = { workspace = true }     # content hashing, mirrors control-lambda

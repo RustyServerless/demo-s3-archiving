@@ -15,7 +15,7 @@ Parameters:
     Description: Key prefix under which the test objects (and the contender archives, under archives/) live
   TestFileCount:
     Type: Number
-    Default: 500
+    Default: 3000
     Description: The number of test files to fill the bucket with
   TestFileSize:
     Type: Number
@@ -23,7 +23,7 @@ Parameters:
     Description: The average size of test files, in MB
   RunsPerContender:
     Type: Number
-    Default: 1
+    Default: 10
     Description: Number of times each contender Lambda is invoked in parallel per benchmark run; the reported duration_ms is the mean across all runs
   MaxRunTimeMs:
     Type: Number

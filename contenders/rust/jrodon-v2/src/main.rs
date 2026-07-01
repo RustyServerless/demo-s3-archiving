@@ -159,18 +159,6 @@ async fn list_files(bucket: Arc<str>, key_prefix: &str) -> Result<Vec<FileInfo>,
 /// Lambda entry point: list source objects, plan the ZIP layout, then execute the multipart upload.
 #[instrument(skip_all, fields(job_info = ?event.payload))]
 async fn handler(event: LambdaEvent<JobInfo>) -> Result<(), LambdaError> {
-    let _profiler = dhat::Profiler::builder()
-        .file_name(format!(
-            "/mnt/efs/{}.dhat-heap.json",
-            event
-                .context
-                .invoked_function_arn
-                .split(':')
-                .last()
-                .unwrap()
-        ))
-        .build();
-
     info!("Start processing");
 
     let job_info = event.payload;
@@ -214,6 +202,3 @@ awssdk_instrumentation::make_lambda_runtime!(
     trigger = awssdk_instrumentation::lambda::layer::OTelFaasTrigger::Other,
     s3() -> aws_sdk_s3::Client
 );
-
-#[global_allocator]
-static ALLOC: dhat::Alloc = dhat::Alloc;
