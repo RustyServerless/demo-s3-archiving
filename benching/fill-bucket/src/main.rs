@@ -33,7 +33,7 @@ use tracing::{debug, error, info, instrument};
 
 // ---------- Tunables ----------
 /// Standard deviation (in bytes) of the normal distribution used to sample object sizes.
-const SIZE_STDDEV: usize = 1 * 1024 * 1024;
+const SIZE_STDDEV: usize = 1024 * 1024; // 1 MB
 /// Maximum allowed deviation from the per-object mean size (±3σ clamp).
 const MAX_DEVIATION: usize = 3 * SIZE_STDDEV;
 /// Absolute floor for any sampled object size, regardless of the distribution clamp.

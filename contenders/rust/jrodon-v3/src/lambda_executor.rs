@@ -328,7 +328,7 @@ impl LambdaWorker {
             .send(cdfhs)
             .map_err(|_| "Could not send the Job Response: Channel closed")?;
         completed_part_tx
-            .send(completed_parts.into_iter().map(From::from).collect())
+            .send(completed_parts.into_iter().collect())
             .map_err(|_| "Could not send the Job Response: Channel closed")?;
 
         Ok(())
