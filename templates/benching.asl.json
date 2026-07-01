@@ -65,7 +65,7 @@
               "arn": "{% $arn %}",
               "archive_key": "{% $archive_key_base & '-' & $string($states.context.Map.Item.Value) & '.zip' %}"
             },
-            "MaxConcurrency": 0,
+            "MaxConcurrency": 5,
             "ItemProcessor": {
               "ProcessorConfig": {
                 "Mode": "INLINE"
