@@ -9,6 +9,7 @@
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use bytes::Bytes;
 
 use crate::engine::plan::{FileId, SourceFile};
 use crate::engine::zip_format::{self, EntryMeta};
@@ -23,35 +24,35 @@ pub use crate::aws::assemble::AssembleError;
 /// its own simple traversal). Computes each entry's CRC from the bytes it reads.
 pub async fn run(
     s3: &Client,
-    bucket: &str,
-    archive_key: &str,
-    files_prefix: &str,
+    bucket: String,
+    archive_key: String,
+    files_prefix: String,
 ) -> Result<(), AssembleError> {
     // List source files.
-    let files = list(s3, bucket, files_prefix).await?;
+    let files = list(s3, bucket.clone(), &files_prefix).await?;
 
     // Build the whole archive in memory. Fallback inputs are small by definition.
     let mut archive: Vec<u8> = Vec::new();
     let mut metas: Vec<EntryMeta> = Vec::new();
     let mut offset: u64 = 0;
-    for f in &files {
+    for f in files {
         let key = format!("{files_prefix}/{}", f.name);
-        let body = get_bytes(s3, bucket, &key, f.size as usize).await?;
+        let body = get_bytes(s3, bucket.clone(), key, f.size as usize).await?;
         let crc = {
             let mut h = crc32fast::Hasher::new();
             h.update(&body);
             h.finalize()
         };
         let meta = EntryMeta {
-            name: f.name.clone(),
+            name: f.name,
             size: f.size,
             crc,
             local_header_offset: offset,
         };
         let header = zip_format::local_header(&meta);
         offset += header.len() as u64 + body.len() as u64;
-        archive.extend_from_slice(&header);
-        archive.extend_from_slice(&body);
+        archive.extend(header);
+        archive.extend(body);
         metas.push(meta);
     }
 
@@ -61,9 +62,9 @@ pub async fn run(
     for m in &metas {
         let rec = zip_format::central_dir_entry(m);
         cd_size += rec.len() as u64;
-        archive.extend_from_slice(&rec);
+        archive.extend(rec);
     }
-    archive.extend_from_slice(&zip_format::end_records(
+    archive.extend(zip_format::end_records(
         metas.len() as u64,
         cd_offset,
         cd_size,
@@ -84,25 +85,25 @@ pub async fn run(
     // Multipart: 5 MiB parts, last part takes the remainder (exempt).
     let upload_id = s3
         .create_multipart_upload()
-        .bucket(bucket)
-        .key(archive_key)
+        .bucket(bucket.clone())
+        .key(archive_key.clone())
         .content_type("application/zip")
         .send()
         .await?
-        .upload_id()
-        .map(ToOwned::to_owned)
+        .upload_id
         .ok_or(AssembleError::NoUploadId)?;
 
     let mut parts: Vec<CompletedPart> = Vec::new();
     let mut part_number = 1i32;
     let mut pos = 0usize;
-    while pos < archive.len() {
-        let end = (pos + PART_FLOOR).min(archive.len());
-        let chunk = archive[pos..end].to_vec();
+    let archive_bytes = Bytes::from(archive);
+    while pos < archive_bytes.len() {
+        let end = (pos + PART_FLOOR).min(archive_bytes.len());
+        let chunk = archive_bytes.slice(pos..end);
         let out = s3
             .upload_part()
-            .bucket(bucket)
-            .key(archive_key)
+            .bucket(bucket.clone())
+            .key(archive_key.clone())
             .upload_id(&upload_id)
             .part_number(part_number)
             .body(ByteStream::from(chunk))
@@ -137,23 +138,23 @@ pub async fn run(
 
 async fn list(
     s3: &Client,
-    bucket: &str,
+    bucket: String,
     files_prefix: &str,
 ) -> Result<Vec<SourceFile>, AssembleError> {
     let s3_prefix = format!("{files_prefix}/");
     let mut paginator = s3
         .list_objects_v2()
         .bucket(bucket)
-        .prefix(&s3_prefix)
+        .prefix(s3_prefix.clone())
         .into_paginator()
         .send();
     let mut out = Vec::new();
     let mut id = 0u32;
     while let Some(page) = paginator.next().await {
         let page = page?;
-        for obj in page.contents() {
-            let Some(key) = obj.key() else { continue };
-            let Some(size) = obj.size() else { continue };
+        for obj in page.contents.into_iter().flatten() {
+            let Some(key) = obj.key else { continue };
+            let Some(size) = obj.size else { continue };
             if key == s3_prefix {
                 continue;
             }
@@ -163,8 +164,7 @@ async fn list(
                 }
                 out.push(SourceFile {
                     id: FileId(id),
-                    key: key.to_string(),
-                    name: name.to_string(),
+                    name: name.to_owned(),
                     size: size as u64,
                 });
                 id += 1;
@@ -176,8 +176,8 @@ async fn list(
 
 async fn get_bytes(
     s3: &Client,
-    bucket: &str,
-    key: &str,
+    bucket: String,
+    key: String,
     expected: usize,
 ) -> Result<Vec<u8>, AssembleError> {
     let mut resp = s3.get_object().bucket(bucket).key(key).send().await?;

@@ -179,7 +179,7 @@ pub fn central_dir_entry(e: &EntryMeta) -> Vec<u8> {
 }
 
 /// Length of a central-directory record without building it (for end-record offset math).
-#[allow(dead_code)] // used in tests
+#[cfg(test)] // used in tests
 pub fn central_dir_entry_len(name: &str, local_header_offset: u64) -> u64 {
     let extra = if local_header_offset > U32_MAX as u64 {
         12

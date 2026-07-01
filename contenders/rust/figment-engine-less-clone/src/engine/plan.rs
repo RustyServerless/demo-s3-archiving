@@ -24,8 +24,6 @@ pub struct FileId(pub u32);
 #[derive(Debug, Clone)]
 pub struct SourceFile {
     pub id: FileId,
-    #[allow(dead_code)] // used in tests
-    pub key: String,
     pub name: String, // ZIP entry name (key minus prefix)
     pub size: u64,
 }
@@ -34,14 +32,10 @@ pub struct SourceFile {
 /// filled later (None until then).
 #[derive(Debug, Clone)]
 pub struct Entry {
-    #[allow(dead_code)] // used in tests
-    pub id: FileId,
     pub name: String,
     pub size: u64,
     pub local_header_offset: u64,
     pub crc: Option<u32>,
-    #[allow(dead_code)] // used in tests
-    pub streamed: bool, // true: header written inline by a Stream part; false: COPIED body
 }
 
 /// A piece of a Stream part.
@@ -94,7 +88,7 @@ pub struct SinglePlan {
     pub order: Vec<FileId>,
     pub entries: HashMap<FileId, Entry>,
     pub parts: Vec<PartSpec>,
-    #[allow(dead_code)] // used in tests
+    #[cfg(test)] // used in tests
     pub copyable: Vec<FileId>, // bigs needing a phase-1 CRC HEAD
     pub stats: PlanStats,
 }
@@ -127,9 +121,9 @@ pub fn plan_single_mpu(files: Vec<SourceFile>) -> SingleRouting {
     bigs.sort_by(|a, b| b.size.cmp(&a.size).then(a.id.0.cmp(&b.id.0)));
     smalls.sort_by(|a, b| a.size.cmp(&b.size).then(a.id.0.cmp(&b.id.0)));
 
-    let mut size_of: HashMap<FileId, (String, u64)> = HashMap::new();
+    let mut size_of: HashMap<FileId, (&str, u64)> = HashMap::new();
     for f in bigs.iter().chain(smalls.iter()) {
-        size_of.insert(f.id, (f.name.clone(), f.size));
+        size_of.insert(f.id, (&f.name, f.size));
     }
 
     // ----- Build the canonical entry ORDER and the alternating PART list together. -----
@@ -156,8 +150,8 @@ pub fn plan_single_mpu(files: Vec<SourceFile>) -> SingleRouting {
     let mut streamed_bigs: std::collections::HashSet<FileId> = std::collections::HashSet::new();
     let mut stolen_count: usize = 0;
 
-    for big in bigs.iter() {
-        let header_big = zip_format::local_header_len(&size_of[&big.id].0);
+    for big in &bigs {
+        let header_big = zip_format::local_header_len(size_of[&big.id].0);
         let max_steal = big.size.saturating_sub(PART_FLOOR); // keep ranged remainder >= floor
 
         // Pull smalls one at a time, but only until the remaining gap to the floor is small enough
@@ -182,7 +176,7 @@ pub fn plan_single_mpu(files: Vec<SourceFile>) -> SingleRouting {
                 let sid = small_iter.next().unwrap().id;
                 cur_segs.push(Segment::StreamedFile { id: sid });
                 order.push(sid);
-                let (ref name, sz) = size_of[&sid];
+                let (name, sz) = size_of[&sid];
                 cur_bytes += zip_format::local_header_len(name) + sz;
                 pulled_small = true;
             } else {
@@ -256,24 +250,20 @@ pub fn plan_single_mpu(files: Vec<SourceFile>) -> SingleRouting {
     // ----- Offsets + entries from the final order. -----
     let offsets = compute_offsets(&order, &size_of);
     let mut entries: HashMap<FileId, Entry> = HashMap::new();
-    let big_ids: std::collections::HashSet<FileId> = bigs.iter().map(|f| f.id).collect();
     for (i, id) in order.iter().enumerate() {
-        let (name, size) = size_of[id].clone();
-        // Copied iff it's a big that was NOT folded into a stream part.
-        let copied = big_ids.contains(id) && !streamed_bigs.contains(id);
+        let (name, size) = size_of[id];
         entries.insert(
             *id,
             Entry {
-                id: *id,
-                name,
+                name: name.to_owned(),
                 size,
                 local_header_offset: offsets[i],
                 crc: None,
-                streamed: !copied,
             },
         );
     }
     // Only copied bigs need a phase-1 CRC HEAD; folded (streamed) bigs self-compute at stream time.
+    #[cfg(test)]
     let copyable: Vec<FileId> = bigs
         .iter()
         .map(|f| f.id)
@@ -299,6 +289,7 @@ pub fn plan_single_mpu(files: Vec<SourceFile>) -> SingleRouting {
         order,
         entries,
         parts,
+        #[cfg(test)]
         copyable,
         stats,
     })
@@ -312,13 +303,13 @@ pub enum SingleRouting {
 
 /// Compute local-header offsets across `order` via a single fold (the only place offset
 /// arithmetic lives).
-fn compute_offsets(order: &[FileId], size_of: &HashMap<FileId, (String, u64)>) -> Vec<u64> {
+fn compute_offsets(order: &[FileId], size_of: &HashMap<FileId, (&str, u64)>) -> Vec<u64> {
     order
         .iter()
         .scan(0u64, |acc, id| {
             let here = *acc;
-            let (name, size) = &size_of[id];
-            *acc += zip_format::entry_total_len(name, *size);
+            let (name, size) = size_of[id];
+            *acc += zip_format::entry_total_len(name, size);
             Some(here)
         })
         .collect()
@@ -365,7 +356,6 @@ mod tests {
                 let name = sha256_hex(&raw[i]);
                 SourceFile {
                     id: FileId(i as u32),
-                    key: format!("files/{name}"),
                     name,
                     size: raw[i].len() as u64,
                 }

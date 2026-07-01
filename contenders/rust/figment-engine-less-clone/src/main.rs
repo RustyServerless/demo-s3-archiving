@@ -30,14 +30,14 @@ struct JobInfo {
 /// List every object under `{files_prefix}/`, returning a `SourceFile` per object with a
 /// stable id, full key, bare name (key minus prefix), and size.
 async fn list_source_files(
-    bucket: &str,
+    bucket: String,
     files_prefix: &str,
 ) -> Result<Vec<SourceFile>, LambdaError> {
     let s3_prefix = format!("{files_prefix}/");
     let mut paginator = s3()
         .list_objects_v2()
         .bucket(bucket)
-        .prefix(&s3_prefix)
+        .prefix(s3_prefix.clone())
         .into_paginator()
         .send();
 
@@ -45,9 +45,9 @@ async fn list_source_files(
     let mut next_id: u32 = 0;
     while let Some(page) = paginator.next().await {
         let page = page?;
-        for obj in page.contents() {
-            let Some(key) = obj.key() else { continue };
-            let Some(size) = obj.size() else { continue };
+        for obj in page.contents.into_iter().flatten() {
+            let Some(key) = obj.key else { continue };
+            let Some(size) = obj.size else { continue };
             if key == s3_prefix {
                 continue;
             }
@@ -57,7 +57,6 @@ async fn list_source_files(
                 }
                 out.push(SourceFile {
                     id: FileId(next_id),
-                    key: key.to_string(),
                     name: name.to_string(),
                     size: size as u64,
                 });
@@ -78,14 +77,20 @@ async fn handler(event: LambdaEvent<JobInfo>) -> Result<(), LambdaError> {
 
     info!(%bucket_name, %files_prefix, %archive_key, "contender invoked");
 
-    let files = list_source_files(&bucket_name, &files_prefix).await?;
+    let files = list_source_files(bucket_name.to_string(), &files_prefix).await?;
     info!(count = files.len(), "listed source files");
 
     match plan_single_mpu(files) {
         SingleRouting::SingleMpu(p) => {
             info!(parts = p.parts.len(), "single-MPU fast path");
-            if let Err(e) =
-                aws::assemble::assemble(&s3(), &bucket_name, &files_prefix, &archive_key, p).await
+            if let Err(e) = aws::assemble::assemble(
+                &s3(),
+                bucket_name.to_string(),
+                files_prefix.to_string(),
+                archive_key.to_string(),
+                p,
+            )
+            .await
             {
                 error!(%e, "single-MPU assemble failed");
                 return Err(Box::new(e));
@@ -93,8 +98,13 @@ async fn handler(event: LambdaEvent<JobInfo>) -> Result<(), LambdaError> {
         }
         SingleRouting::Fallback => {
             info!("streaming fallback path");
-            if let Err(e) =
-                aws::stream_fallback::run(&s3(), &bucket_name, &archive_key, &files_prefix).await
+            if let Err(e) = aws::stream_fallback::run(
+                &s3(),
+                bucket_name.to_string(),
+                archive_key.to_string(),
+                files_prefix.to_string(),
+            )
+            .await
             {
                 error!(%e, "stream fallback failed");
                 return Err(Box::new(e));

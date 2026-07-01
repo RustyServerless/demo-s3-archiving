@@ -8,7 +8,7 @@
 //! directory as the final part and complete. No temp objects, no per-chain MPUs.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
@@ -27,10 +27,6 @@ use crate::engine::zip_format::{self, EntryMeta};
 const STREAM_CONCURRENCY: usize = 32;
 const COPY_CONCURRENCY: usize = 128;
 const CRC_CONCURRENCY: usize = 64;
-/// Max attempts per part/HEAD before giving up. Transient stream breaks and SlowDown/5xx are
-/// retried with exponential backoff + jitter; a re-run is safe because re-uploading a part number
-/// overwrites it and a HEAD is read-only.
-const MAX_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssembleError {
@@ -54,64 +50,12 @@ where
     }
 }
 
-/// Is this error worth retrying? Transient stream breaks (a body GET/upload that dropped
-/// mid-transfer) and S3 throttling / 5xx are retryable; missing-etag, bad-CRC and no-upload-id are
-/// deterministic logic errors that won't change on a re-run.
-fn is_retryable(e: &AssembleError) -> bool {
-    match e {
-        AssembleError::ByteStream(_) => true,
-        AssembleError::S3(_) => {
-            let s = e.to_string();
-            s.contains("SlowDown")
-                || s.contains("Throttl") // Throttling / Throttled
-                || s.contains("ServiceUnavailable")
-                || s.contains("Service Unavailable")
-                || s.contains("RequestTimeout")
-                || s.contains("InternalError")
-                || s.contains("(500)")
-                || s.contains("(503)")
-        }
-        _ => false,
-    }
-}
-
-/// Run `op` up to `MAX_ATTEMPTS` times, retrying only transient failures with exponential backoff
-/// (100ms, 200ms, 400ms, … capped at ~3.2s) plus a little jitter to de-synchronise concurrent
-/// retries within the invocation. `op` is re-invoked from scratch each attempt, so it must be
-/// self-contained (rebuild the request, re-GET the bodies); part re-uploads are idempotent.
-async fn with_retry<T, F, Fut>(mut op: F) -> Result<T, AssembleError>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, AssembleError>>,
-{
-    let mut attempt: u32 = 0;
-    loop {
-        match op().await {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                attempt += 1;
-                if attempt >= MAX_ATTEMPTS || !is_retryable(&e) {
-                    return Err(e);
-                }
-                let base_ms = 100u64.saturating_mul(1u64 << (attempt - 1).min(5));
-                // Cheap jitter from the system clock's sub-ms component; no extra deps.
-                let jitter_ms = (std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.subsec_micros() as u64)
-                    .unwrap_or(0))
-                    % 100;
-                tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
-            }
-        }
-    }
-}
-
 /// Entry point: realise `plan` into the archive at `archive_key`.
 pub async fn assemble(
     s3: &Client,
-    bucket: &str,
-    files_prefix: &str,
-    archive_key: &str,
+    bucket: String,
+    files_prefix: String,
+    archive_key: String,
     mut plan: SinglePlan,
 ) -> Result<(), AssembleError> {
     // Log the planner's decisions: bigs copied (off-ENI) vs folded into stream parts (on-ENI,
@@ -131,7 +75,7 @@ pub async fn assemble(
 
     // ---- Phase 1: fill CRCs (HEAD all entries; every object carries a stored CRC32). ----
     let t_crc = Instant::now();
-    fill_crcs(s3, bucket, files_prefix, &mut plan).await?;
+    fill_crcs(s3, bucket.clone(), files_prefix.clone(), &mut plan).await?;
     tracing::info!(
         ms = t_crc.elapsed().as_millis(),
         entries = plan.order.len(),
@@ -141,7 +85,7 @@ pub async fn assemble(
     let plan = Arc::new(plan);
 
     // ---- Open the single archive MPU. ----
-    let upload_id = create_mpu(s3, bucket, archive_key).await?;
+    let upload_id = create_mpu(s3, bucket.clone(), archive_key.clone()).await?;
 
     // ---- Realise every planned part into the one MPU via two INDEPENDENT pools. ----
     // Part numbers are fixed by the plan and resolved at CompleteMPU, so parts have no execution
@@ -166,47 +110,42 @@ pub async fn assemble(
 
     let t_parts = Instant::now();
 
+    let bucket_c = bucket.clone();
+    let archive_key_c = archive_key.clone();
+    let upload_id_c = upload_id.clone();
     let copies =
         futures::stream::iter(copy_parts.into_iter().map(|(part_number, id, copy_from)| {
             let s3 = s3.clone();
             let plan = plan.clone();
-            let bucket = bucket.to_string();
-            let files_prefix = files_prefix.to_string();
-            let archive_key = archive_key.to_string();
-            let upload_id = upload_id.clone();
+            let bucket = bucket_c.clone();
+            let files_prefix = files_prefix.clone();
+            let archive_key = archive_key_c.clone();
+            let upload_id = upload_id_c.clone();
             async move {
-                with_retry(|| async {
-                    let entry = &plan.entries[&id];
-                    let source = format!("{bucket}/{files_prefix}/{}", entry.name);
-                    let mut req = s3
-                        .upload_part_copy()
-                        .bucket(&bucket)
-                        .key(&archive_key)
-                        .upload_id(&upload_id)
+                let entry = &plan.entries[&id];
+                let source = format!("{bucket}/{files_prefix}/{}", entry.name);
+                let mut req = s3
+                    .upload_part_copy()
+                    .bucket(bucket)
+                    .key(archive_key)
+                    .upload_id(upload_id)
+                    .part_number(part_number as i32)
+                    .copy_source(source);
+                // When a prefix was streamed, copy only the remainder [copy_from, size-1].
+                if copy_from > 0 {
+                    req = req.copy_source_range(format!("bytes={}-{}", copy_from, entry.size - 1));
+                }
+                let out = req.send().await?;
+                let etag = out
+                    .copy_part_result
+                    .and_then(|r| r.e_tag)
+                    .ok_or(AssembleError::NoEtag("upload_part_copy"))?;
+                Ok::<_, AssembleError>(
+                    CompletedPart::builder()
                         .part_number(part_number as i32)
-                        .copy_source(source);
-                    // When a prefix was streamed, copy only the remainder [copy_from, size-1].
-                    if copy_from > 0 {
-                        req = req.copy_source_range(format!(
-                            "bytes={}-{}",
-                            copy_from,
-                            entry.size - 1
-                        ));
-                    }
-                    let out = req.send().await?;
-                    let etag = out
-                        .copy_part_result()
-                        .and_then(|r| r.e_tag())
-                        .ok_or(AssembleError::NoEtag("upload_part_copy"))?
-                        .to_string();
-                    Ok::<_, AssembleError>(
-                        CompletedPart::builder()
-                            .part_number(part_number as i32)
-                            .e_tag(etag)
-                            .build(),
-                    )
-                })
-                .await
+                        .e_tag(etag)
+                        .build(),
+                )
             }
         }))
         .buffer_unordered(COPY_CONCURRENCY);
@@ -214,35 +153,29 @@ pub async fn assemble(
     let streams = futures::stream::iter(stream_parts.into_iter().map(|(part_number, segments)| {
         let s3 = s3.clone();
         let plan = plan.clone();
-        let bucket = bucket.to_string();
-        let files_prefix = files_prefix.to_string();
-        let archive_key = archive_key.to_string();
-        let upload_id = upload_id.clone();
+        let bucket = bucket_c.clone();
+        let files_prefix = files_prefix.clone();
+        let archive_key = archive_key_c.clone();
+        let upload_id = upload_id_c.clone();
         async move {
-            with_retry(|| async {
-                let bytes =
-                    build_stream_part_bytes(&s3, &bucket, &files_prefix, &plan, &segments).await?;
-                let out = s3
-                    .upload_part()
-                    .bucket(&bucket)
-                    .key(&archive_key)
-                    .upload_id(&upload_id)
+            let bytes =
+                build_stream_part_bytes(&s3, bucket.clone(), files_prefix, &plan, segments).await?;
+            let out = s3
+                .upload_part()
+                .bucket(bucket)
+                .key(archive_key)
+                .upload_id(upload_id)
+                .part_number(part_number as i32)
+                .body(ByteStream::from(bytes))
+                .send()
+                .await?;
+            let etag = out.e_tag.ok_or(AssembleError::NoEtag("upload_part"))?;
+            Ok::<_, AssembleError>(
+                CompletedPart::builder()
                     .part_number(part_number as i32)
-                    .body(ByteStream::from(bytes))
-                    .send()
-                    .await?;
-                let etag = out
-                    .e_tag()
-                    .ok_or(AssembleError::NoEtag("upload_part"))?
-                    .to_string();
-                Ok::<_, AssembleError>(
-                    CompletedPart::builder()
-                        .part_number(part_number as i32)
-                        .e_tag(etag)
-                        .build(),
-                )
-            })
-            .await
+                    .e_tag(etag)
+                    .build(),
+            )
         }
     }))
     .buffer_unordered(STREAM_CONCURRENCY);
@@ -268,7 +201,7 @@ pub async fn assemble(
     s3.complete_multipart_upload()
         .bucket(bucket)
         .key(archive_key)
-        .upload_id(&upload_id)
+        .upload_id(upload_id)
         .multipart_upload(
             CompletedMultipartUpload::builder()
                 .set_parts(Some(completed))
@@ -288,18 +221,18 @@ pub async fn assemble(
 /// following ranged Copy continues from `len` to the end.
 async fn build_stream_part_bytes(
     s3: &Client,
-    bucket: &str,
-    files_prefix: &str,
+    bucket: String,
+    files_prefix: String,
     plan: &SinglePlan,
-    segments: &[Segment],
+    segments: Vec<Segment>,
 ) -> Result<Vec<u8>, AssembleError> {
     let mut buf: Vec<u8> = Vec::new();
     for seg in segments {
         match seg {
             Segment::StreamedFile { id } => {
-                let entry = &plan.entries[id];
+                let entry = &plan.entries[&id];
                 let key = format!("{files_prefix}/{}", entry.name);
-                let body = get_object_bytes(s3, bucket, &key, entry.size as usize).await?;
+                let body = get_object_bytes(s3, bucket.clone(), key, entry.size as usize).await?;
                 let crc = entry
                     .crc
                     .ok_or_else(|| AssembleError::BadCrc(entry.name.clone()))?;
@@ -308,7 +241,7 @@ async fn build_stream_part_bytes(
                 buf.extend_from_slice(&body);
             }
             Segment::CopiedFileHeader { id } => {
-                let entry = &plan.entries[id];
+                let entry = &plan.entries[&id];
                 let crc = entry
                     .crc
                     .ok_or_else(|| AssembleError::BadCrc(entry.name.clone()))?;
@@ -316,9 +249,10 @@ async fn build_stream_part_bytes(
                 buf.extend_from_slice(&zip_format::local_header(&meta));
             }
             Segment::StreamedBigPrefix { id, len } => {
-                let entry = &plan.entries[id];
+                let entry = &plan.entries[&id];
                 let key = format!("{files_prefix}/{}", entry.name);
-                let prefix = get_object_range_bytes(s3, bucket, &key, 0, *len).await?;
+                let prefix =
+                    get_object_range_bytes(s3, bucket.to_owned(), key.to_owned(), 0, len).await?;
                 buf.extend_from_slice(&prefix);
             }
             Segment::CentralDirectory => {
@@ -370,8 +304,8 @@ fn entry_meta(e: &Entry, crc: u32) -> EntryMeta {
 /// HEAD every entry to fetch its stored full-object CRC32 (all objects carry one).
 async fn fill_crcs(
     s3: &Client,
-    bucket: &str,
-    files_prefix: &str,
+    bucket: String,
+    files_prefix: String,
     plan: &mut SinglePlan,
 ) -> Result<(), AssembleError> {
     let jobs: Vec<(FileId, String)> = plan
@@ -393,18 +327,15 @@ async fn fill_crcs(
             let s3 = s3.clone();
             let bucket = bucket.to_string();
             async move {
-                with_retry(|| async {
-                    let out = s3
-                        .head_object()
-                        .bucket(&bucket)
-                        .key(&key)
-                        .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
-                        .send()
-                        .await?;
-                    let crc_b64 = out.checksum_crc32().map(ToOwned::to_owned);
-                    Ok::<_, AssembleError>((id, crc_b64))
-                })
-                .await
+                let out = s3
+                    .head_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .checksum_mode(aws_sdk_s3::types::ChecksumMode::Enabled)
+                    .send()
+                    .await?;
+                let crc_b64 = out.checksum_crc32().map(ToOwned::to_owned);
+                Ok::<_, AssembleError>((id, crc_b64))
             }
         }))
         .buffer_unordered(CRC_CONCURRENCY)
@@ -424,22 +355,20 @@ async fn fill_crcs(
     Ok(())
 }
 
-async fn create_mpu(s3: &Client, bucket: &str, key: &str) -> Result<String, AssembleError> {
+async fn create_mpu(s3: &Client, bucket: String, key: String) -> Result<String, AssembleError> {
     let out = s3
         .create_multipart_upload()
         .bucket(bucket)
         .key(key)
         .send()
         .await?;
-    out.upload_id()
-        .map(ToOwned::to_owned)
-        .ok_or(AssembleError::NoUploadId)
+    out.upload_id.ok_or(AssembleError::NoUploadId)
 }
 
 async fn get_object_bytes(
     s3: &Client,
-    bucket: &str,
-    key: &str,
+    bucket: String,
+    key: String,
     expected: usize,
 ) -> Result<Vec<u8>, AssembleError> {
     let mut resp = s3.get_object().bucket(bucket).key(key).send().await?;
@@ -453,8 +382,8 @@ async fn get_object_bytes(
 /// GET the first `len` bytes of an object (range `[start, start+len-1]`), for a stolen big-prefix.
 async fn get_object_range_bytes(
     s3: &Client,
-    bucket: &str,
-    key: &str,
+    bucket: String,
+    key: String,
     start: u64,
     len: u64,
 ) -> Result<Vec<u8>, AssembleError> {

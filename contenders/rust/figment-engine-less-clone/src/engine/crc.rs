@@ -32,7 +32,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     if bytes.len() % 4 != 0 {
         return None;
     }
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
     for chunk in bytes.chunks(4) {
         let c0 = val(chunk[0])?;
         let c1 = val(chunk[1])?;
