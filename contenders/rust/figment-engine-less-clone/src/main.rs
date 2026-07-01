@@ -69,6 +69,18 @@ async fn list_source_files(
 
 /// Lambda handler: list -> plan -> assemble (fast path) | stream_fallback.
 async fn handler(event: LambdaEvent<JobInfo>) -> Result<(), LambdaError> {
+    let _profiler = dhat::Profiler::builder()
+        .file_name(format!(
+            "/mnt/efs/{}.dhat-heap.json",
+            event
+                .context
+                .invoked_function_arn
+                .split(':')
+                .last()
+                .unwrap()
+        ))
+        .build();
+
     let JobInfo {
         bucket_name,
         files_prefix,
@@ -120,3 +132,6 @@ awssdk_instrumentation::make_lambda_runtime!(
     trigger = awssdk_instrumentation::lambda::layer::OTelFaasTrigger::Other,
     s3() -> aws_sdk_s3::Client
 );
+
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
