@@ -16,7 +16,6 @@ use futures::stream::StreamExt;
 use crate::engine::crc::decode_s3_crc32;
 use crate::engine::plan::{Entry, FileId, PartSpec, Segment, SinglePlan};
 use crate::engine::zip_format::{self, EntryMeta};
-use crate::s3;
 
 /// Tunables. The two part kinds have opposite cost profiles, so they get independent pools:
 /// streams are ENI-bandwidth-bound (size to saturate the pipe, covering request latency with
@@ -51,6 +50,7 @@ where
 
 /// Entry point: realise `plan` into the archive at `archive_key`.
 pub async fn assemble(
+    s3_client: &aws_sdk_s3::Client,
     bucket: String,
     files_prefix: String,
     archive_key: String,
@@ -73,7 +73,7 @@ pub async fn assemble(
 
     // ---- Phase 1: fill CRCs (HEAD all entries; every object carries a stored CRC32). ----
     let t_crc = Instant::now();
-    fill_crcs(bucket.clone(), files_prefix.clone(), &mut plan).await?;
+    fill_crcs(s3_client, bucket.clone(), files_prefix.clone(), &mut plan).await?;
     tracing::info!(
         ms = t_crc.elapsed().as_millis(),
         entries = plan.order.len(),
@@ -81,7 +81,7 @@ pub async fn assemble(
     );
 
     // ---- Open the single archive MPU. ----
-    let upload_id = create_mpu(bucket.clone(), archive_key.clone()).await?;
+    let upload_id = create_mpu(s3_client, bucket.clone(), archive_key.clone()).await?;
 
     // ---- Realise every planned part into the one MPU via two INDEPENDENT pools. ----
     // Part numbers are fixed by the plan and resolved at CompleteMPU, so parts have no execution
@@ -119,7 +119,7 @@ pub async fn assemble(
             async move {
                 let entry = &ref_plan.entries[&id];
                 let source = format!("{bucket}/{files_prefix}/{}", entry.name);
-                let mut req = s3()
+                let mut req = s3_client
                     .upload_part_copy()
                     .bucket(bucket)
                     .key(archive_key)
@@ -152,9 +152,15 @@ pub async fn assemble(
         let upload_id = upload_id_c.clone();
         let ref_plan = &plan;
         async move {
-            let bytes =
-                build_stream_part_bytes(bucket.clone(), files_prefix, ref_plan, segments).await?;
-            let out = s3()
+            let bytes = build_stream_part_bytes(
+                s3_client,
+                bucket.clone(),
+                files_prefix,
+                ref_plan,
+                segments,
+            )
+            .await?;
+            let out = s3_client
                 .upload_part()
                 .bucket(bucket)
                 .key(archive_key)
@@ -192,7 +198,9 @@ pub async fn assemble(
     // ---- Complete the MPU (parts must be ascending by number). ----
     completed.sort_by_key(|p| p.part_number().unwrap_or_default());
     let t_done = Instant::now();
-    s3().complete_multipart_upload()
+
+    s3_client
+        .complete_multipart_upload()
         .bucket(bucket)
         .key(archive_key)
         .upload_id(upload_id)
@@ -214,6 +222,7 @@ pub async fn assemble(
 /// body bytes (ranged GET, no header — its header is the preceding CopiedFileHeader), which the
 /// following ranged Copy continues from `len` to the end.
 async fn build_stream_part_bytes(
+    s3_client: &aws_sdk_s3::Client,
     bucket: String,
     files_prefix: String,
     plan: &SinglePlan,
@@ -225,7 +234,8 @@ async fn build_stream_part_bytes(
             Segment::StreamedFile { id } => {
                 let entry = &plan.entries[&id];
                 let key = format!("{files_prefix}/{}", entry.name);
-                let body = get_object_bytes(bucket.clone(), key, entry.size as usize).await?;
+                let body =
+                    get_object_bytes(s3_client, bucket.clone(), key, entry.size as usize).await?;
                 let crc = entry
                     .crc
                     .ok_or_else(|| AssembleError::BadCrc(entry.name.clone()))?;
@@ -244,7 +254,7 @@ async fn build_stream_part_bytes(
             Segment::StreamedBigPrefix { id, len } => {
                 let entry = &plan.entries[&id];
                 let key = format!("{files_prefix}/{}", entry.name);
-                let prefix = get_object_range_bytes(bucket.clone(), key, 0, len).await?;
+                let prefix = get_object_range_bytes(s3_client, bucket.clone(), key, 0, len).await?;
                 buf.extend_from_slice(&prefix);
             }
             Segment::CentralDirectory => {
@@ -295,6 +305,7 @@ fn entry_meta(e: &Entry, crc: u32) -> EntryMeta<'_> {
 
 /// HEAD every entry to fetch its stored full-object CRC32 (all objects carry one).
 async fn fill_crcs(
+    s3_client: &aws_sdk_s3::Client,
     bucket: String,
     files_prefix: String,
     plan: &mut SinglePlan,
@@ -303,8 +314,13 @@ async fn fill_crcs(
         .order
         .iter()
         .map(|id| {
-            let name = &plan.entries.get(id).expect("ordered id in entries").name;
-            (*id, format!("{files_prefix}/{}", name))
+            (
+                *id,
+                format!(
+                    "{files_prefix}/{}",
+                    plan.entries.get(id).expect("ordered id in entries").name
+                ),
+            )
         })
         .collect();
 
@@ -312,7 +328,7 @@ async fn fill_crcs(
         futures::stream::iter(jobs.into_iter().map(move |(id, key)| {
             let bucket = bucket.clone();
             async move {
-                let out = s3()
+                let out = s3_client
                     .head_object()
                     .bucket(bucket)
                     .key(key)
@@ -340,8 +356,12 @@ async fn fill_crcs(
     Ok(())
 }
 
-async fn create_mpu(bucket: String, key: String) -> Result<String, AssembleError> {
-    let out = s3()
+async fn create_mpu(
+    s3_client: &aws_sdk_s3::Client,
+    bucket: String,
+    key: String,
+) -> Result<String, AssembleError> {
+    let out = s3_client
         .create_multipart_upload()
         .bucket(bucket)
         .key(key)
@@ -351,11 +371,17 @@ async fn create_mpu(bucket: String, key: String) -> Result<String, AssembleError
 }
 
 async fn get_object_bytes(
+    s3_client: &aws_sdk_s3::Client,
     bucket: String,
     key: String,
     expected: usize,
 ) -> Result<Vec<u8>, AssembleError> {
-    let mut resp = s3().get_object().bucket(bucket).key(key).send().await?;
+    let mut resp = s3_client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await?;
     let mut data = Vec::with_capacity(expected);
     while let Some(chunk) = resp.body.next().await {
         data.extend_from_slice(&chunk?);
@@ -365,13 +391,14 @@ async fn get_object_bytes(
 
 /// GET the first `len` bytes of an object (range `[start, start+len-1]`), for a stolen big-prefix.
 async fn get_object_range_bytes(
+    s3_client: &aws_sdk_s3::Client,
     bucket: String,
     key: String,
     start: u64,
     len: u64,
 ) -> Result<Vec<u8>, AssembleError> {
     let range = format!("bytes={}-{}", start, start + len - 1);
-    let mut resp = s3()
+    let mut resp = s3_client
         .get_object()
         .bucket(bucket)
         .key(key)

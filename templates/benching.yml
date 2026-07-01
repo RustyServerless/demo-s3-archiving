@@ -23,7 +23,7 @@ Parameters:
     Description: The average size of test files, in MB
   RunsPerContender:
     Type: Number
-    Default: 10
+    Default: 25
     Description: Number of times each contender Lambda is invoked in parallel per benchmark run; the reported duration_ms is the mean across all runs
   MaxRunTimeMs:
     Type: Number

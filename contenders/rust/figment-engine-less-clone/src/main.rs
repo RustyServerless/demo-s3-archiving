@@ -84,6 +84,7 @@ async fn handler(event: LambdaEvent<JobInfo>) -> Result<(), LambdaError> {
         SingleRouting::SingleMpu(p) => {
             info!(parts = p.parts.len(), "single-MPU fast path");
             if let Err(e) = aws::assemble::assemble(
+                &s3(),
                 bucket_name.to_string(),
                 files_prefix.to_string(),
                 archive_key.to_string(),
