@@ -113,6 +113,7 @@ async fn handler(event: LambdaEvent<JobInfo>) -> Result<(), LambdaError> {
 
     info!("archive complete");
     Ok(())
+    // Err("I want it to stop")?
 }
 
 awssdk_instrumentation::make_lambda_runtime!(

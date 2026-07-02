@@ -186,6 +186,7 @@ async fn handler(event: LambdaEvent<JobInfo>) -> Result<(), LambdaError> {
 
     info!("Archive created successfully");
     Ok(())
+    // Err("I want it to stop")?
 }
 
 // This macro from `awssdk-instrumentation` generates the entire main() function:

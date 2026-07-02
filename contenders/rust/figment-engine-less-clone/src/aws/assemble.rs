@@ -22,7 +22,7 @@ use crate::engine::zip_format::{self, EntryMeta};
 /// concurrent transfers); copies are server-side and latency-bound (run wide and cheap — no
 /// 503s observed copying into a single MPU). They never share slots, so copy-waits can't starve
 /// the ENI.
-const STREAM_CONCURRENCY: usize = 16;
+const STREAM_CONCURRENCY: usize = 10;
 const COPY_CONCURRENCY: usize = 64;
 const CRC_CONCURRENCY: usize = 64;
 

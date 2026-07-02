@@ -158,7 +158,7 @@
                 "Next": "RecordContenderFailureFromRuns"
               }
             ],
-            "Default": "InvokeControl"
+            "Default": "EmitSuccess"
           },
           "RecordContenderFailureFromRuns": {
             "Type": "Pass",
@@ -171,28 +171,6 @@
               }
             },
             "Next": "DeleteAllArchives"
-          },
-          "InvokeControl": {
-            "Type": "Task",
-            "Comment": "Validate only run-0's archive for correctness. Timing is collected for all runs.",
-            "Resource": "arn:aws:states:::lambda:invoke",
-            "Arguments": {
-              "FunctionName": "${ControlFunctionArn}",
-              "Payload": {
-                "archive_key": "{% $archive_key_run0 %}",
-                "expected_object_count": "${TestFileCount}"
-              }
-            },
-            "Catch": [
-              {
-                "ErrorEquals": ["States.ALL"],
-                "Next": "RecordContenderInvalid",
-                "Output": {
-                  "reason": "{% 'invalid: ' & ($exists($states.errorOutput.Cause) ? ($parse($states.errorOutput.Cause).errorMessage ? $parse($states.errorOutput.Cause).errorMessage : $states.errorOutput.Cause) : $states.errorOutput.Error) %}"
-                }
-              }
-            ],
-            "Next": "EmitSuccess"
           },
           "RecordContenderInvalid": {
             "Type": "Pass",

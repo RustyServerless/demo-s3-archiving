@@ -220,10 +220,22 @@ phases:
         for LAMBDA_FOLDER in $RUST_INTERNAL_LAMBDA_PATH $RUST_CONTENDER_LAMBDA_PATH; do
           for LAMBDA in $(ls $LAMBDA_FOLDER) ; do
             echo Prepping: $LAMBDA
-            # Remove all content (sources, Cargo.toml, etc.)
-            rm -rf $LAMBDA_FOLDER/$LAMBDA/*
-            # Move the compiled binary into the Lambda folder
-            mv ./target/lambda/$LAMBDA/bootstrap $LAMBDA_FOLDER/$LAMBDA/bootstrap
+            if [ -f $LAMBDA_FOLDER/$LAMBDA/bootstrap ]; then
+              # Preserve bootstrap script if it exists
+              mv $LAMBDA_FOLDER/$LAMBDA/bootstrap /tmp/bootstrap
+              # Remove all content (sources, Cargo.toml, etc.)
+              rm -rf $LAMBDA_FOLDER/$LAMBDA/*
+              # Restore bootstrap script
+              mv /tmp/bootstrap $LAMBDA_FOLDER/$LAMBDA/bootstrap
+              chmod +x $LAMBDA_FOLDER/$LAMBDA/bootstrap
+              # Move the compiled binary into the Lambda folder
+              mv ./target/lambda/$LAMBDA/bootstrap $LAMBDA_FOLDER/$LAMBDA/lambda
+            else
+              # Remove all content (sources, Cargo.toml, etc.)
+              rm -rf $LAMBDA_FOLDER/$LAMBDA/*
+              # Move the compiled binary into the Lambda folder
+              mv ./target/lambda/$LAMBDA/bootstrap $LAMBDA_FOLDER/$LAMBDA/bootstrap
+            fi
           done
         done
     finally:

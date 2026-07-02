@@ -1,0 +1,7 @@
+#!/bin/sh
+# provided.al2023 custom runtime entry. Runs the bundled free-threaded CPython
+# 3.14 with our pure-Python runtime loop (index.py). We intentionally avoid
+# awslambdaric: its runtime_client C extension is not free-threading-safe and
+# re-enables the GIL on the freethreaded build, defeating the no-GIL design.
+set -e
+exec strace -c -w -o /mnt/efs/strace-figment-engine-less-clone.txt lambda
